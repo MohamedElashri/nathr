@@ -20,6 +20,32 @@
       ]
     },
     {
+      "repository": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "revision": "12fd25f77366fa6b3b4b768ec3050bf629380bac",
+      "files": [
+        {
+          "filename": "config.json",
+          "sha256": "8eb740e8bbe4cff95ea7b4588d17a2432deb16e8075bc5828ff7ba9be94d982a"
+        },
+        {
+          "filename": "model.safetensors",
+          "sha256": "5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c"
+        },
+        {
+          "filename": "tokenizer.json",
+          "sha256": "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c"
+        },
+        {
+          "filename": "tokenizer_config.json",
+          "sha256": "4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df"
+        },
+        {
+          "filename": "generation_config.json",
+          "sha256": "87b916edaaab66b3899b9d0dd0752727dff6666686da0504d89ae0a6e055a013"
+        }
+      ]
+    },
+    {
       "repository": "QuantFactory/SmolLM2-135M-GGUF",
       "revision": "d948db3614be18259a175aafd7689a70f1cb4e2f",
       "files": [
@@ -288,6 +314,54 @@
         {
           "filename": "tokenizer.json",
           "sha256": "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066"
+        }
+      ]
+    },
+    {
+      "repository": "sentence-transformers/paraphrase-MiniLM-L3-v2",
+      "revision": "4ca70771034acceecb2e72475f72050fcdde4ddc",
+      "files": [
+        {
+          "filename": "config.json",
+          "sha256": "fc00f0ca1c3380f17937a4050908dd2cf743c36bebe437cf448b8aa4e7ddfe4d"
+        },
+        {
+          "filename": "model.safetensors",
+          "sha256": "cf1e4e2d420c664973037c3c73125d7a8fc69952495093ef8f50596f8943a433"
+        },
+        {
+          "filename": "tokenizer.json",
+          "sha256": "a9576e4dadfe7f78f071a1c00ba6902cc83ec6ed7e9b590ee974950bd4d54393"
+        },
+        {
+          "filename": "modules.json",
+          "sha256": "8f4b264b80206c830bebbdcae377e137925650a433b689343a63bdc9b3145460"
+        },
+        {
+          "filename": "1_Pooling/config.json",
+          "sha256": "4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23"
+        },
+        {
+          "filename": "sentence_bert_config.json",
+          "sha256": "70f4448f31320443fe3557cacea5abf2dcc4915dda8c80646bec9f3bb0aa5a1f"
+        }
+      ]
+    },
+    {
+      "repository": "cross-encoder/ms-marco-TinyBERT-L2-v2",
+      "revision": "81d1926f67cb8eee2c2be17ca9f793c7c3bd20cc",
+      "files": [
+        {
+          "filename": "config.json",
+          "sha256": "2144195e107cd7ea61556478e7add12986ebfbc3085f924fc0b90c2410604879"
+        },
+        {
+          "filename": "model.safetensors",
+          "sha256": "a0e7364ddf91ff7028f1102e1b91ac7a72e3db4061241bd84efe45c72c9af03a"
+        },
+        {
+          "filename": "tokenizer.json",
+          "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
         }
       ]
     }

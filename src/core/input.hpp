@@ -18,6 +18,7 @@ std::vector<std::byte> read_file(const std::filesystem::path& path, std::size_t 
 Json parse_json(std::span<const std::byte> bytes, const std::filesystem::path& path);
 Json read_json(const std::filesystem::path& path, std::size_t maximum);
 std::size_t natural(const Json& value, std::string_view context);
+Token primary_eos_id(const Json& value, std::size_t vocabulary, std::string_view context);
 std::uint64_t little_integer(std::span<const std::byte> bytes);
 
 } // namespace nathr::detail

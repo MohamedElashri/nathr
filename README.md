@@ -1,261 +1,205 @@
 # Nathr
 
-Nathr is an educational C++20 Transformer inference engine for x86-64 Linux. It runs GPT-2 and Llama-style text continuation, BERT encoding, and T5 text-to-text generation offline. [Example checkpoints and SHA-256 hashes](models/manifest.json)
+Nathr runs small text Transformers locally. Chat, continue a prompt, or inspect model outputs in the browser. The same runtime is available from the CLI and as a C++ library. [How the engine works](docs/inference-engine.md)
 
-The CLI exposes inference, checkpoint inspection, tokenization, and decoder benchmarking. The same engine is available as an embeddable C++ library. [Public API](include/nathr)
+## Install the release
 
-## Quick start
+The prebuilt package targets Ubuntu 24.04 on x86-64. Install the runtime tools if needed.
 
-### 1. Set up Nathr
+```sh
+sudo apt update
+sudo apt install ca-certificates curl libicu74 libstdc++6 python3
+```
+
+Download and verify the latest archive, then extract it into a new directory. [GitHub Releases](https://github.com/MohamedElashri/nathr/releases/latest)
+
+```sh
+mkdir -p nathr
+cd nathr
+release=https://github.com/MohamedElashri/nathr/releases/latest/download
+curl -fLO "$release/nathr-linux-x86_64.tar.gz"
+curl -fLO "$release/nathr-linux-x86_64.tar.gz.sha256"
+sha256sum -c nathr-linux-x86_64.tar.gz.sha256 && \
+  tar -xzf nathr-linux-x86_64.tar.gz --strip-components=1
+```
+
+## Start the browser app
+
+From the extracted directory, download the chat checkpoint (about 270 MB) and start Nathr.
+
+```sh
+nathr=./bin/nathr
+get_model=./share/nathr/setup.sh
+"$get_model" --download-only --models-dir models/cache instruct
+chat_model=models/cache/SmolLM2-135M-Instruct
+"$nathr" serve "$chat_model"
+```
+
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and enter a message. The available modes depend on the loaded checkpoint. The server stays in this terminal until you press Ctrl+C.
+
+## Choose a checkpoint
+
+Pass a GGUF file or a directory containing `config.json` and `model.safetensors` as `MODEL`. Text input for Safetensors also needs `tokenizer.json`. The downloader verifies pinned files before use. [Pinned revisions and SHA-256 hashes](models/manifest.json) · [Supported configurations](docs/inference-engine.md#checkpoint-support-and-limits)
+
+| Downloader selection | Path under `models/cache/` | Use |
+| --- | --- | --- |
+| `gguf` | `SmolLM2-135M.Q4_0.gguf` | Text continuation |
+| `safetensors` | `SmolLM2-135M` | Text continuation with the original weights |
+| `instruct` | `SmolLM2-135M-Instruct` | Chat |
+| `gpt2` | `gpt2` | Text continuation |
+| `t5` | `t5-small` | Text-to-text generation |
+| `bert` | `bert-base-uncased` | Hidden states and pooler output |
+| `minilm` | `paraphrase-MiniLM-L3-v2` | Sentence embeddings |
+| `tinybert` | `ms-marco-TinyBERT-L2-v2` | Text-pair scores |
+
+Use `"$get_model" --download-only --models-dir models/cache CHECKPOINT` to fetch another model. Restart the server with its path to use it in the browser. The `all` selection fetches both base SmolLM2 formats.
+
+## CLI reference
+
+```sh
+"$nathr" --help
+"$nathr" generate --help
+"$nathr" help serve
+```
+
+| Command | Use |
+| --- | --- |
+| `inspect MODEL --summary` | See checkpoint capabilities and output names. The default output is JSON. |
+| `generate MODEL PROMPT` | Generate from text, `--stdin`, `--tokens IDS`, or `--messages FILE`. Add `--json` for token IDs and the finish reason. |
+| `infer MODEL PROMPT --output NAME` | Return a named tensor as JSON. Accepts plain text from `--stdin` or raw IDs from `--tokens IDS`. |
+| `tokenize MODEL PROMPT` | Return token IDs. Use `--tokens IDS` to decode or `--stdin` to read one JSON string per line. |
+| `batch MODEL` | Run JSONL generation and tensor requests with one loaded checkpoint. |
+| `serve MODEL` | Start the browser interface and HTTP API on loopback. |
+| `bench MODEL` | Measure decoder-only prefill and decode. |
+| `encode MODEL PROMPT` | Return BERT hidden states as JSON rows. |
+| `forward MODEL --tokens IDS` | Inspect decoder-only logits and intermediate activations. |
+
+Use `--model PATH` and `--prompt TEXT` for named arguments. Token lists use commas, as in `--tokens '1, 7, 2'`. Place `--` before a positional prompt that starts with `--`.
+
+Execution commands default to one CPU thread and the scalar backend. Use `--backend auto` to select available CPU kernels, `--threads N` to set the thread count, or `--backend avx2` to require AVX2. The server defaults to `auto`.
+
+## CLI examples
+
+### Generate and tokenize
+
+Download the smaller SmolLM2 GGUF checkpoint for text continuation.
+
+```sh
+"$get_model" --download-only --models-dir models/cache gguf
+model=models/cache/SmolLM2-135M.Q4_0.gguf
+"$nathr" inspect "$model" --summary
+"$nathr" tokenize "$model" "Once upon a time"
+printf '%s' 'Once upon a time' |
+    "$nathr" generate "$model" --stdin --sample --seed 7 --top-k 40 --max-new-tokens 8 --backend auto
+```
+
+Use `--greedy` for highest-score selection or `--sample` with `--temperature`, `--top-k`, and `--top-p` to control sampling. Add repeatable `--stop TEXT` or comma-separated `--stop-ids IDS` to end generation early. `--stdin` in `generate` and `infer` reads a single plain-text prompt through EOF and preserves line breaks.
+
+For a checkpoint with an external tokenizer, use `generate MODEL --tokens IDS --json` and decode the returned IDs with that tokenizer.
+
+The same command runs T5 with a source prompt.
+
+```sh
+"$get_model" --download-only --models-dir models/cache t5
+"$nathr" generate models/cache/t5-small "translate English to German: The sky is blue." \
+  --greedy --max-new-tokens 12 --backend auto
+```
+
+### Run chat in the terminal
+
+```sh
+"$nathr" generate "$chat_model" --messages - --greedy --max-new-tokens 16 --backend auto <<'JSON'
+[
+  {"role":"user","content":"What is the capital of France?"},
+  {"role":"assistant","content":"Paris."},
+  {"role":"user","content":"What country is it in?"}
+]
+JSON
+```
+
+Use `--messages FILE` to read the same JSON array from disk. Messages can begin with a system message, then alternate user and assistant turns and end with a user message. The checkpoint must have a supported chat template.
+
+### Request a named output
+
+```sh
+"$get_model" --download-only --models-dir models/cache minilm
+embedding_model=models/cache/paraphrase-MiniLM-L3-v2
+"$nathr" inspect "$embedding_model" --summary
+"$nathr" infer "$embedding_model" "The sky is blue." --output sentence_embedding --backend auto
+```
+
+`infer` returns `output`, `shape`, and flat row-major `values`. Use `--text-pair TEXT` for a BERT text pair, `--token-type-ids IDS` for segment IDs with raw tokens, or `--decoder-tokens IDS` for a T5 decoder prefix. Use `--tokenizer FILE` with a GGUF checkpoint that needs a matching external tokenizer.
+
+### Batch requests
+
+Each input line supplies an ID and one input. Generation lines emit `token` and `done` events. A line with `output` returns a `result` event with a named tensor.
+
+```sh
+"$nathr" batch "$model" --backend auto --stats <<'JSONL'
+{"id":1,"prompt":"Once upon a time","max_new_tokens":8}
+{"id":2,"tokens":[6403,1980,253,655],"max_new_tokens":4,"greedy":false,"top_k":10,"seed":7}
+JSONL
+```
+
+Text input also emits decoded fragments. Send `{"cancel":2}` to cancel a pending request. Close stdin to let the batch finish. Use `batch --help` for queue, context, and memory limits.
+
+### Benchmark a decoder
+
+```sh
+"$nathr" bench "$model" --prompt-length 16 --decode-length 4 --warmups 1 --repetitions 3 --backend auto
+```
+
+The JSON report includes prefill and decode throughput, inter-token timings, and KV memory.
+
+## Serve over HTTP
+
+With the server running, send a request from another terminal.
+
+```sh
+curl -fsS http://127.0.0.1:8000/model
+curl -fsS http://127.0.0.1:8000/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"temperature":0,"max_tokens":16}'
+```
+
+| Endpoint | Use |
+| --- | --- |
+| `GET /health` | Worker status and request counts |
+| `GET /model` | Checkpoint capabilities, output shapes, and request limits |
+| `GET /v1/models`, `GET /v1/models/{id}` | List and retrieve model IDs for OpenAI-compatible clients |
+| `POST /infer` | A batch-style request without an ID, for generation or a named tensor |
+| `POST /v1/completions` | Generate from one prompt or token array |
+| `POST /v1/chat/completions` | Generate from text messages |
+| `POST /v1/embeddings` | Embed text or token arrays with a checkpoint that exposes `sentence_embedding` |
+
+Set `"stream":true` on a generation request for server-sent events. Embeddings accept up to 16 inputs and return fixed-width vectors as floats or base64. The server loads one checkpoint per process. Use `serve --help` to change the port, scheduler settings, or HTTP limits.
+
+## Build from source
+
+### Prerequisites
+
+Build on x86-64 Linux with CMake 3.25+, Ninja, GCC 12+ or Clang 16+, and ICU 70+ development libraries (`libicu-dev` on Debian or Ubuntu). The setup script uses Git, Bash, Python 3, `curl`, `sha256sum`, and `flock`. Serving requires Python 3.10+.
 
 ```sh
 git clone https://github.com/MohamedElashri/nathr.git
 cd nathr
-./setup.sh
-```
-
-The script downloads and verifies the 92 MB GGUF checkpoint, builds Nathr, and runs the tests. [Prerequisites, other checkpoint options, and manual installation](#installation)
-
-### 2. Generate text
-
-Once setup prints `Ready`, run this from the `nathr` directory.
-
-```sh
-./build/release/nathr generate models/cache/SmolLM2-135M.Q4_0.gguf \
-    "Once upon a time" --greedy --max-new-tokens 16
-```
-
-Nathr prints the continuation of the prompt.
-
-```text
-, the
-people of the country were all very different. Some were farmers,
-```
-
-Replace the quoted prompt to try your own. [CLI options and examples](#cli-reference)
-
-### Run GPT-2 small
-
-From the repository root, run setup for GPT-2 small and pass the checkpoint directory to `generate`. The weights download is about 548 MB. [Pinned GPT-2 checkpoint](https://huggingface.co/openai-community/gpt2/tree/607a30d783dfa663caf39e06633721c8d4cfcd7e)
-
-```sh
-./setup.sh gpt2
-./build/release/nathr generate models/cache/gpt2 "Once upon a time" --greedy --max-new-tokens 16
-```
-
-### Encode with BERT
-
-The IDs encode `The sky is blue.` with BERT's boundary tokens. The output contains seven vectors of width 768.
-
-```sh
-./setup.sh bert
-./build/release/nathr encode models/cache/bert-base-uncased \
-    --tokens 101,1996,3712,2003,2630,1012,102 > build/bert-hidden.json
-```
-
-### Generate with T5
-
-The input IDs encode `translate English to German: The sky is blue.`. The generated IDs decode to `Der Himmel ist blau.` with the checkpoint's tokenizer. [Use your own text](#tokenize-for-bert-and-t5)
-
-```sh
-./setup.sh t5
-./build/release/nathr generate models/cache/t5-small \
-    --tokens 13959,1566,12,2968,10,37,5796,19,1692,5,1 --greedy --max-new-tokens 12
-```
-
-## How inference works
-
-GPT-2 and Llama-style models use a causal decoder to continue a prompt. [Inference engine guide](docs/inference-engine.md)
-
-```mermaid
-flowchart LR
-    Prompt --> Tokenizer
-    Tokenizer -->|Token IDs| Transformer
-    Transformer -->|Next-token scores| Sampler
-    Sampler -->|Next input ID| Transformer
-    Sampler -->|Sampled ID| Bytes["Token-to-byte lookup"]
-    Bytes --> Text["UTF-8 output"]
-```
-
-1. The model loader checks tensor sizes and shapes and binds weights by name. Safetensors weights are read into a shared model buffer. GGUF files are memory-mapped, and quantized weights stay in their packed format. [Safetensors loader](src/formats/safetensors.cpp) · [GGUF loader](src/formats/gguf.cpp)
-2. The byte-level BPE tokenizer looks up byte tokens and merges neighboring tokens in the order specified by the model's merge table. The resulting IDs index the embedding table. [Tokenizer](src/tokenizer/tokenizer.cpp)
-3. The decoder runs causal attention and a feed-forward layer in each block. Llama-style models use RMSNorm, rotary position embeddings (RoPE), and SwiGLU. GPT-2 uses LayerNorm, learned position embeddings, and GELU. Both produce one score, or logit, per vocabulary token. [Llama decoder](src/models/llama/model.cpp) · [GPT-2 decoder](src/models/gpt2/model.cpp) · [Shared attention](src/backend/cpu/scalar.cpp)
-4. **Prefill** processes the prompt in chunks and saves each layer's keys and values. During **decode**, the sampler takes the highest logit or draws a token using temperature, top-k, and top-p. Nathr emits the token and appends it when another generation step is needed. Attention reuses the saved keys and values for earlier tokens. Generation ends at the end-of-sequence token or the token limit. [Sessions](src/runtime/session.cpp) · [Sampling and generation](src/runtime/generation.cpp)
-
-**BERT** lets each token attend to the entire input and returns a hidden vector per token. **T5** encodes its source once, then generates with a causal decoder that also attends to the encoded source. [BERT encoder](src/models/bert/model.cpp) · [T5 encoder and decoder](src/models/t5/model.cpp)
-
-## CPU execution and memory
-
-Nathr selects kernels by tensor encoding. The automatic backend uses AVX2 kernels when supported and falls back to scalar kernels where needed. During prefill, a weight row can serve several tokens in a small tile. Decoding a single token uses row-wise dot products. [CPU kernels](src/backend/cpu/kernels.cpp)
-
-Sessions share model weights and own their key-value (KV) cache, working memory, and random state. KV cache size grows with the configured context capacity. FP16 cache storage uses half the memory of FP32. [Session allocation](src/runtime/session.cpp)
-
-## Model compatibility
-
-Nathr reads dimensions, attention head counts, context length, and boundary token IDs from the checkpoint. Checkpoints can be up to 1 GiB with vocabularies of up to 65,536 tokens. Session capacity is also subject to the KV cache memory limit. [Session limits](src/runtime/session.cpp)
-
-- **Llama-style.** Single-file GGUF v3 or Safetensors with RMSNorm, SwiGLU, unscaled full-width RoPE, and bias-free projections. [Llama configuration](src/models/llama/config.cpp)
-- **GPT-2.** Dense, single-file Safetensors with the GPT-2 attention and GELU configuration. [GPT-2 decoder](src/models/gpt2/model.cpp)
-- **BERT.** Dense, single-file Safetensors with absolute position embeddings and GELU. Encodes one unpadded sequence with segment ID zero and returns the last hidden states. [BERT encoder](src/models/bert/model.cpp)
-- **T5.** Dense, single-file Safetensors for original ReLU T5. Uses an unpadded source and a greedy or sampled decoder with FP32 caches. Each sequence is capped at 512 positions or the checkpoint limit, whichever is smaller. [T5 model](src/models/t5/model.cpp)
-
-The built-in tokenizer supports the byte-level BPE variants used by SmolLM2 and GPT-2. For GGUF, it reads the vocabulary, merges, and control tokens from metadata. Models with other tokenizers take IDs directly. [Built-in tokenizer](src/tokenizer/tokenizer.cpp) · [BERT and T5 tokenization](#tokenize-for-bert-and-t5)
-
-## CLI reference
-
-Run these commands from the repository root. Use a GGUF file or a directory containing `config.json` and `model.safetensors` as `MODEL`. Built-in text tokenization for Safetensors also uses `tokenizer.json`. You can write `--model PATH` and `--prompt TEXT` in place of the positional arguments.
-
-```sh
+./setup.sh instruct
 nathr=./build/release/nathr
-"$nathr" --help
-"$nathr" --version
+get_model=./setup.sh
+"$nathr" serve models/cache/SmolLM2-135M-Instruct
 ```
 
-| Command | Options |
-| --- | --- |
-| `inspect MODEL` | Print checkpoint metadata and selected kernels as JSON. |
-| `encode MODEL --tokens IDS` | Return one BERT hidden-state row per input token as JSON. |
-| `tokenize MODEL PROMPT` | Use `--stages` to see pretokenization or `--stdin` to read one JSON string per line. Use `--tokens IDS` in place of the prompt to decode IDs and `--skip-special` to omit special tokens. |
-| `forward MODEL --tokens IDS` | Report the highest-scoring next token from a decoder-only model. Use `--cached` to exercise the KV cache, `--json` to include the final logits, or `--trace FILE` to save activations. `--logits-f32` streams one little-endian FP32 row per token and is exclusive with `--json` and `--trace`. |
-| `generate MODEL PROMPT` | Use `--tokens IDS` to supply IDs. For T5 these are source IDs and the output is always JSON. For decoder-only models use `--bos` to prepend a start token or `--json` for token IDs and metadata. Choose `--greedy` or tune sampling with `--temperature T`, `--top-k K`, `--top-p P`, and `--seed N`. `--max-new-tokens N` limits output (default 32). |
-| `bench MODEL` | Report decoder-only prefill and decode timings as JSON. Set `--prompt-length N`, `--decode-length N`, `--warmups N`, and `--repetitions N` (defaults 128, 32, 2, and 7). |
+To build with an existing checkpoint, run `cmake --preset release`, `cmake --build --preset release`, and `ctest --preset release` from the source tree.
 
-Pass token IDs as comma-separated integers such as `1,7,2`. With a GGUF checkpoint, `tokenize` and `generate` accept `--tokenizer FILE` to supply a matching tokenizer.
+To install into a local prefix, run `cmake --install build/release --prefix "$PWD/build/install"` and use `./build/install/bin/nathr`. CMake consumers can use `find_package(nathr CONFIG REQUIRED)` and link `nathr::nathr`. [C++ consumer example](tests/consumer)
 
-Inference commands and `inspect` accept `--backend scalar|auto|avx2` and `--threads N` (1–64). The defaults are scalar execution and one thread. For cached decoder-only inference, `--context N` sets capacity, `--kv-cache f32|f16` selects cache precision, and `--prefill-chunk N` (1–32) sets the prompt chunk size. For T5, `--context N` sets decoder capacity, including the decoder start token.
+### Check model compatibility
 
-### Examples
-
-In the same shell, use the default SmolLM2 checkpoint from `./setup.sh`. The forward command takes the IDs returned by `tokenize`.
+From the source tree, run the checker after downloading the named checkpoints. It checks file hashes, token IDs, tensor values, and generation where supported.
 
 ```sh
-model=models/cache/SmolLM2-135M.Q4_0.gguf
-"$nathr" inspect "$model"
-"$nathr" tokenize "$model" "Once upon a time"
-"$nathr" forward "$model" --tokens 6403,1980,253,655 --cached
-"$nathr" bench "$model" --prompt-length 16 --decode-length 4 \
-    --warmups 1 --repetitions 2 --backend auto
+python3 tests/compatibility.py gguf instruct
+python3 tests/compatibility.py gguf --measure --threads 2 --repetitions 3
 ```
 
-After `./setup.sh gpt2`, try sampling from GPT-2 with a fixed seed.
-
-```sh
-"$nathr" generate models/cache/gpt2 "Once upon a time" \
-    --temperature 0.8 --top-k 40 --top-p 0.95 --seed 7 --max-new-tokens 8
-```
-
-### Tokenize for BERT and T5
-
-After running setup for both checkpoints, use their `tokenizer.json` files with the optional Python `tokenizers` package. The tokenizer adds the checkpoint's special tokens.
-
-```sh
-python3 -m venv build/tokenizer-env
-build/tokenizer-env/bin/pip install tokenizers
-build/tokenizer-env/bin/python - <<'PY'
-import json
-import subprocess
-from tokenizers import Tokenizer
-
-def run(command, checkpoint, text, *options):
-    model = f"models/cache/{checkpoint}"
-    tokenizer = Tokenizer.from_file(f"{model}/tokenizer.json")
-    ids = ",".join(map(str, tokenizer.encode(text).ids))
-    output = subprocess.check_output(
-        ["./build/release/nathr", command, model, "--tokens", ids, *options]
-    )
-    return tokenizer, json.loads(output)
-
-_, bert = run("encode", "bert-base-uncased", "The sky is blue.")
-print(len(bert["hidden_states"]), bert["hidden_size"])
-
-tokenizer, t5 = run("generate", "t5-small", "translate English to German: The sky is blue.",
-                    "--greedy", "--max-new-tokens", "12")
-print(tokenizer.decode(t5["generated_ids"]))
-PY
-```
-
-## Installation
-
-### Prerequisites
-
-Use x86-64 Linux with CMake 3.25+, Ninja, and GCC 12+ or Clang 16+. Cloning and downloading use Git, `curl`, and `sha256sum`. The setup script also uses Bash, Python 3 to read the checkpoint manifest, and `flock` from util-linux.
-
-### Setup script options
-
-Run `./setup.sh` or `./setup.sh gguf` for quantized SmolLM2, `./setup.sh safetensors` for the original weights, or `./setup.sh all` for both SmolLM2 formats. Use `./setup.sh gpt2`, `./setup.sh bert`, or `./setup.sh t5` for the other checkpoints. Setup stores checkpoints under `models/cache`, reuses verified files, and prints an inference command.
-
-### 1. Build and test manually
-
-From the repository root, run the build and tests. The tests use fixtures included in the repository.
-
-```sh
-cmake --preset release
-cmake --build --preset release --parallel 2
-ctest --preset release
-./build/release/nathr --version
-```
-
-### 2. Download a model
-
-Choose a SmolLM2-135M download below or use a model-specific setup command in Quick start. Each manual download block sets `model` to the path the CLI expects. Continue when every `sha256sum` check reports `OK`. [Supported downloads and SHA-256 hashes](models/manifest.json)
-
-**GGUF (about 92 MB).** This single-file Q4_0 checkpoint includes the tokenizer and is the smaller download. [QuantFactory checkpoint](https://huggingface.co/QuantFactory/SmolLM2-135M-GGUF/blob/d948db3614be18259a175aafd7689a70f1cb4e2f/SmolLM2-135M.Q4_0.gguf)
-
-```sh
-model="$PWD/models/cache/SmolLM2-135M.Q4_0.gguf"
-mkdir -p models/cache
-curl --fail --location --retry 3 --output "$model" \
-    'https://huggingface.co/QuantFactory/SmolLM2-135M-GGUF/resolve/d948db3614be18259a175aafd7689a70f1cb4e2f/SmolLM2-135M.Q4_0.gguf?download=true' &&
-printf '%s  %s\n' '6f96e054a48f8fcdb5814abc1203ca12c0f9cce2791ca9a5153caad8c3b5479b' "$model" | sha256sum --check
-```
-
-**Safetensors (about 271 MB).** Download the original weights, configuration, and tokenizer into one directory. Pass that directory to Nathr. [Hugging Face checkpoint](https://huggingface.co/HuggingFaceTB/SmolLM2-135M/tree/93efa2f097d58c2a74874c7e644dbc9b0cee75a2)
-
-```sh
-model="$PWD/models/cache/SmolLM2-135M"
-(
-    set -e
-    mkdir -p "$model"
-    cd "$model"
-    base_url='https://huggingface.co/HuggingFaceTB/SmolLM2-135M/resolve/93efa2f097d58c2a74874c7e644dbc9b0cee75a2'
-    for file in config.json model.safetensors tokenizer.json; do
-        curl --fail --location --retry 3 --output "$file" "$base_url/$file?download=true"
-    done
-    sha256sum --check <<'SHA256'
-1d556eab73b69c7f11f64c557a2f9c6f440bd4c6b89bb2584a6b498c92603843  config.json
-80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1  model.safetensors
-9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c  tokenizer.json
-SHA256
-)
-```
-
-If a download or checksum fails, rerun that block. To use an existing checkpoint, set `model` to its absolute path. Use the file path for GGUF and the directory path for Safetensors.
-
-### 3. Test the downloaded model
-
-Run this in the same shell as the download block, with `model` pointing to the verified checkpoint. [More CLI examples](#examples)
-
-```sh
-./build/release/nathr generate "$model" "Once upon a time" \
-    --greedy --max-new-tokens 32 --context 512 --backend auto
-```
-
-### Install locally (optional)
-
-The CLI also runs directly from the build directory. To install the CLI and C++ library under the checkout without administrator access, run the following.
-
-```sh
-cmake --install build/release --prefix "$PWD/build/install"
-./build/install/bin/nathr --version
-```
-
-Use `./build/install/bin/nathr` in place of `./build/release/nathr` in the commands above. To use the library from another CMake project, set `CMAKE_PREFIX_PATH` to the absolute path of `build/install`, call `find_package(nathr CONFIG REQUIRED)`, and link your target against `nathr::nathr`. [C++ API](include/nathr)
-
-The included consumer example checks that a separate C++ project can find and run the installed library. It exits successfully without printing output. [Consumer source](tests/consumer/main.cpp)
-
-```sh
-cmake -S tests/consumer -B build/consumer -G Ninja \
-    -DCMAKE_PREFIX_PATH="$PWD/build/install"
-cmake --build build/consumer
-./build/consumer/nathr-consumer tests/fixtures/model
-```
+Use `all` to check every setup checkpoint. [Reference values and measurement details](docs/inference-engine.md#run-the-checks-with-nathr)

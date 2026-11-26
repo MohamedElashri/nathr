@@ -19,14 +19,24 @@ Sampler::Sampler(SamplingOptions options, std::size_t vocabulary)
 }
 
 Token Sampler::select(std::span<const float> logits, std::mt19937_64& generator) {
-    if (logits.size() != vocabulary_ ||
-        !std::ranges::all_of(logits, [](float value) { return std::isfinite(value); })) {
-        throw Error(ErrorCode::invalid_argument, "sampler requires vocabulary-sized finite logits");
+    constexpr auto invalid_logits = "sampler requires vocabulary-sized finite logits";
+    if (logits.size() != vocabulary_)
+        throw Error(ErrorCode::invalid_argument, invalid_logits);
+    if (options_.greedy) {
+        Token best = 0;
+        for (Token i = 0; i < logits.size(); ++i) {
+            if (!std::isfinite(logits[i]))
+                throw Error(ErrorCode::invalid_argument, invalid_logits);
+            if (logits[i] > logits[best])
+                best = i;
+        }
+        return best;
     }
-    if (options_.greedy)
-        return static_cast<Token>(std::ranges::max_element(logits) - logits.begin());
-    for (std::size_t i = 0; i < logits.size(); ++i)
-        candidates_[i] = {static_cast<Token>(i), logits[i]};
+    for (Token i = 0; i < logits.size(); ++i) {
+        if (!std::isfinite(logits[i]))
+            throw Error(ErrorCode::invalid_argument, invalid_logits);
+        candidates_[i] = {i, logits[i]};
+    }
     auto allowed = std::span(candidates_);
     if (options_.top_k)
         allowed = allowed.first(options_.top_k);
@@ -59,19 +69,25 @@ Token Sampler::select(std::span<const float> logits, std::mt19937_64& generator)
 
 namespace {
 GenerationResult generate_tokens(auto& session, std::size_t length, Sampler& sampler, Token eos,
-                                 std::size_t max_new_tokens, const TokenSink& emit) {
+                                 std::span<const Token> stop_ids, std::size_t max_new_tokens,
+                                 const GenerationSink& emit) {
     GenerationResult result;
     if (!max_new_tokens)
         return result;
-    if (eos >= session.logits().size() || !emit || max_new_tokens - 1 > session.capacity() - length) {
+    const auto vocabulary = session.logits().size();
+    if (eos >= vocabulary || !emit || max_new_tokens - 1 > session.capacity() - length ||
+        std::ranges::any_of(stop_ids, [&](Token id) { return id >= vocabulary; })) {
         throw Error(ErrorCode::invalid_argument, "invalid EOS, token sink or generation budget");
     }
     while (result.emitted < max_new_tokens) {
         const auto token = session.sample(sampler);
-        emit(token);
+        const bool eos_token = token == eos;
+        const bool stop_id = std::ranges::find(stop_ids, token) != stop_ids.end();
+        const bool keep_going = emit(token, eos_token || stop_id);
         ++result.emitted;
-        result.stopped_at_eos = token == eos;
-        if (result.stopped_at_eos || result.emitted == max_new_tokens) {
+        result.stopped_at_eos = eos_token;
+        result.stopped_at_stop = !eos_token && (stop_id || !keep_going);
+        if (result.stopped_at_eos || result.stopped_at_stop || result.emitted == max_new_tokens) {
             result.pending = token;
             break;
         }
@@ -82,14 +98,91 @@ GenerationResult generate_tokens(auto& session, std::size_t length, Sampler& sam
 }
 } // namespace
 
+GenerationText::GenerationText(Tokenizer tokenizer, std::vector<std::string> stops)
+    : tokenizer_(std::move(tokenizer)), stops_(std::move(stops)) {
+    if (stops_.size() > 16)
+        throw Error(ErrorCode::resource_limit, "at most 16 stop strings are supported");
+    for (const auto& stop : stops_) {
+        Utf8Stream check;
+        if (stop.empty() || stop.size() > 256 || check.push(stop) != stop || !check.finish().empty())
+            throw Error(ErrorCode::invalid_argument,
+                        "stop strings must be nonempty UTF-8 of at most 256 bytes");
+    }
+}
+
+std::string GenerationText::push_text(std::string text) {
+    if (stopped_)
+        return {};
+    if (stops_.empty())
+        return text;
+    pending_.append(text);
+    auto end = std::string::npos;
+    std::size_t hold = 0;
+    for (const auto& stop : stops_) {
+        end = std::min(end, pending_.find(stop));
+        auto size = std::min(stop.size() - 1, pending_.size());
+        while (size > hold && !std::string_view(pending_).ends_with(std::string_view(stop).substr(0, size)))
+            --size;
+        hold = std::max(hold, size);
+    }
+    if (end != std::string::npos) {
+        stopped_ = true;
+        auto output = pending_.substr(0, end);
+        pending_.clear();
+        return output;
+    }
+    const auto bytes = pending_.size() - hold;
+    auto output = pending_.substr(0, bytes);
+    pending_.erase(0, bytes);
+    return output;
+}
+
+std::string GenerationText::push(Token token) {
+    if (stopped_ || token >= tokenizer_.vocabulary())
+        return {};
+    const auto bytes = tokenizer_.decode_piece(token, first_, true);
+    first_ = first_ && bytes.empty() && tokenizer_.token_bytes(token, true).empty();
+    if (bytes.empty())
+        return {};
+    return push_text(utf8_.push(bytes));
+}
+
+std::string GenerationText::finish() {
+    auto text = push_text(utf8_.finish());
+    text += std::exchange(pending_, {});
+    return text;
+}
+
+GenerationResult generate_until(Session& session, Sampler& sampler, Token eos,
+                                std::span<const Token> stop_ids, std::size_t max_new_tokens,
+                                const GenerationSink& emit) {
+    return generate_tokens(session, session.history().size(), sampler, eos, stop_ids, max_new_tokens, emit);
+}
+
+GenerationResult generate_until(T5Session& session, Sampler& sampler, Token eos,
+                                std::span<const Token> stop_ids, std::size_t max_new_tokens,
+                                const GenerationSink& emit) {
+    return generate_tokens(session, session.length(), sampler, eos, stop_ids, max_new_tokens, emit);
+}
+
 GenerationResult generate(Session& session, Sampler& sampler, Token eos, std::size_t max_new_tokens,
                           const TokenSink& emit) {
-    return generate_tokens(session, session.history().size(), sampler, eos, max_new_tokens, emit);
+    if (max_new_tokens && !emit)
+        throw Error(ErrorCode::invalid_argument, "missing token sink");
+    return generate_until(session, sampler, eos, {}, max_new_tokens, [&](Token token, bool) {
+        emit(token);
+        return true;
+    });
 }
 
 GenerationResult generate(T5Session& session, Sampler& sampler, Token eos, std::size_t max_new_tokens,
                           const TokenSink& emit) {
-    return generate_tokens(session, session.length(), sampler, eos, max_new_tokens, emit);
+    if (max_new_tokens && !emit)
+        throw Error(ErrorCode::invalid_argument, "missing token sink");
+    return generate_until(session, sampler, eos, {}, max_new_tokens, [&](Token token, bool) {
+        emit(token);
+        return true;
+    });
 }
 
 } // namespace nathr

@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libicu-dev ninja-build
+      - name: Build and test
+        run: |
+          cmake --preset release
+          cmake --build --preset release --parallel 2
+          ctest --preset release
+      - name: Package and verify the extracted release
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test "$(build/release/nathr --version)" = "nathr $version"
+          cpack --config build/release/CPackConfig.cmake -B build/packages
+          mkdir -p build/verify
+          archive=build/packages/nathr-linux-x86_64.tar.gz
+          mv "build/packages/nathr-$version-linux-x86_64.tar.gz" "$archive"
+          tar -xzf "$archive" --strip-components=1 -C build/verify
+          test "$(build/verify/bin/nathr --version)" = "nathr $version"
+          build/verify/share/nathr/setup.sh --help
+          python3 -B tests/serve.py "$PWD/build/verify/bin/nathr" "$PWD/tests/fixtures"
+          cd build/packages
+          sha256sum nathr-linux-x86_64.tar.gz > nathr-linux-x86_64.tar.gz.sha256
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --latest --title "Nathr $GITHUB_REF_NAME" \
+            --notes "Ubuntu 24.04 x86-64 binary with the local browser interface, CLI, C++ library, and checkpoint downloader. See the README for installation and model setup." \
+            build/packages/nathr-linux-x86_64.tar.gz build/packages/nathr-linux-x86_64.tar.gz.sha256

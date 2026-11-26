@@ -146,21 +146,53 @@ KernelChoice scalar_kernel(DType type) {
     }
 }
 
-Cache::Cache(const ModelConfig& config, std::size_t limit, KvPrecision format)
+Cache::Cache(const ModelConfig& config, std::size_t limit, KvPrecision format, CachePagePool* pool)
     : precision(format), capacity(limit), kv_heads(config.kv_heads), width(config.head_dim),
-      bank_elements(product({config.layers, kv_heads, capacity, width}, "KV cache")) {
-    const auto count = product({2, bank_elements}, "KV cache");
-    const auto element_size = precision == KvPrecision::f16 ? sizeof(std::uint16_t) : sizeof(float);
-    if (count > max_kv_cache_bytes / element_size)
+      bank_width_(product({config.layers, kv_heads, width}, "KV cache")),
+      bytes_per_token_(required_bytes(config, 1, format)), pool_(pool) {
+    if (product({capacity, bytes_per_token_}, "KV cache") > max_kv_cache_bytes)
         throw Error(ErrorCode::resource_limit, "KV cache exceeds 512 MiB");
     if (precision == KvPrecision::f16)
-        storage.emplace<std::vector<std::uint16_t>>(count);
-    else
-        storage.emplace<std::vector<float>>(count);
+        pages_.emplace<Pages<std::uint16_t>>();
+}
+
+std::size_t Cache::required_bytes(const ModelConfig& config, std::size_t capacity, KvPrecision precision) {
+    const auto element_size = precision == KvPrecision::f16 ? sizeof(std::uint16_t) : sizeof(float);
+    return product({2, config.layers, config.kv_heads, config.head_dim, capacity, element_size}, "KV cache");
+}
+
+std::size_t Cache::page_length(std::size_t page) const noexcept {
+    return std::min(page_tokens, capacity - page * page_tokens);
+}
+
+void Cache::ensure(std::size_t positions) {
+    if (positions > capacity)
+        throw Error(ErrorCode::invalid_argument, "KV page request exceeds capacity");
+    const auto required = positions / page_tokens + (positions % page_tokens != 0);
+    std::visit(
+        [&](auto& pages) {
+            using Element = typename std::decay_t<decltype(pages)>::value_type::element_type;
+            const auto original = pages.size();
+            try {
+                while (pages.size() < required) {
+                    const auto count = 2 * bank_width_ * page_length(pages.size());
+                    const auto data = pool_ ? pool_->acquire<Element>(count)
+                                            : std::make_unique_for_overwrite<Element[]>(count).release();
+                    using Lease = typename std::decay_t<decltype(pages)>::value_type;
+                    pages.push_back(Lease(data, {pool_, count}));
+                }
+            } catch (...) {
+                while (pages.size() > original)
+                    pages.pop_back();
+                throw;
+            }
+        },
+        pages_);
 }
 
 std::size_t Cache::bytes() const noexcept {
-    return std::visit([](const auto& bank) { return bank.capacity() * sizeof(bank.front()); }, storage);
+    const auto count = std::visit([](const auto& pages) { return pages.size(); }, pages_);
+    return std::min(count * page_tokens, capacity) * bytes_per_token_;
 }
 
 void Scalar::embedding(TensorView table, std::size_t index, std::span<float> output) {
@@ -289,31 +321,38 @@ void attend(const ModelConfig& config, std::size_t layer, Cache* cache, std::spa
         const auto kv = head / group;
         const auto q = query.subspan(head * width, width);
         auto out = output.subspan(head * width, width);
-        const auto get = [&](bool value, std::size_t i) -> std::span<const T> {
+        const auto visit_rows = [&](bool value, const auto& visit) {
             if constexpr (std::is_same_v<T, float>) {
-                if (!cache)
-                    return (value ? values : keys).subspan(i * kv_width + kv * width, width);
+                if (!cache) {
+                    const auto data = value ? values : keys;
+                    for (std::size_t i = 0; i < scores.size(); ++i)
+                        visit(i, data.subspan(i * kv_width + kv * width, width));
+                    return;
+                }
             }
-            return cache->row<T>(value, layer, kv, i);
+            for (std::size_t start = 0; start < scores.size(); start += Cache::page_tokens) {
+                const auto rows = cache->head_page<T>(value, layer, kv, start / Cache::page_tokens);
+                const auto count = std::min(Cache::page_tokens, scores.size() - start);
+                for (std::size_t i = 0; i < count; ++i)
+                    visit(start + i, std::span<const T>(rows.subspan(i * width, width)));
+            }
         };
-        for (std::size_t i = 0; i < scores.size(); ++i) {
-            const auto k = get(false, i);
+        visit_rows(false, [&](std::size_t i, std::span<const T> k) {
             double sum = 0;
             for (std::size_t d = 0; d < width; ++d)
                 sum += static_cast<double>(q[d]) * decode(k[d]);
             scores[i] = static_cast<float>(sum * scale);
-        }
+        });
         if (!bias.empty())
             Scalar::add(scores, bias.subspan(head * scores.size(), scores.size()));
         Scalar::softmax(scores);
         for (std::size_t offset = 0; offset < width; offset += 64) {
             std::array<double, 64> sums{};
             const auto lanes = std::min(sums.size(), width - offset);
-            for (std::size_t i = 0; i < scores.size(); ++i) {
-                const auto v = get(true, i);
+            visit_rows(true, [&](std::size_t i, std::span<const T> v) {
                 for (std::size_t d = 0; d < lanes; ++d)
                     sums[d] += static_cast<double>(scores[i]) * decode(v[offset + d]);
-            }
+            });
             for (std::size_t d = 0; d < lanes; ++d)
                 out[offset + d] = static_cast<float>(sums[d]);
         }

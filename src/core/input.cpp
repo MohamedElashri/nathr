@@ -91,6 +91,23 @@ std::size_t natural(const Json& value, std::string_view context) {
     return value.get<std::size_t>();
 }
 
+Token primary_eos_id(const Json& value, std::size_t vocabulary, std::string_view context) {
+    const auto checked_id = [&](const Json& item) {
+        const auto id = natural(item, context);
+        if (id >= vocabulary)
+            throw Error(ErrorCode::malformed, std::string(context) + ": token ID exceeds vocabulary");
+        return static_cast<Token>(id);
+    };
+    if (!value.is_array())
+        return checked_id(value);
+    if (value.empty())
+        throw Error(ErrorCode::malformed, std::string(context) + ": empty token ID list");
+    const auto first = checked_id(value.front());
+    for (std::size_t i = 1; i < value.size(); ++i)
+        (void)checked_id(value[i]);
+    return first;
+}
+
 std::uint64_t little_integer(std::span<const std::byte> bytes) {
     if (bytes.size() > sizeof(std::uint64_t)) {
         throw Error(ErrorCode::malformed, "integer exceeds 64 bits");

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
 
 namespace nathr::detail {
 
@@ -53,10 +54,24 @@ Bert::Bert(SafeTensors& file, const std::filesystem::path& path, const ModelConf
     const auto embeddings = prefix + "embeddings.";
     tokens_ = take(embeddings + "word_embeddings.weight", {config.vocabulary, h});
     positions_ = take(embeddings + "position_embeddings.weight", {config.context, h});
-    const auto segments = natural(json.value("type_vocab_size", Json(2)), "BERT type_vocab_size");
-    if (!segments)
+    const auto check_index_buffer = [&](std::string_view name, bool positions) {
+        if (!file.contains(name))
+            return;
+        const auto tensor = file.take(name, {1, config.context});
+        if (tensor.desc.dtype != DType::i64)
+            throw Error(ErrorCode::unsupported, path.string() + ": expected I64 in " + std::string(name));
+        for (std::size_t i = 0; i < config.context; ++i) {
+            if (little_integer(tensor.bytes.subspan(i * 8, 8)) != (positions ? i : 0))
+                throw Error(ErrorCode::unsupported,
+                            path.string() + ": unsupported index buffer " + std::string(name));
+        }
+    };
+    check_index_buffer(embeddings + "position_ids", true);
+    check_index_buffer(embeddings + "token_type_ids", false);
+    segments_count_ = natural(json.value("type_vocab_size", Json(2)), "BERT type_vocab_size");
+    if (!segments_count_)
         throw Error(ErrorCode::unsupported, path.string() + ": BERT requires segment embeddings");
-    segments_ = take(embeddings + "token_type_embeddings.weight", {segments, h});
+    segments_ = take(embeddings + "token_type_embeddings.weight", {segments_count_, h});
     embedding_norm_ = norm(embeddings + "LayerNorm");
     layers_.reserve(config.layers);
     for (std::size_t i = 0; i < config.layers; ++i) {
@@ -68,7 +83,57 @@ Bert::Bert(SafeTensors& file, const std::filesystem::path& path, const ModelConf
                            norm(attention + "LayerNorm"), linear(layer + "intermediate.dense", h, f),
                            linear(layer + "output.dense", f, h), norm(layer + "output.LayerNorm")});
     }
-    // Checkpoints can include a pooler or task head. Encoding uses only the underlying encoder.
+    const auto pooler = prefix + "pooler.dense";
+    if (file.contains(pooler + ".weight"))
+        pooler_ = linear(pooler, h, h);
+    if (json.value("architectures", Json::array()) == Json::array({"BertForSequenceClassification"})) {
+        const auto labels = json.value("id2label", Json::object());
+        label_count_ =
+            natural(json.value("num_labels", Json(labels.empty() ? 2 : labels.size())), "BERT num_labels");
+        if (!pooler_ || !label_count_ || label_count_ > max_vocabulary)
+            throw Error(ErrorCode::unsupported, path.string() + ": invalid BERT classifier");
+        classifier_ = linear("classifier", h, label_count_);
+    }
+    if (std::filesystem::exists(path / "modules.json")) {
+        try {
+            const auto modules = read_json(path / "modules.json", mib);
+            constexpr std::string_view root = "sentence_transformers.models.";
+            if (!modules.is_array() || modules.size() < 2 || modules.size() > 3 ||
+                modules[0].at("type") != std::string(root) + "Transformer" || modules[0].at("path") != "" ||
+                modules[1].at("type") != std::string(root) + "Pooling" ||
+                (modules.size() == 3 && modules[2].at("type") != std::string(root) + "Normalize")) {
+                throw Error(ErrorCode::unsupported, path.string() + ": unsupported sentence model modules");
+            }
+            const auto directory = std::filesystem::path(modules[1].at("path").get<std::string>());
+            if (directory.empty() || directory.has_parent_path() || directory.is_absolute() ||
+                directory == "." || directory == "..")
+                throw Error(ErrorCode::malformed, path.string() + ": invalid pooling module path");
+            const auto pooling = read_json(path / directory / "config.json", mib);
+            const bool mean = pooling.value("pooling_mode_mean_tokens", false);
+            const bool cls = pooling.value("pooling_mode_cls_token", false);
+            const bool max = pooling.value("pooling_mode_max_tokens", false);
+            if (static_cast<int>(mean) + cls + max != 1 ||
+                natural(pooling.at("word_embedding_dimension"), "pooling width") != h ||
+                pooling.value("pooling_mode_mean_sqrt_len_tokens", false) ||
+                pooling.value("pooling_mode_weightedmean_tokens", false) ||
+                pooling.value("pooling_mode_lasttoken", false))
+                throw Error(ErrorCode::unsupported, path.string() + ": unsupported sentence pooling");
+            pooling_ = mean ? Pooling::mean : cls ? Pooling::cls : Pooling::maximum;
+            normalize_embedding_ = modules.size() == 3;
+            embedding_context_ = config.context;
+            if (std::filesystem::exists(path / "sentence_bert_config.json")) {
+                const auto sentence = read_json(path / "sentence_bert_config.json", mib);
+                const auto limit = natural(sentence.value("max_seq_length", Json(config.context)),
+                                           "sentence max_seq_length");
+                if (!limit || sentence.value("do_lower_case", false))
+                    throw Error(ErrorCode::unsupported,
+                                path.string() + ": unsupported sentence input options");
+                embedding_context_ = std::min(config.context, limit);
+            }
+        } catch (const Json::exception& error) {
+            throw Error(ErrorCode::malformed, path.string() + ": " + error.what());
+        }
+    }
 }
 
 namespace {
@@ -88,35 +153,44 @@ struct BertWorkspace final : Workspace {
 };
 } // namespace
 
-std::vector<float> Bert::encode(std::span<const Token> tokens) const {
+std::vector<float> Bert::encode(std::span<const Token> tokens, std::span<const Token> token_types) const {
     const auto h = config_.hidden, count = tokens.size();
+    if ((!token_types.empty() && token_types.size() != count) ||
+        std::ranges::any_of(token_types, [&](Token id) { return id >= segments_count_; }))
+        throw Error(ErrorCode::invalid_argument, "invalid token_type_ids");
     BertWorkspace w(config_, count);
     std::vector<float> hidden(w.query.size());
-    const auto affine = [&](const Affine& weights, std::span<const float> input, std::span<float> output) {
-        backend_.project(weights.weight, input, output, count, w.packed);
+    const auto add_bias = [&](std::span<float> output, TensorView bias) {
         const auto width = output.size() / count;
         for (std::size_t i = 0; i < count; ++i)
-            Scalar::add_bias(row(output, width, i), weights.bias);
+            Scalar::add_bias(row(output, width, i), bias);
+    };
+    const auto affine = [&](const Affine& weights, std::span<const float> input, std::span<float> output) {
+        backend_.project(weights.weight, input, output, count, w.packed);
+        add_bias(output, weights.bias);
     };
     const auto normalize = [&](const Affine& norm, std::span<float> input) {
         Scalar::layer_norm(norm.weight, norm.bias, input, input, config_.rms_epsilon);
     };
     const auto segment = w.attended.first(h);
-    Scalar::embedding(segments_, 0, segment);
     for (std::size_t i = 0; i < count; ++i) {
         auto activation = row(hidden, h, i);
         auto position = w.projected.first(h);
         Scalar::embedding(tokens_, tokens[i], activation);
         Scalar::embedding(positions_, i, position);
+        Scalar::embedding(segments_, token_types.empty() ? 0 : token_types[i], segment);
         Scalar::add(activation, segment);
         Scalar::add(activation, position);
         normalize(embedding_norm_, activation);
     }
     const auto scale = 1.0 / std::sqrt(static_cast<double>(config_.head_dim));
     for (const auto& layer : layers_) {
-        affine(layer.query, hidden, w.query);
-        affine(layer.key, hidden, w.key);
-        affine(layer.value, hidden, w.value);
+        backend_.project(
+            {{layer.query.weight, w.query}, {layer.key.weight, w.key}, {layer.value.weight, w.value}}, hidden,
+            count, w.packed);
+        add_bias(w.query, layer.query.bias);
+        add_bias(w.key, layer.key.bias);
+        add_bias(w.value, layer.value.bias);
         for (std::size_t i = 0; i < count; ++i)
             Scalar::attention_range(config_, 0, nullptr, w.key, w.value, row(w.query, h, i),
                                     row(w.attended, h, i), w.scores, scale);
@@ -135,6 +209,63 @@ std::vector<float> Bert::encode(std::span<const Token> tokens) const {
     if (!std::ranges::all_of(hidden, [](float value) { return std::isfinite(value); }))
         throw Error(ErrorCode::backend, "BERT encoder produced non-finite output");
     return hidden;
+}
+
+std::vector<OutputInfo> Bert::outputs() const {
+    std::vector<OutputInfo> result{{"hidden_states", config_.hidden, config_.context, true}};
+    if (pooler_)
+        result.push_back({"pooler_output", config_.hidden, config_.context, false});
+    if (pooling_ != Pooling::none)
+        result.push_back({"sentence_embedding", config_.hidden, embedding_context_, false});
+    if (classifier_)
+        result.push_back({"logits", label_count_, config_.context, false});
+    return result;
+}
+
+TensorResult Bert::infer(InferenceInput input, const OutputInfo& output) const {
+    auto hidden = encode(input.tokens, input.token_type_ids);
+    const auto width = config_.hidden;
+    if (output.name == "hidden_states")
+        return {{input.tokens.size(), width}, std::move(hidden)};
+
+    std::vector<float> result(output.width);
+    if (output.name == "sentence_embedding") {
+        for (std::size_t d = 0; d < width; ++d) {
+            if (pooling_ == Pooling::cls) {
+                result[d] = hidden[d];
+                continue;
+            }
+            double sum = 0;
+            float max = hidden[d];
+            for (std::size_t i = 0; i < input.tokens.size(); ++i) {
+                const auto value = hidden[i * width + d];
+                sum += value;
+                max = std::max(max, value);
+            }
+            result[d] = pooling_ == Pooling::mean ? static_cast<float>(sum / input.tokens.size()) : max;
+        }
+        if (normalize_embedding_) {
+            const auto norm = std::max(
+                1e-12, std::sqrt(std::inner_product(result.begin(), result.end(), result.begin(), 0.0)));
+            for (auto& value : result)
+                value = static_cast<float>(value / norm);
+        }
+    } else {
+        std::vector<float> pooled(width);
+        backend_.project(pooler_->weight, std::span(hidden).first(width), pooled, 1, {});
+        Scalar::add_bias(pooled, pooler_->bias);
+        for (auto& value : pooled)
+            value = std::tanh(value);
+        if (output.name == "pooler_output")
+            result = std::move(pooled);
+        else {
+            backend_.project(classifier_->weight, pooled, result, 1, {});
+            Scalar::add_bias(result, classifier_->bias);
+        }
+    }
+    if (!std::ranges::all_of(result, [](float value) { return std::isfinite(value); }))
+        throw Error(ErrorCode::backend, "BERT output contains non-finite values");
+    return {{output.width}, std::move(result)};
 }
 
 } // namespace nathr::detail

@@ -29,6 +29,7 @@ enum class DType : std::uint32_t {
     iq3_s = 21,
     iq2_s = 22,
     iq4_xs = 23,
+    i64 = 27,
     iq1_m = 29,
     bf16 = 30,
     id_limit,

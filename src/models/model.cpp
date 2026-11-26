@@ -16,6 +16,8 @@ CpuBackend::CpuBackend(BackendOptions options, CpuFeatures features)
 TensorView CpuBackend::bind(TensorView view, const std::filesystem::path& path, std::string_view name) {
     const auto type = view.desc.dtype;
     const auto format = encoding(type);
+    if (!format)
+        throw Error(ErrorCode::unsupported, path.string() + ": no weight encoding for " + std::string(name));
     auto& kernel = kernels_[static_cast<std::size_t>(type)];
     if (!kernel.dot)
         kernel = select_kernel(type, options_.policy, features_);
@@ -28,8 +30,12 @@ TensorView CpuBackend::bind(TensorView view, const std::filesystem::path& path, 
 
 void CpuBackend::project(TensorView weight, std::span<const float> input, std::span<float> output,
                          std::size_t tokens, std::span<float> packed) const {
-    detail::project(kernels_[static_cast<std::size_t>(weight.desc.dtype)], pool_, weight, input, output,
-                    tokens, packed);
+    project({{weight, output}}, input, tokens, packed);
+}
+
+void CpuBackend::project(std::initializer_list<Projection> projections, std::span<const float> input,
+                         std::size_t tokens, std::span<float> packed) const {
+    detail::project(pool_, kernels_, {projections.begin(), projections.size()}, input, tokens, packed);
 }
 
 std::string_view CpuBackend::kernel(std::uint32_t id) const noexcept {
@@ -74,6 +80,8 @@ void Evaluation::publish_logits(std::size_t index, std::span<const float> values
     record("logits", TraceEvent::model_level, index, values);
     if (mode == LogitsMode::all_tokens)
         sink(start + index, values);
+    if (!last_logits.empty())
+        std::ranges::copy(values, last_logits.begin());
 }
 
 void validate_tokens(std::span<const Token> tokens, const ModelConfig& config, std::size_t limit) {
@@ -194,6 +202,64 @@ ModelMemory Model::memory() const noexcept {
 
 std::string_view Model::architecture() const noexcept {
     return impl_->architecture;
+}
+
+std::vector<OutputInfo> Model::outputs() const {
+    if (const auto* bert = std::get_if<std::unique_ptr<Bert>>(&impl_->execution))
+        return (*bert)->outputs();
+    const auto limit = std::holds_alternative<std::unique_ptr<Decoder>>(impl_->execution)
+                           ? std::min(config().context, max_uncached_tokens)
+                           : config().context;
+    return {{"logits", config().vocabulary, limit, true}};
+}
+
+bool Model::supports_generation() const noexcept {
+    return !std::holds_alternative<std::unique_ptr<Bert>>(impl_->execution);
+}
+
+bool Model::supports_fused_batch() const noexcept {
+    return std::holds_alternative<std::unique_ptr<Decoder>>(impl_->execution);
+}
+
+TensorResult Model::infer(InferenceInput input, std::string_view output) const {
+    const auto available = outputs();
+    const auto info = std::ranges::find(available, output, &OutputInfo::name);
+    if (info == available.end())
+        throw Error(ErrorCode::unsupported, "checkpoint has no output named " + std::string(output));
+    validate_tokens(input.tokens, config(), info->input_limit);
+    if (const auto* bert = std::get_if<std::unique_ptr<Bert>>(&impl_->execution)) {
+        if (!input.decoder_tokens.empty())
+            throw Error(ErrorCode::invalid_argument, "BERT input has no decoder tokens");
+        return (*bert)->infer(input, *info);
+    }
+    if (!input.token_type_ids.empty())
+        throw Error(ErrorCode::invalid_argument, "this checkpoint has no token_type_ids input");
+    const auto width = info->width;
+    if (std::holds_alternative<std::unique_ptr<Decoder>>(impl_->execution)) {
+        if (!input.decoder_tokens.empty())
+            throw Error(ErrorCode::invalid_argument, "decoder-only input uses tokens");
+        TensorResult result{{input.tokens.size(), width}, std::vector<float>(input.tokens.size() * width)};
+        forward(input.tokens, LogitsMode::all_tokens, {},
+                [&](std::size_t position, std::span<const float> values) {
+                    std::ranges::copy(values,
+                                      result.values.begin() + static_cast<std::ptrdiff_t>(position * width));
+                });
+        return result;
+    }
+    const auto count = std::max<std::size_t>(1, input.decoder_tokens.size());
+    if (!input.decoder_tokens.empty()) {
+        validate_tokens(input.decoder_tokens, config(), config().context);
+        if (input.decoder_tokens.front() != config().bos)
+            throw Error(ErrorCode::invalid_argument, "T5 decoder_tokens must begin with decoder_start_id");
+    }
+    TensorResult result{{count, width}, std::vector<float>(count * width)};
+    auto session = T5Session::create(*this, input.tokens, count);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (i)
+            session.append(input.decoder_tokens.subspan(i, 1));
+        std::ranges::copy(session.logits(), result.values.begin() + static_cast<std::ptrdiff_t>(i * width));
+    }
+    return result;
 }
 
 std::string_view Model::backend() const noexcept {

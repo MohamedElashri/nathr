@@ -2,6 +2,7 @@
 
 #include "core/input.hpp"
 #include "formats/gguf.hpp"
+#include "tokenizer/subword.hpp"
 #include "tokenizer/unicode_tables.hpp"
 
 #include <algorithm>
@@ -258,13 +259,17 @@ struct Tokenizer::Impl {
     };
 
     explicit Impl(const detail::Json& json) {
+        const auto& model = json.at("model");
+        if (model.at("vocab").is_array() || has_type(json.at("decoder"), "WordPiece")) {
+            subword = std::make_unique<detail::SubwordTokenizer>(json);
+            return;
+        }
         if (json.at("version") != "1.0" || !json.at("normalizer").is_null() ||
             !json.at("truncation").is_null() || !json.at("padding").is_null() ||
             (!json.at("post_processor").is_null() && !has_type(json.at("post_processor"), "ByteLevel")) ||
             !has_type(json.at("decoder"), "ByteLevel"))
             throw Error(ErrorCode::unsupported, "unsupported tokenizer pipeline");
         pre = read_pretokenizer(json.at("pre_tokenizer"));
-        const auto& model = json.at("model");
         if (model.value("type", std::string("BPE")) != "BPE" || !model.at("dropout").is_null() ||
             !model.at("unk_token").is_null() || !empty_affix(model.at("continuing_subword_prefix")) ||
             !empty_affix(model.at("end_of_word_suffix")) || model.value("fuse_unk", false) ||
@@ -403,6 +408,7 @@ struct Tokenizer::Impl {
             output.push_back(nodes[i].id);
     }
 
+    std::unique_ptr<detail::SubwordTokenizer> subword;
     std::vector<std::string> raw;
     std::vector<bool> special;
     std::array<Token, 256> byte_tokens;
@@ -481,6 +487,8 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
             if (!sidecar_merges.is_array() || !std::ranges::equal(merges, sidecar_merges, same_pair))
                 throw Error(ErrorCode::malformed, "GGUF merges differ from the tokenizer sidecar");
             auto impl = std::make_shared<Impl>(json);
+            if (impl->subword)
+                throw Error(ErrorCode::unsupported, "GGUF requires a byte-level BPE sidecar");
             if (types != metadata.end() && impl->special != special)
                 throw Error(ErrorCode::malformed, "GGUF token types differ from the tokenizer sidecar");
             if (pre != Pretokenizer::unsupported && impl->pre != pre)
@@ -527,10 +535,12 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
 }
 
 std::size_t Tokenizer::vocabulary() const noexcept {
-    return impl_->raw.size();
+    return impl_->subword ? impl_->subword->vocabulary() : impl_->raw.size();
 }
 
 std::vector<Token> Tokenizer::encode(std::string_view text) const {
+    if (impl_->subword)
+        return impl_->subword->encode(text, {}).ids;
     const auto cp = units(text);
     const auto count = cp.size() - 1;
     std::vector<Token> result;
@@ -558,7 +568,15 @@ std::vector<Token> Tokenizer::encode(std::string_view text) const {
     return result;
 }
 
+TokenizedInput Tokenizer::encode_pair(std::string_view text, std::string_view second) const {
+    if (!impl_->subword)
+        throw Error(ErrorCode::unsupported, "this tokenizer has no text-pair template");
+    return impl_->subword->encode(text, second);
+}
+
 std::vector<std::string> Tokenizer::pretokenize(std::string_view text) const {
+    if (impl_->subword)
+        return impl_->subword->pieces(text);
     const auto cp = units(text);
     std::vector<std::string> result;
     split(text, cp, 0, cp.size() - 1, impl_->pre,
@@ -567,12 +585,22 @@ std::vector<std::string> Tokenizer::pretokenize(std::string_view text) const {
 }
 
 std::string_view Tokenizer::token_bytes(Token token, bool skip_special) const {
+    if (impl_->subword)
+        return impl_->subword->piece(token, skip_special);
     if (token >= vocabulary())
         throw Error(ErrorCode::invalid_argument, "token ID exceeds tokenizer vocabulary");
     return skip_special && impl_->special[token] ? std::string_view{} : impl_->raw[token];
 }
 
+std::string Tokenizer::decode_piece(Token token, bool first, bool skip_special) const {
+    if (impl_->subword)
+        return impl_->subword->decode_piece(token, first, skip_special);
+    return std::string(token_bytes(token, skip_special));
+}
+
 std::string Tokenizer::decode_bytes(std::span<const Token> tokens, bool skip_special) const {
+    if (impl_->subword)
+        return impl_->subword->decode(tokens, skip_special);
     std::string bytes;
     for (const auto token : tokens) {
         auto piece = token_bytes(token, skip_special);

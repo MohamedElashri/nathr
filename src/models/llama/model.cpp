@@ -46,7 +46,7 @@ class Llama final : public Decoder {
     std::unique_ptr<Workspace> workspace(std::size_t positions, std::size_t block) const override {
         return std::make_unique<LlamaWorkspace>(config, positions, block);
     }
-    void execute(Workspace& scratch, const Evaluation& evaluation) const override;
+    void execute_batch(Workspace& scratch, const EvaluationBatch& batch) const override;
 
   private:
     const ModelConfig& config;
@@ -107,15 +107,12 @@ Llama::Llama(File& file, const std::filesystem::path& path, const ModelConfig& c
     }
 }
 
-void Llama::execute(Workspace& scratch, const Evaluation& evaluation) const {
+void Llama::execute_batch(Workspace& scratch, const EvaluationBatch& batch) const {
     auto& w = static_cast<LlamaWorkspace&>(scratch);
-    const auto tokens = evaluation.tokens;
-    const auto start = evaluation.start;
-    auto* const cache = evaluation.cache;
     const auto h = config.hidden;
     const auto kv = config.kv_heads * config.head_dim;
     const auto ff = config.intermediate;
-    const auto count = tokens.size();
+    const auto count = batch.size();
     const auto hidden = w.hidden.first(count * h);
     const auto queries = w.query.first(count * h);
     const auto keys = w.keys.first(count * kv);
@@ -127,82 +124,81 @@ void Llama::execute(Workspace& scratch, const Evaluation& evaluation) const {
     const auto up = w.up.first(count * ff);
     const auto linear = [&](TensorView weight, std::span<const float> input, std::span<float> result,
                             std::size_t rows) { backend.project(weight, input, result, rows, w.packed); };
-    for (std::size_t i = 0; i < count; ++i) {
-        auto activation = row(hidden, h, i);
-        Scalar::embedding(embedding, tokens[i], activation);
-        evaluation.record("embedding", TraceEvent::model_level, i, activation);
-    }
+    batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+        auto activation = row(hidden, h, index);
+        Scalar::embedding(embedding, e.tokens[i], activation);
+        e.record("embedding", TraceEvent::model_level, i, activation);
+    });
 
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
         const auto& weights = layers[layer];
-        for (std::size_t i = 0; i < count; ++i) {
-            auto activation = row(hidden, h, i);
-            auto norm_row = row(norms, h, i);
-            evaluation.record("layer_input", layer, i, activation);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto activation = row(hidden, h, index);
+            auto norm_row = row(norms, h, index);
+            e.record("layer_input", layer, i, activation);
             Scalar::rms_norm(weights.input_norm, activation, norm_row, config.rms_epsilon);
-            evaluation.record("input_norm", layer, i, norm_row);
-        }
-        linear(weights.q, norms, queries, count);
-        linear(weights.k, norms, keys, count);
-        linear(weights.v, norms, values, count);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto q = row(queries, h, i);
-            auto k = row(keys, kv, i);
-            auto v = row(values, kv, i);
-            evaluation.record("q_before_rope", layer, i, q);
-            evaluation.record("k_before_rope", layer, i, k);
-            evaluation.record("value", layer, i, v);
-            Scalar::rope(q, k, frequency, start + i);
-            evaluation.record("q_after_rope", layer, i, q);
-            evaluation.record("key_after_rope", layer, i, k);
-            if (cache)
-                Scalar::store(*cache, layer, start + i, k, v);
-        }
-        for (std::size_t i = 0; i < count; ++i) {
-            auto result = row(attention, h, i);
-            Scalar::attention(config, layer, start + i, cache, keys, values, row(queries, h, i), result,
-                              w.scores);
-            evaluation.record("attention", layer, i, result);
-        }
+            e.record("input_norm", layer, i, norm_row);
+        });
+        backend.project({{weights.q, queries}, {weights.k, keys}, {weights.v, values}}, norms, count,
+                        w.packed);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto q = row(queries, h, index);
+            auto k = row(keys, kv, index);
+            auto v = row(values, kv, index);
+            e.record("q_before_rope", layer, i, q);
+            e.record("k_before_rope", layer, i, k);
+            e.record("value", layer, i, v);
+            Scalar::rope(q, k, frequency, e.start + i);
+            e.record("q_after_rope", layer, i, q);
+            e.record("key_after_rope", layer, i, k);
+            if (e.cache)
+                Scalar::store(*e.cache, layer, e.start + i, k, v);
+        });
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t offset) {
+            auto result = row(attention, h, index);
+            Scalar::attention(
+                config, layer, e.start + i, e.cache, keys.subspan(offset * kv, e.tokens.size() * kv),
+                values.subspan(offset * kv, e.tokens.size() * kv), row(queries, h, index), result, w.scores);
+            e.record("attention", layer, i, result);
+        });
         linear(weights.o, attention, projection, count);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto activation = row(hidden, h, i);
-            auto result = row(projection, h, i);
-            auto norm_row = row(norms, h, i);
-            evaluation.record("attention_projection", layer, i, result);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto activation = row(hidden, h, index);
+            auto result = row(projection, h, index);
+            auto norm_row = row(norms, h, index);
+            e.record("attention_projection", layer, i, result);
             Scalar::add(activation, result);
-            evaluation.record("attention_residual", layer, i, activation);
+            e.record("attention_residual", layer, i, activation);
             Scalar::rms_norm(weights.post_attention_norm, activation, norm_row, config.rms_epsilon);
-            evaluation.record("post_attention_norm", layer, i, norm_row);
-        }
-        linear(weights.gate, norms, gate, count);
-        linear(weights.up, norms, up, count);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto g = row(gate, ff, i);
-            auto u = row(up, ff, i);
-            evaluation.record("gate", layer, i, g);
-            evaluation.record("up", layer, i, u);
+            e.record("post_attention_norm", layer, i, norm_row);
+        });
+        backend.project({{weights.gate, gate}, {weights.up, up}}, norms, count, w.packed);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto g = row(gate, ff, index);
+            auto u = row(up, ff, index);
+            e.record("gate", layer, i, g);
+            e.record("up", layer, i, u);
             Scalar::swiglu(g, u);
-            evaluation.record("swiglu", layer, i, g);
-        }
+            e.record("swiglu", layer, i, g);
+        });
         linear(weights.down, gate, projection, count);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto result = row(projection, h, i);
-            auto activation = row(hidden, h, i);
-            evaluation.record("down", layer, i, result);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto result = row(projection, h, index);
+            auto activation = row(hidden, h, index);
+            e.record("down", layer, i, result);
             Scalar::add(activation, result);
-            evaluation.record("layer_output", layer, i, activation);
-        }
+            e.record("layer_output", layer, i, activation);
+        });
     }
-    for (std::size_t i = 0; i < tokens.size(); ++i) {
-        if (!evaluation.wants_logits(i))
-            continue;
+    batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+        if (!e.wants_logits(i))
+            return;
         const auto final_norm = w.norm.first(h);
-        Scalar::rms_norm(norm, row(hidden, h, i), final_norm, config.rms_epsilon);
-        evaluation.record("final_norm", TraceEvent::model_level, i, final_norm);
+        Scalar::rms_norm(norm, row(hidden, h, index), final_norm, config.rms_epsilon);
+        e.record("final_norm", TraceEvent::model_level, i, final_norm);
         linear(output, final_norm, w.logits, 1);
-        evaluation.publish_logits(i, w.logits);
-    }
+        e.publish_logits(i, w.logits);
+    });
 }
 
 } // namespace

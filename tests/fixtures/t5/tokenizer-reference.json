@@ -1,0 +1,14 @@
+{
+  "text": "hello  world! <extra_id_0> \ud83e\ude90\u732b",
+  "ids": [
+    4,
+    5,
+    13,
+    22,
+    3,
+    2,
+    18,
+    1
+  ],
+  "decoded": "hello world! \u732b"
+}

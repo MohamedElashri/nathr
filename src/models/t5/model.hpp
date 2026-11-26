@@ -13,7 +13,8 @@ class T5 {
 
     T5(SafeTensors& file, const std::filesystem::path& path, const ModelConfig& config, const Json& json,
        CpuBackend& backend);
-    [[nodiscard]] std::unique_ptr<State> start(std::span<const Token> tokens, std::size_t capacity) const;
+    [[nodiscard]] std::unique_ptr<State> start(std::span<const Token> tokens, std::size_t capacity,
+                                               CachePagePool* pool) const;
     void step(State& state, Token token) const;
 
   private:
@@ -30,6 +31,7 @@ class T5 {
     struct Scratch;
 
     void normalize(Scratch& w, TensorView gain) const;
+    void project_attention(Scratch& w, const Attention& weights) const;
     void feed_forward(Scratch& w, const FeedForward& weights) const;
     void project(Scratch& w, TensorView weight, std::span<const float> input, std::span<float> output) const;
     void encode(std::span<const Token> tokens, Scratch& w) const;

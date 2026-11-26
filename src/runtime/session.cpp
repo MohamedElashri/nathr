@@ -18,6 +18,7 @@ struct Session::Impl {
         detail::validate_tokens(ids, model.config(), cache.capacity - tokens.size());
         detail::validate_mode(mode, sink);
         const auto start = tokens.size();
+        cache.ensure(start + ids.size());
         state = SessionState::invalid;
         has_logits = false;
         for (std::size_t i = 0; i < ids.size();) {

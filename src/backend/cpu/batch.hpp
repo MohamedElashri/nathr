@@ -54,7 +54,9 @@ void batch_row(const std::byte* bytes, const float* input, std::size_t width, fl
 
 template <DType dtype, BlockDecode unpack = nullptr>
 void batch(const std::byte* bytes, const float* input, std::size_t width, std::size_t lanes, float* output) {
-    if (lanes == 4)
+    if (lanes == 2)
+        batch_row<2, dtype, unpack>(bytes, input, width, output);
+    else if (lanes == 4)
         batch_row<4, dtype, unpack>(bytes, input, width, output);
     else if (lanes == 8)
         batch_row<8, dtype, unpack>(bytes, input, width, output);

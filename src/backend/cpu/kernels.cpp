@@ -51,41 +51,54 @@ KernelChoice select_kernel(DType type, ExecutionPolicy policy, CpuFeatures featu
     return scalar_kernel(type);
 }
 
-void project(const KernelChoice& kernel, const ThreadPool& pool, TensorView weight,
-             std::span<const float> input, std::span<float> output, std::size_t tokens,
+void project(const ThreadPool& pool, std::span<const KernelChoice> kernels,
+             std::span<const Projection> projections, std::span<const float> input, std::size_t tokens,
              std::span<float> packed) {
     const auto width = input.size() / tokens;
-    const auto rows = output.size() / tokens;
-    const auto& format = *encoding(weight.desc.dtype);
-    const auto stride = width / format.elements * format.bytes;
+    std::size_t total_rows = 0;
+    for (const auto& projection : projections)
+        total_rows += projection.output.size() / tokens;
     for (std::size_t start = 0; start < tokens; start += batch_tile) {
         const auto count = std::min(batch_tile, tokens - start);
-        if (count == 1) {
-            const auto activations = input.subspan(start * width, width);
-            const auto result = output.subspan(start * rows, rows);
-            pool.rows(rows, width, [&](std::size_t begin, std::size_t end) {
-                for (std::size_t row = begin; row < end; ++row) {
-                    result[canonical_row(weight, row)] =
-                        kernel.dot(weight.bytes.data() + row * stride, activations.data(), width);
-                }
-            });
-            continue;
-        }
-        // A contiguous set of activations for each column lets a row of weights
-        // serve several tokens without changing any individual dot's reduction order.
-        const auto lanes = count <= 4 ? 4 : count <= 8 ? 8 : batch_tile;
-        for (std::size_t column = 0; column < width; ++column) {
-            for (std::size_t i = 0; i < count; ++i)
-                packed[column * lanes + i] = input[(start + i) * width + column];
-            std::fill_n(packed.data() + column * lanes + count, lanes - count, 0.f);
-        }
-        pool.rows(rows, width * count, [&](std::size_t begin, std::size_t end) {
-            for (std::size_t r = begin; r < end; ++r) {
-                std::array<float, batch_tile> projected;
-                kernel.batch(weight.bytes.data() + r * stride, packed.data(), width, lanes, projected.data());
-                const auto row = canonical_row(weight, r);
+        const auto lanes = count <= 2 ? 2 : count <= 4 ? 4 : count <= 8 ? 8 : batch_tile;
+        if (count > 1) {
+            // Pack each activation tile once for every weight matrix that uses it.
+            for (std::size_t column = 0; column < width; ++column) {
                 for (std::size_t i = 0; i < count; ++i)
-                    output[(start + i) * rows + row] = projected[i];
+                    packed[column * lanes + i] = input[(start + i) * width + column];
+                std::fill_n(packed.data() + column * lanes + count, lanes - count, 0.f);
+            }
+        }
+        pool.rows(total_rows, width * count, [&](std::size_t begin, std::size_t end) {
+            for (const auto& [weight, output] : projections) {
+                const auto rows = output.size() / tokens;
+                if (begin < rows) {
+                    const auto& format = *encoding(weight.desc.dtype);
+                    const auto stride = width / format.elements * format.bytes;
+                    const auto& kernel = kernels[static_cast<std::size_t>(weight.desc.dtype)];
+                    const auto last = std::min(end, rows);
+                    if (count == 1) {
+                        const auto* activations = input.data() + start * width;
+                        auto result = output.subspan(start * rows, rows);
+                        for (std::size_t r = begin; r < last; ++r) {
+                            result[canonical_row(weight, r)] =
+                                kernel.dot(weight.bytes.data() + r * stride, activations, width);
+                        }
+                    } else {
+                        for (std::size_t r = begin; r < last; ++r) {
+                            std::array<float, batch_tile> projected;
+                            kernel.batch(weight.bytes.data() + r * stride, packed.data(), width, lanes,
+                                         projected.data());
+                            const auto row = canonical_row(weight, r);
+                            for (std::size_t i = 0; i < count; ++i)
+                                output[(start + i) * rows + row] = projected[i];
+                        }
+                    }
+                }
+                if (end <= rows)
+                    break;
+                begin -= std::min(begin, rows);
+                end -= rows;
             }
         });
     }

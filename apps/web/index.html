@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nathr</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="workspace">
+    <aside class="navigation">
+      <a class="brand" href="/" aria-label="Nathr home"><span class="monogram" aria-hidden="true">N</span>Nathr</a>
+      <nav aria-label="Inference mode" id="modes" hidden>
+        <button type="button" data-mode="chat" aria-pressed="false" hidden>Chat</button>
+        <button type="button" data-mode="completion" aria-pressed="false" hidden>Completion</button>
+        <button type="button" data-mode="tensor" aria-pressed="false" hidden>Named tensors</button>
+      </nav>
+      <div class="local" id="connection"><span class="signal" aria-hidden="true"></span><span>Connecting</span></div>
+    </aside>
+
+    <main class="main">
+      <header class="top">
+        <div><h1 id="heading">Nathr</h1><p id="subtitle">Connecting to the local model</p></div>
+        <button type="button" class="secondary" id="reset" hidden>New conversation</button>
+      </header>
+
+      <div class="results" id="results">
+        <section class="empty" id="empty" hidden>
+          <span class="empty-symbol" aria-hidden="true"><i></i><i></i><i></i></span>
+          <h2 id="empty-title"></h2>
+          <p id="empty-detail"></p>
+          <div class="suggestions" id="suggestions"></div>
+        </section>
+        <div class="transcript" id="transcript"></div>
+        <article class="tensor-result" id="tensor-result" hidden>
+          <div class="result-top"><h2 id="tensor-title"></h2><button type="button" class="secondary" id="download">Download JSON</button></div>
+          <p id="tensor-shape"></p>
+          <pre id="tensor-preview" tabindex="0"></pre>
+        </article>
+      </div>
+
+      <form class="composer" id="composer" hidden>
+        <div class="composer-tools" id="input-tools" hidden>
+          <label id="input-kind-label">Input
+            <select id="input-kind"><option value="text">Text</option><option value="tokens">Token IDs</option></select>
+          </label>
+          <label id="output-label" hidden>Output <select id="output"></select></label>
+        </div>
+        <div class="prompt-box">
+          <label for="prompt" class="sr-only" id="prompt-label">Prompt</label>
+          <textarea id="prompt" rows="3" required></textarea>
+          <label class="extra" id="pair-label" hidden>Second text <input id="pair" type="text"></label>
+          <label class="extra" id="ids-label" hidden><span id="ids-title"></span><input id="extra-ids" type="text"></label>
+          <div class="composer-bottom">
+            <span class="hint">Enter to run · Shift+Enter for a new line</span>
+            <button type="submit" class="primary" id="run">Run</button>
+            <button type="button" class="secondary" id="stop" hidden>Stop</button>
+          </div>
+        </div>
+      </form>
+      <p class="status" id="status" role="status" aria-live="polite"></p>
+    </main>
+
+    <aside class="settings" id="settings" hidden>
+      <section>
+        <h2>Model</h2>
+        <p id="model-id" class="model-id"></p>
+        <dl><div><dt>Architecture</dt><dd id="architecture"></dd></div><div><dt>Context</dt><dd id="context"></dd></div></dl>
+      </section>
+      <section id="generation-settings" hidden>
+        <h2>Generation</h2>
+        <label>Max new tokens <input id="max-tokens" type="number" min="1" value="128"></label>
+        <label>Temperature <input id="temperature" type="number" min="0" max="2" step="0.1" value="0"></label>
+        <p class="setting-hint">Set temperature to 0 for greedy decoding.</p>
+        <label>Seed <input id="seed" type="number" min="0" placeholder="Optional"></label>
+      </section>
+    </aside>
+  </div>
+</body>
+</html>

@@ -27,11 +27,10 @@ void validate_config(const ModelConfig& c, const std::string& path) {
 
 void set_boundary_tokens(ModelConfig& c, const Json& bos_id, const Json& eos_id, const std::string& path) {
     const auto bos = natural(bos_id, path + ": BOS token ID");
-    const auto eos = natural(eos_id, path + ": EOS token ID");
-    if (bos >= c.vocabulary || eos >= c.vocabulary)
+    if (bos >= c.vocabulary)
         throw Error(ErrorCode::malformed, path + ": special token ID exceeds vocabulary");
     c.bos = static_cast<Token>(bos);
-    c.eos = static_cast<Token>(eos);
+    c.eos = primary_eos_id(eos_id, c.vocabulary, path + ": EOS token ID");
 }
 
 } // namespace

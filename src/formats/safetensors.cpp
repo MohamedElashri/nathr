@@ -14,7 +14,9 @@ DType read_dtype(const Json& value, std::string_view context) {
         return DType::f16;
     if (value == "BF16")
         return DType::bf16;
-    throw Error(ErrorCode::unsupported, std::string(context) + ": expected F32, F16 or BF16");
+    if (value == "I64")
+        return DType::i64;
+    throw Error(ErrorCode::unsupported, std::string(context) + ": expected F32, F16, BF16 or I64");
 }
 } // namespace
 
@@ -82,12 +84,14 @@ SafeTensors::SafeTensors(const std::filesystem::path& path) : path_(path) {
             }
             const auto begin = natural(offsets[0], context);
             const auto end = natural(offsets[1], context);
-            const auto size = product({desc.elements, encoding(desc.dtype)->bytes}, context);
+            const auto width = desc.dtype == DType::i64 ? sizeof(std::int64_t) : encoding(desc.dtype)->bytes;
+            const auto size = product({desc.elements, width}, context);
             if (end < begin || end > data_size || end - begin != size) {
                 throw Error(ErrorCode::malformed, context + ": extent does not match tensor storage");
             }
             extents.push_back({begin, end, name, desc});
-            memory_.stored_parameters = sum(memory_.stored_parameters, desc.elements, context);
+            if (desc.dtype != DType::i64)
+                memory_.stored_parameters = sum(memory_.stored_parameters, desc.elements, context);
             memory_.f32_tensors += desc.dtype == DType::f32;
             memory_.f16_tensors += desc.dtype == DType::f16;
             memory_.bf16_tensors += desc.dtype == DType::bf16;
@@ -143,7 +147,11 @@ TensorView SafeTensors::take(std::string_view name, std::initializer_list<std::s
 
 TensorView SafeTensors::take_transposed_matrix(std::string_view name, std::size_t rows, std::size_t columns) {
     auto tensor = take(name, {columns, rows});
-    const auto width = encoding(tensor.desc.dtype)->bytes;
+    const auto* format = encoding(tensor.desc.dtype);
+    if (!format)
+        throw Error(ErrorCode::unsupported,
+                    path_.string() + ": unsupported matrix encoding for " + std::string(name));
+    const auto width = format->bytes;
     std::vector<std::byte> transposed(tensor.bytes.size());
     for (std::size_t row = 0; row < rows; ++row) {
         for (std::size_t column = 0; column < columns; ++column) {

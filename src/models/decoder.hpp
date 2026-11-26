@@ -14,6 +14,8 @@ class CpuBackend {
     TensorView bind(TensorView view, const std::filesystem::path& path, std::string_view name);
     void project(TensorView weight, std::span<const float> input, std::span<float> output, std::size_t tokens,
                  std::span<float> packed) const;
+    void project(std::initializer_list<Projection> projections, std::span<const float> input,
+                 std::size_t tokens, std::span<float> packed) const;
     [[nodiscard]] std::string_view kernel(std::uint32_t id) const noexcept;
     [[nodiscard]] std::string_view name() const noexcept;
     [[nodiscard]] unsigned threads() const noexcept { return options_.threads; }
@@ -47,6 +49,7 @@ struct Evaluation {
     LogitsMode mode;
     const LogitsSink& sink;
     const TraceSink& trace;
+    std::span<float> last_logits{};
 
     [[nodiscard]] bool wants_logits(std::size_t index) const;
     void record(std::string_view name, std::size_t layer, std::size_t index,
@@ -54,12 +57,35 @@ struct Evaluation {
     void publish_logits(std::size_t index, std::span<const float> values) const;
 };
 
+struct EvaluationBatch {
+    std::span<const Evaluation> entries;
+
+    std::size_t size() const {
+        std::size_t total = 0;
+        for (const auto& entry : entries)
+            total += entry.tokens.size();
+        return total;
+    }
+
+    void for_each(const auto& visit) const {
+        std::size_t offset = 0;
+        for (const auto& entry : entries) {
+            for (std::size_t i = 0; i < entry.tokens.size(); ++i)
+                visit(entry, i, offset + i, offset);
+            offset += entry.tokens.size();
+        }
+    }
+};
+
 class Decoder {
   public:
     virtual ~Decoder() = default;
     [[nodiscard]] virtual std::unique_ptr<Workspace> workspace(std::size_t positions,
                                                                std::size_t block) const = 0;
-    virtual void execute(Workspace& scratch, const Evaluation& evaluation) const = 0;
+    void execute(Workspace& scratch, const Evaluation& evaluation) const {
+        execute_batch(scratch, {std::span(&evaluation, 1)});
+    }
+    virtual void execute_batch(Workspace& scratch, const EvaluationBatch& batch) const = 0;
 };
 
 inline std::span<float> row(std::span<float> values, std::size_t width, std::size_t index) {

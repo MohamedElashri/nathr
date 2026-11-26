@@ -54,11 +54,10 @@ ModelConfig t5_config(const Json& json, const std::filesystem::path& path) {
             throw Error(ErrorCode::unsupported, path.string() + ": unsupported T5 dimensions or epsilon");
         }
         const auto start = field(json, "decoder_start_token_id");
-        const auto eos = field(json, "eos_token_id");
-        if (start >= c.vocabulary || eos >= c.vocabulary)
+        if (start >= c.vocabulary)
             throw Error(ErrorCode::malformed, path.string() + ": T5 special token ID exceeds vocabulary");
         c.bos = static_cast<Token>(start);
-        c.eos = static_cast<Token>(eos);
+        c.eos = primary_eos_id(json.at("eos_token_id"), c.vocabulary, path.string() + ": eos_token_id");
         return c;
     } catch (const Json::exception& error) {
         throw Error(ErrorCode::malformed, path.string() + ": " + error.what());
@@ -153,9 +152,9 @@ struct T5::Scratch final : Workspace {
 };
 
 struct T5::State {
-    State(const ModelConfig& c, std::size_t source_length, std::size_t capacity)
-        : scratch(c, 1, std::max(source_length, capacity)), self(c, capacity), source(c, source_length),
-          logits(c.vocabulary) {}
+    State(const ModelConfig& c, std::size_t source_length, std::size_t capacity, CachePagePool* pool)
+        : scratch(c, 1, std::max(source_length, capacity)), self(c, capacity, KvPrecision::f32, pool),
+          source(c, source_length, KvPrecision::f32, pool), logits(c.vocabulary) {}
 
     Scratch scratch;
     Cache self, source;
@@ -171,6 +170,12 @@ void T5::normalize(Scratch& w, TensorView gain) const {
     const auto h = config_.hidden;
     for (std::size_t i = 0; i < w.count; ++i)
         Scalar::rms_norm(gain, row(w.hidden, h, i), row(w.norm, h, i), config_.rms_epsilon);
+}
+
+void T5::project_attention(Scratch& w, const Attention& weights) const {
+    normalize(w, weights.norm);
+    backend_.project({{weights.query, w.query}, {weights.key, w.key}, {weights.value, w.value}}, w.norm,
+                     w.count, w.packed);
 }
 
 void T5::feed_forward(Scratch& w, const FeedForward& weights) const {
@@ -208,10 +213,7 @@ void T5::encode(std::span<const Token> tokens, Scratch& w) const {
         Scalar::embedding(embedding_, tokens[i], row(w.hidden, config_.hidden, i));
     for (const auto& layer : encoder_) {
         const auto& weights = layer.self;
-        normalize(w, weights.norm);
-        project(w, weights.query, w.norm, w.query);
-        project(w, weights.key, w.norm, w.key);
-        project(w, weights.value, w.norm, w.value);
+        project_attention(w, weights);
         for (std::size_t i = 0; i < tokens.size(); ++i) {
             position_bias(w, i, tokens.size(), true);
             Scalar::attention_range(config_, 0, nullptr, w.key, w.value, row(w.query, w.inner, i),
@@ -224,19 +226,21 @@ void T5::encode(std::span<const Token> tokens, Scratch& w) const {
     normalize(w, encoder_norm_);
 }
 
-std::unique_ptr<T5::State> T5::start(std::span<const Token> tokens, std::size_t capacity) const {
-    const auto bytes = product({2, sizeof(float), config_.layers, config_.query_heads, config_.head_dim,
-                                sum(tokens.size(), capacity, "T5 cache positions")},
-                               "T5 cache");
+std::unique_ptr<T5::State> T5::start(std::span<const Token> tokens, std::size_t capacity,
+                                     CachePagePool* pool) const {
+    const auto bytes =
+        Cache::required_bytes(config_, sum(tokens.size(), capacity, "T5 cache positions"), KvPrecision::f32);
     if (bytes > max_kv_cache_bytes)
         throw Error(ErrorCode::resource_limit, "T5 self-attention and cross-attention caches exceed 512 MiB");
     Scratch encoder(config_, tokens.size(), tokens.size());
     encode(tokens, encoder);
-    auto state = std::make_unique<State>(config_, tokens.size(), capacity);
+    auto state = std::make_unique<State>(config_, tokens.size(), capacity, pool);
+    state->source.ensure(tokens.size());
+    state->self.ensure(1);
     for (std::size_t i = 0; i < decoder_.size(); ++i) {
         const auto& weights = decoder_[i].cross;
-        project(encoder, weights.key, encoder.norm, encoder.key);
-        project(encoder, weights.value, encoder.norm, encoder.value);
+        backend_.project({{weights.key, encoder.key}, {weights.value, encoder.value}}, encoder.norm,
+                         encoder.count, encoder.packed);
         for (std::size_t pos = 0; pos < tokens.size(); ++pos)
             Scalar::store(state->source, i, pos, row(encoder.key, encoder.inner, pos),
                           row(encoder.value, encoder.inner, pos));
@@ -253,10 +257,7 @@ void T5::step(State& state, Token token) const {
     position_bias(w, pos, visible, false);
     for (std::size_t i = 0; i < decoder_.size(); ++i) {
         const auto& layer = decoder_[i];
-        normalize(w, layer.self.norm);
-        project(w, layer.self.query, w.norm, w.query);
-        project(w, layer.self.key, w.norm, w.key);
-        project(w, layer.self.value, w.norm, w.value);
+        project_attention(w, layer.self);
         Scalar::store(state.self, i, pos, w.key, w.value);
         Scalar::attention_range(config_, i, &state.self, {}, {}, w.query, w.attended, w.scores.first(visible),
                                 1.0, w.bias);
@@ -289,8 +290,8 @@ using namespace detail;
 
 struct T5Session::Impl {
     Impl(const Model& model, const T5& decoder, std::span<const Token> source, std::size_t capacity,
-         std::uint64_t seed)
-        : model(model), decoder(decoder), state(decoder.start(source, capacity)), rng(seed) {}
+         std::uint64_t seed, CachePagePool* pool)
+        : model(model), decoder(decoder), state(decoder.start(source, capacity, pool)), rng(seed) {}
 
     Model model;
     const T5& decoder;
@@ -306,6 +307,11 @@ T5Session& T5Session::operator=(T5Session&&) noexcept = default;
 
 T5Session T5Session::create(const Model& model, std::span<const Token> source, std::size_t capacity,
                             std::uint64_t seed) {
+    return create_pooled(model, source, capacity, seed, nullptr);
+}
+
+T5Session T5Session::create_pooled(const Model& model, std::span<const Token> source, std::size_t capacity,
+                                   std::uint64_t seed, CachePagePool* pool) {
     const auto* decoder = std::get_if<std::unique_ptr<T5>>(&model.impl_->execution);
     if (!decoder)
         throw Error(ErrorCode::unsupported, "T5Session requires a T5 model");
@@ -315,13 +321,14 @@ T5Session T5Session::create(const Model& model, std::span<const Token> source, s
         capacity = config.context;
     if (capacity > config.context)
         throw Error(ErrorCode::invalid_argument, "T5 decoder capacity exceeds model limit");
-    return T5Session(std::make_unique<Impl>(model, **decoder, source, capacity, seed));
+    return T5Session(std::make_unique<Impl>(model, **decoder, source, capacity, seed, pool));
 }
 
 void T5Session::append(std::span<const Token> tokens) {
     if (!impl_->valid)
         throw Error(ErrorCode::invalid_argument, "T5 session is invalid");
     validate_tokens(tokens, impl_->model.config(), capacity() - length());
+    impl_->state->self.ensure(length() + tokens.size());
     impl_->valid = false;
     for (const auto token : tokens)
         impl_->decoder.step(*impl_->state, token);

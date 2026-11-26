@@ -14,6 +14,10 @@
 
 namespace nathr {
 
+namespace detail {
+class CachePagePool;
+}
+
 enum class ErrorCode { invalid_argument, unsupported, malformed, io, resource_limit, backend };
 
 class Error : public std::runtime_error {
@@ -63,6 +67,23 @@ struct TraceEvent {
 };
 using TraceSink = std::function<void(const TraceEvent&)>;
 
+struct InferenceInput {
+    std::span<const Token> tokens;
+    std::span<const Token> token_type_ids{};
+    std::span<const Token> decoder_tokens{};
+};
+
+struct OutputInfo {
+    std::string_view name;
+    std::size_t width, input_limit;
+    bool sequence;
+};
+
+struct TensorResult {
+    std::vector<std::size_t> shape;
+    std::vector<float> values;
+};
+
 class Model {
   public:
     static Model load(const std::filesystem::path& path, BackendOptions options = {});
@@ -72,6 +93,10 @@ class Model {
     [[nodiscard]] std::string_view backend() const noexcept;
     [[nodiscard]] unsigned threads() const noexcept;
     [[nodiscard]] std::string_view kernel(std::uint32_t encoding_id) const noexcept;
+    [[nodiscard]] std::vector<OutputInfo> outputs() const;
+    [[nodiscard]] bool supports_generation() const noexcept;
+    [[nodiscard]] bool supports_fused_batch() const noexcept;
+    [[nodiscard]] TensorResult infer(InferenceInput input, std::string_view output) const;
     // Uncached, absolute positions starting at zero. At most 128 tokens.
     // Last-token mode writes last_logits and all-token mode streams to sink.
     void forward(std::span<const Token> tokens, LogitsMode mode, std::span<float> last_logits = {},
@@ -85,6 +110,7 @@ class Model {
     std::shared_ptr<const Impl> impl_;
     friend class Session;
     friend class T5Session;
+    friend class BatchScheduler;
 };
 
 enum class SessionState { empty, ready, invalid };
@@ -94,6 +120,7 @@ struct SessionOptions {
     std::size_t prefill_chunk = 16;
 };
 struct SessionMemory {
+    // cache_bytes counts allocated KV page payloads, including pages retained after reset.
     std::size_t cache_bytes, workspace_bytes, history_bytes;
 };
 
@@ -145,6 +172,9 @@ class T5Session {
     [[nodiscard]] std::size_t capacity() const noexcept;
 
   private:
+    static T5Session create_pooled(const Model& model, std::span<const Token> source, std::size_t capacity,
+                                   std::uint64_t seed, detail::CachePagePool* pool);
+    friend class BatchScheduler;
     struct Impl;
     explicit T5Session(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;

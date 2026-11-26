@@ -1,0 +1,4 @@
+{
+  "word_embedding_dimension": 12,
+  "pooling_mode_mean_tokens": true
+}

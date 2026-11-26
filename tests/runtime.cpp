@@ -1,3 +1,4 @@
+#include <nathr/batch.hpp>
 #include <nathr/generation.hpp>
 #include <nathr/tokenizer.hpp>
 
@@ -55,6 +56,15 @@ void close(float actual, double expected, double epsilon, std::string_view descr
 
 template <std::size_t Size> TensorView floats(const std::array<float, Size>& values) {
     return {{DType::f32, {}, 1, values.size()}, std::as_bytes(std::span(values))};
+}
+
+void project(const KernelChoice& kernel, const ThreadPool& pool, TensorView weight,
+             std::span<const float> input, std::span<float> output, std::size_t tokens,
+             std::span<float> packed) {
+    std::array<KernelChoice, static_cast<std::size_t>(DType::id_limit)> kernels{};
+    kernels[static_cast<std::size_t>(weight.desc.dtype)] = kernel;
+    const std::array targets{Projection{weight, output}};
+    detail::project(pool, kernels, targets, input, tokens, packed);
 }
 
 void kernels() {
@@ -138,6 +148,8 @@ void kernels() {
     config.layers = 1;
     config.head_dim = 66;
     Cache rounded(config, 3), packed(config, 3, KvPrecision::f16);
+    rounded.ensure(3);
+    packed.ensure(3);
     constexpr std::uint16_t half_bits[] = {0x8000, 0x0001, 0x83ff, 0x0400, 0xb2a1, 0x3c00, 0x4355};
     for (const bool value : {false, true}) {
         for (std::size_t pos = 0; pos < 3; ++pos) {
@@ -248,6 +260,8 @@ std::size_t allocation_test(const Model& model, std::span<const Token> prompt, T
                             SessionOptions options = {}) {
     auto session = Session::create(model, std::min<std::size_t>(512, model.config().context), 0, options);
     session.prefill(prompt);
+    for (unsigned i = 0; i < 4; ++i)
+        session.append(std::span(&next, 1));
     session.reset();
     start_allocation_count();
     try {
@@ -259,6 +273,143 @@ std::size_t allocation_test(const Model& model, std::span<const Token> prompt, T
         throw;
     }
     return stop_allocation_count();
+}
+
+void paged_cache() {
+    const auto model = Model::load(fixture / "f32");
+    const auto& config = model.config();
+    constexpr auto page = Cache::page_tokens;
+    constexpr auto capacity = 2 * page + 3;
+    std::array<Token, capacity> tokens{};
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+        tokens[i] = static_cast<Token>((7 * i + 3) % config.vocabulary);
+    const auto prompt = std::span(tokens);
+    std::vector<std::vector<float>> reference;
+    model.forward(prompt, LogitsMode::all_tokens, {}, [&](std::size_t pos, std::span<const float> values) {
+        expect(pos == reference.size(), "uncached output order");
+        reference.emplace_back(values.begin(), values.end());
+    });
+    for (auto precision : {KvPrecision::f32, KvPrecision::f16}) {
+        const auto bytes_per_token = 2 * config.layers * config.kv_heads * config.head_dim *
+                                     (precision == KvPrecision::f16 ? sizeof(std::uint16_t) : sizeof(float));
+        auto session = Session::create(model, capacity, 0, {precision, 7});
+        expect(session.memory().cache_bytes == 0, "new session has no KV pages");
+        const auto tolerance = precision == KvPrecision::f32 ? 0.0 : 8e-4;
+        const LogitsSink cmp = [&](std::size_t pos, std::span<const float> values) {
+            compare(values, reference.at(pos), tolerance);
+        };
+        session.prefill(prompt.first(page), LogitsMode::all_tokens, cmp);
+        expect(session.memory().cache_bytes == page * bytes_per_token, "first KV page");
+        const auto invalid = static_cast<Token>(config.vocabulary);
+        rejects([&] { session.append(std::span(&invalid, 1)); }, ErrorCode::invalid_argument);
+        expect(session.memory().cache_bytes == page * bytes_per_token, "invalid input allocates no page");
+        session.append(prompt.subspan(page, 1), LogitsMode::all_tokens, cmp);
+        expect(session.memory().cache_bytes == 2 * page * bytes_per_token, "append opens second KV page");
+        session.append(prompt.subspan(page + 1), LogitsMode::all_tokens, cmp);
+        expect(session.memory().cache_bytes == capacity * bytes_per_token, "final KV page fits capacity");
+        session.reset();
+        expect(session.memory().cache_bytes == capacity * bytes_per_token, "reset retains allocated pages");
+        session.prefill(prompt.first(2), LogitsMode::all_tokens, cmp);
+        compare(session.logits(), reference.at(1), tolerance);
+        expect(allocation_test(model, prompt.first(page - 1), tokens[page - 1], {precision, 7}) == 0,
+               "warmed append across a page boundary allocates no heap");
+    }
+}
+
+void batch_scheduler() {
+    const auto model = Model::load(fixture / "f32");
+    BatchOptions options;
+    options.context = 64;
+    options.max_active = 3;
+    options.max_queued = 3;
+    options.step_tokens = 6;
+    options.session.prefill_chunk = 4;
+    const SamplingOptions sampling{false, 0.8, 7, 0.95};
+    const BatchRequest long_prompt{1, std::vector<Token>(37, 4), 5, 37, sampling};
+    const BatchRequest short_prompt{2, {1, 7}, 4, 11, sampling};
+    const BatchRequest short_later{4, {3, 9, 6}, 5, 91, sampling};
+    const auto standalone = [&](const BatchRequest& request) {
+        auto session = Session::create(model, options.context, request.seed, options.session);
+        session.prefill(request.tokens);
+        Sampler sampler(request.sampling, model.config().vocabulary);
+        std::vector<Token> result;
+        (void)generate(session, sampler, model.config().eos, request.max_new_tokens,
+                       [&](Token token) { result.push_back(token); });
+        return result;
+    };
+    std::array<std::vector<Token>, 5> observed;
+    const auto record = [&](const std::vector<BatchEvent>& events) {
+        for (const auto& event : events) {
+            expect(event.kind != BatchEventKind::error, event.message);
+            if (event.kind == BatchEventKind::token) {
+                expect(event.token.has_value() && event.elapsed_ms >= 0, "batch token event");
+                const auto next = observed.at(event.id).size() + 1;
+                expect(event.emitted == next && event.inter_token_ms.has_value() == (next > 1),
+                       "batch output timing and sequence");
+                observed.at(event.id).push_back(*event.token);
+            }
+        }
+    };
+
+    BatchScheduler scheduler(model, options);
+    scheduler.submit(long_prompt);
+    scheduler.submit(short_prompt);
+    rejects([&] { scheduler.submit(short_prompt); }, ErrorCode::invalid_argument);
+    record(scheduler.step());
+    expect(observed[1].empty() && observed[2].size() == 1, "short prompt progresses before long prefill");
+    scheduler.submit({3, std::vector<Token>(22, 8), 4, 0, {}});
+    record(scheduler.step());
+    const auto cancelled = scheduler.cancel(3);
+    expect(cancelled && cancelled->kind == BatchEventKind::cancelled && cancelled->emitted == 0,
+           "cancel request after partial prefill");
+    expect(!scheduler.cancel(3), "cancel drops request ID");
+    scheduler.submit(short_later);
+    for (unsigned i = 0; i < 64 && !scheduler.empty(); ++i)
+        record(scheduler.step());
+    expect(scheduler.empty(), "mixed batch drains");
+    for (const auto* request : {&long_prompt, &short_prompt, &short_later})
+        expect(observed[request->id] == standalone(*request), "batch sampling matches standalone");
+    expect(observed[3].empty(), "cancelled request emits no later token");
+    expect(scheduler.peak_kv_bytes() > 0, "batch tracks peak KV payload");
+
+    options.max_queued = 1;
+    options.kv_budget_bytes = Cache::required_bytes(model.config(), 5, KvPrecision::f32);
+    BatchScheduler bounded(model, options);
+    bounded.submit({1, {1, 7, 2}, 3, 0, {}});
+    rejects([&] { bounded.submit({2, {1}, 1, 0, {}}); }, ErrorCode::resource_limit);
+    (void)bounded.step();
+    bounded.submit({2, {1, 7, 2}, 3, 0, {}});
+    expect(std::ranges::none_of(bounded.step(), [](const BatchEvent& event) { return event.id == 2; }),
+           "KV budget holds second request in queue");
+    expect(bounded.peak_kv_bytes() == options.kv_budget_bytes, "KV payload stays within reservation");
+    expect(bounded.cancel(2).has_value(), "cancel waiting request");
+    rejects([&] { bounded.submit({3, {1, 7, 2}, 4, 0, {}}); }, ErrorCode::resource_limit);
+    if (!bounded.empty())
+        expect(bounded.cancel(1).has_value(), "cancel active request");
+    bounded.submit({3, {1, 7, 2}, 3, 0, {}});
+    (void)bounded.step();
+    expect(bounded.kv_page_reuses() > 0 && bounded.resident_kv_bytes() <= options.kv_budget_bytes,
+           "request pages return to the shared pool");
+
+    options.max_queued = 3;
+    options.max_queued_tokens = 3;
+    BatchScheduler token_limited(model, options);
+    token_limited.submit({1, {1, 2}, 1, 0, {}});
+    rejects([&] { token_limited.submit({2, {3, 4}, 1, 0, {}}); }, ErrorCode::resource_limit);
+    expect(!token_limited.contains(2) && token_limited.cancel(1).has_value(),
+           "queued token rejection leaves the queue intact");
+    token_limited.submit({2, {3, 4, 5}, 1, 0, {}});
+    (void)token_limited.step();
+    token_limited.submit({3, {6, 7, 8}, 1, 0, {}});
+
+    BatchOptions enough;
+    enough.context = 32;
+    BatchScheduler stopped(model, enough);
+    stopped.submit({1, {4, 4, 4, 4}, 4, 0, {}, {22, 20}});
+    const auto events = stopped.step();
+    expect(events.size() == 2 && events[0].token == 20 && events[1].kind == BatchEventKind::stop &&
+               stopped.empty(),
+           "additional stop IDs finish a batch request at the sampled match");
 }
 
 void threaded_cache_and_chunks() {
@@ -289,11 +440,18 @@ void threaded_cache_and_chunks() {
         project(scalar, serial, matrix, std::span(input).subspan(i * columns, columns),
                 std::span(expected).subspan(i * rows, rows), 1, {});
     const auto selected = select_kernel(DType::f32, ExecutionPolicy::automatic, cpu_features());
-    const auto submit = [&](std::span<float> output) {
+    constexpr auto extra_rows = rows / 2;
+    const TensorView prefix{{DType::f32, {extra_rows, columns}, 2, extra_rows * columns},
+                            matrix.bytes.first(extra_rows * columns * sizeof(float))};
+    const auto submit = [&](std::span<float> output, std::span<float> extra) {
         std::array<float, columns * batch_tile> packed{};
-        project(selected, pool, matrix, input, output, tokens, packed);
+        const auto count = output.size() / rows;
+        const std::array targets{Projection{matrix, output}, Projection{prefix, extra}};
+        detail::project(pool, std::span(&selected, 1), targets, std::span(input).first(count * columns),
+                        count, packed);
     };
     std::vector<float> first(expected.size()), second(expected.size());
+    std::vector<float> first_extra(tokens * extra_rows), second_extra(tokens * extra_rows);
     bool failed = false;
     try {
         pool.rows(rows, columns, [](std::size_t begin, std::size_t) {
@@ -305,11 +463,21 @@ void threaded_cache_and_chunks() {
     }
     expect(failed, "CPU worker exception reaches the submitting caller");
     {
-        std::jthread a([&] { submit(first); });
-        std::jthread b([&] { submit(second); });
+        std::jthread a([&] { submit(first, first_extra); });
+        std::jthread b([&] { submit(second, second_extra); });
     }
     compare(first, expected, 0);
     compare(second, expected, 0);
+    for (std::size_t i = 0; i < tokens; ++i) {
+        const auto reference = std::span(expected).subspan(i * rows, extra_rows);
+        compare(std::span(first_extra).subspan(i * extra_rows, extra_rows), reference, 0);
+        compare(std::span(second_extra).subspan(i * extra_rows, extra_rows), reference, 0);
+    }
+    std::array<float, 2 * rows> pair{};
+    std::array<float, 2 * extra_rows> pair_extra{};
+    submit(pair, pair_extra);
+    compare(pair, std::span(expected).first(pair.size()), 0);
+    compare(pair_extra, std::span(first_extra).first(pair_extra.size()), 0);
 
     auto model = Model::load(fixture / "f32", {ExecutionPolicy::automatic, 3});
     auto run = [&](KvPrecision precision, std::size_t chunk) {
@@ -507,6 +675,60 @@ void encoder_models() {
         generate(generation, greedy, t5.config().eos, 5, [&](Token token) { emitted.push_back(token); });
     expect(emitted == ref.at("greedy").get<std::vector<Token>>() && result.emitted == emitted.size(),
            "T5 greedy output matches reference");
+    const auto evaluated = t5.infer({source, {}, target}, "logits");
+    expect(evaluated.shape == std::vector<std::size_t>{target.size(), t5.config().vocabulary},
+           "T5 named output shape");
+    for (std::size_t i = 0; i < target.size(); ++i)
+        compare(std::span(evaluated.values).subspan(i * t5.config().vocabulary, t5.config().vocabulary),
+                logits.at(i), 2e-5);
+    BatchScheduler scheduler(t5);
+    scheduler.submit({1, source, 5, 0, {}});
+    scheduler.submit({2, source, 5, 0, {}});
+    std::array<std::vector<Token>, 2> scheduled;
+    for (unsigned i = 0; i < 64 && !scheduler.empty(); ++i) {
+        for (const auto& event : scheduler.step()) {
+            expect(event.kind != BatchEventKind::error, event.message);
+            if (event.token)
+                scheduled.at(event.id - 1).push_back(*event.token);
+        }
+    }
+    expect(scheduler.empty() && scheduled[0] == emitted && scheduled[1] == emitted,
+           "T5 batch matches standalone");
+}
+
+void checkpoint_outputs() {
+    const auto path = fixtures / "bert";
+    const auto tokenizer = Tokenizer::load_model(path);
+    const auto ref = read_json(path / "outputs.json", mib);
+    expect(tokenizer.encode(ref.at("single_text").get<std::string>()) ==
+               ref.at("single_ids").get<std::vector<Token>>(),
+           "WordPiece normalization and special IDs");
+    const auto pair =
+        tokenizer.encode_pair(ref.at("first").get<std::string>(), ref.at("second").get<std::string>());
+    expect(pair.ids == ref.at("ids").get<std::vector<Token>>() &&
+               pair.token_type_ids == ref.at("types").get<std::vector<Token>>(),
+           "WordPiece pair IDs and token types");
+    const auto model = Model::load(path);
+    expect(!model.supports_generation() && model.outputs().size() == 4, "checkpoint output capabilities");
+    for (const auto name : {"pooler_output", "sentence_embedding", "logits"}) {
+        const auto result = model.infer({pair.ids, pair.token_type_ids}, name);
+        const auto reference = ref.at(name).get<std::vector<float>>();
+        expect(result.shape == std::vector<std::size_t>{reference.size()}, "named tensor shape");
+        compare(result.values, reference, 3e-6);
+    }
+    rejects([&] { (void)model.infer({pair.ids}, "absent"); }, ErrorCode::unsupported);
+    const std::vector<Token> bad_types(pair.ids.size(), 2);
+    rejects([&] { (void)model.infer({pair.ids, bad_types}, "logits"); }, ErrorCode::invalid_argument);
+    const auto long_input = std::vector<Token>(13, 1);
+    rejects([&] { (void)model.infer({long_input}, "sentence_embedding"); }, ErrorCode::invalid_argument);
+
+    const auto t5_path = fixtures / "t5";
+    const auto unigram = Tokenizer::load_model(t5_path);
+    const auto t5 = read_json(t5_path / "tokenizer-reference.json", mib);
+    const auto ids = unigram.encode(t5.at("text").get<std::string>());
+    expect(ids == t5.at("ids").get<std::vector<Token>>() &&
+               unigram.decode(ids, true) == t5.at("decoded").get<std::string>(),
+           "Unigram scores, unknown IDs, whitespace, and template");
 }
 
 void tokenizer_and_sampling() {
@@ -525,6 +747,16 @@ void tokenizer_and_sampling() {
     expect(stream.push("\xe2\x82").empty() && stream.finish() == "�" && stream.finish().empty(),
            "partial terminal UTF-8 sequence");
     expect(stream.push("\xe2\x82x\xff") == "�x�", "lossy UTF-8 invalid byte boundaries");
+    GenerationText stop(tokenizer, {"bcab", "bca"});
+    expect(stop.push(256) == "a" && stop.push(4).empty() && stop.stopped() && stop.finish().empty(),
+           "matching stop suppresses the matched suffix and the rest of its final token");
+    GenerationText unicode_stop(tokenizer, {"éab"});
+    expect(unicode_stop.push(195).empty() && unicode_stop.push(169).empty() && unicode_stop.push(4).empty() &&
+               unicode_stop.stopped(),
+           "UTF-8 stop spans token boundaries");
+    GenerationText incomplete_stop(tokenizer, {"abcd"});
+    expect(incomplete_stop.push(256).empty() && incomplete_stop.finish() == "abc",
+           "unmatched stop prefix is flushed at the output limit");
 
     std::mt19937_64 rng(1);
     std::array logits{3.0f, 3.0f, -1.0f, 1.0f};
@@ -543,6 +775,7 @@ void tokenizer_and_sampling() {
     }
     logits[0] = std::numeric_limits<float>::infinity();
     rejects([&] { (void)greedy.select(logits, rng); }, ErrorCode::invalid_argument);
+    rejects([&] { (void)stochastic.select(logits, rng); }, ErrorCode::invalid_argument);
     rejects([] { Sampler invalid({false, 0, 0, 1}, 4); }, ErrorCode::invalid_argument);
 
     const auto model = Model::load(fixture / "f32");
@@ -933,8 +1166,11 @@ int main(int argc, char** argv) try {
         kernels();
         parser();
         model_and_sessions();
+        paged_cache();
+        batch_scheduler();
         gpt2_and_sessions();
         encoder_models();
+        checkpoint_outputs();
         threaded_cache_and_chunks();
         tokenizer_and_sampling();
         gguf_tokenizer_metadata();

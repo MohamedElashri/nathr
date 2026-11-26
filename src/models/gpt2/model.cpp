@@ -40,11 +40,11 @@ ModelConfig gpt2_config(const Json& json, const std::filesystem::path& config_pa
         c.tied_embeddings = json.value("tie_word_embeddings", true);
         if (!(c.rms_epsilon > 0) || !std::isfinite(c.rms_epsilon))
             throw Error(ErrorCode::malformed, path + ": invalid LayerNorm epsilon");
-        const auto bos = field("bos_token_id"), eos = field("eos_token_id");
-        if (bos >= c.vocabulary || eos >= c.vocabulary)
+        const auto bos = field("bos_token_id");
+        if (bos >= c.vocabulary)
             throw Error(ErrorCode::malformed, path + ": special token ID exceeds vocabulary");
         c.bos = static_cast<Token>(bos);
-        c.eos = static_cast<Token>(eos);
+        c.eos = primary_eos_id(json.at("eos_token_id"), c.vocabulary, path + ": eos_token_id");
         return c;
     } catch (const Json::exception& error) {
         throw Error(ErrorCode::malformed, path + ": " + error.what());
@@ -109,7 +109,7 @@ class Gpt2 final : public Decoder {
     std::unique_ptr<Workspace> workspace(std::size_t positions, std::size_t block) const override {
         return std::make_unique<Gpt2Workspace>(config, positions, block);
     }
-    void execute(Workspace& scratch, const Evaluation& evaluation) const override;
+    void execute_batch(Workspace& scratch, const EvaluationBatch& batch) const override;
 
   private:
     const ModelConfig& config;
@@ -161,10 +161,10 @@ Gpt2::Gpt2(SafeTensors& file, const std::filesystem::path& path, const ModelConf
         throw Error(ErrorCode::unsupported, path.string() + ": unexpected tensor " + std::string(name));
 }
 
-void Gpt2::execute(Workspace& scratch, const Evaluation& e) const {
+void Gpt2::execute_batch(Workspace& scratch, const EvaluationBatch& batch) const {
     auto& w = static_cast<Gpt2Workspace&>(scratch);
     const auto h = config.hidden, ff = config.intermediate;
-    const auto count = e.tokens.size();
+    const auto count = batch.size();
     const auto hidden = w.hidden.first(count * h);
     const auto norm = w.norm.first(count * h);
     const auto qkv = w.qkv.first(count * 3 * h);
@@ -182,27 +182,27 @@ void Gpt2::execute(Workspace& scratch, const Evaluation& e) const {
     const auto normalize = [&](const Affine& weights, std::span<const float> input, std::span<float> result) {
         Scalar::layer_norm(weights.weight, weights.bias, input, result, config.rms_epsilon);
     };
-    for (std::size_t i = 0; i < count; ++i) {
-        auto activation = row(hidden, h, i);
-        auto position = row(norm, h, i);
+    batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+        auto activation = row(hidden, h, index);
+        auto position = row(norm, h, index);
         Scalar::embedding(embedding, e.tokens[i], activation);
         Scalar::embedding(positions, e.start + i, position);
         Scalar::add(activation, position);
         e.record("embedding", TraceEvent::model_level, i, activation);
-    }
+    });
 
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
         const auto& weights = layers[layer];
-        for (std::size_t i = 0; i < count; ++i) {
-            auto activation = row(hidden, h, i);
-            auto norm_row = row(norm, h, i);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto activation = row(hidden, h, index);
+            auto norm_row = row(norm, h, index);
             e.record("layer_input", layer, i, activation);
             normalize(weights.input_norm, activation, norm_row);
             e.record("input_norm", layer, i, norm_row);
-        }
+        });
         affine(weights.qkv, norm, qkv);
-        for (std::size_t i = 0; i < count; ++i) {
-            const auto combined = row(qkv, 3 * h, i);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            const auto combined = row(qkv, 3 * h, index);
             const auto key = combined.subspan(h, h);
             const auto value = combined.last(h);
             e.record("query", layer, i, combined.first(h));
@@ -211,52 +211,54 @@ void Gpt2::execute(Workspace& scratch, const Evaluation& e) const {
             if (e.cache) {
                 Scalar::store(*e.cache, layer, e.start + i, key, value);
             } else {
-                std::ranges::copy(key, row(keys, h, i).begin());
-                std::ranges::copy(value, row(values, h, i).begin());
+                std::ranges::copy(key, row(keys, h, index).begin());
+                std::ranges::copy(value, row(values, h, index).begin());
             }
-        }
-        for (std::size_t i = 0; i < count; ++i) {
-            auto result = row(attention, h, i);
-            Scalar::attention(config, layer, e.start + i, e.cache, keys, values, row(qkv, 3 * h, i).first(h),
-                              result, w.scores);
+        });
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t offset) {
+            auto result = row(attention, h, index);
+            Scalar::attention(config, layer, e.start + i, e.cache,
+                              keys.subspan(offset * h, e.tokens.size() * h),
+                              values.subspan(offset * h, e.tokens.size() * h),
+                              row(qkv, 3 * h, index).first(h), result, w.scores);
             e.record("attention", layer, i, result);
-        }
+        });
         affine(weights.attention_output, attention, projection);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto activation = row(hidden, h, i);
-            auto result = row(projection, h, i);
-            auto norm_row = row(norm, h, i);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto activation = row(hidden, h, index);
+            auto result = row(projection, h, index);
+            auto norm_row = row(norm, h, index);
             e.record("attention_projection", layer, i, result);
             Scalar::add(activation, result);
             e.record("attention_residual", layer, i, activation);
             normalize(weights.post_attention_norm, activation, norm_row);
             e.record("post_attention_norm", layer, i, norm_row);
-        }
+        });
         affine(weights.ff_in, norm, ff_values);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto result = row(ff_values, ff, i);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto result = row(ff_values, ff, index);
             e.record("ffn", layer, i, result);
             Scalar::gelu(result);
             e.record("gelu", layer, i, result);
-        }
+        });
         affine(weights.ff_out, ff_values, projection);
-        for (std::size_t i = 0; i < count; ++i) {
-            auto result = row(projection, h, i);
-            auto activation = row(hidden, h, i);
+        batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+            auto result = row(projection, h, index);
+            auto activation = row(hidden, h, index);
             e.record("down", layer, i, result);
             Scalar::add(activation, result);
             e.record("layer_output", layer, i, activation);
-        }
+        });
     }
-    for (std::size_t i = 0; i < count; ++i) {
+    batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
         if (!e.wants_logits(i))
-            continue;
+            return;
         const auto final = norm.first(h);
-        normalize(final_norm, row(hidden, h, i), final);
+        normalize(final_norm, row(hidden, h, index), final);
         e.record("final_norm", TraceEvent::model_level, i, final);
         backend.project(output, final, w.logits, 1, w.packed);
         e.publish_logits(i, w.logits);
-    }
+    });
 }
 
 } // namespace

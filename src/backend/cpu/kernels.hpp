@@ -30,8 +30,13 @@ constexpr CpuFeatures usable_features(FeatureInputs input) {
 
 KernelChoice scalar_kernel(DType type);
 KernelChoice select_kernel(DType type, ExecutionPolicy policy, CpuFeatures features);
-void project(const KernelChoice& kernel, const ThreadPool& pool, TensorView weight,
-             std::span<const float> input, std::span<float> output, std::size_t tokens,
+struct Projection {
+    TensorView weight;
+    std::span<float> output;
+};
+
+void project(const ThreadPool& pool, std::span<const KernelChoice> kernels,
+             std::span<const Projection> projections, std::span<const float> input, std::size_t tokens,
              std::span<float> packed);
 
 } // namespace nathr::detail

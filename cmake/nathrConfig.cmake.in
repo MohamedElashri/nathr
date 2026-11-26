@@ -2,5 +2,6 @@
 
 include(CMakeFindDependencyMacro)
 find_dependency(Threads)
+find_dependency(ICU 70 COMPONENTS uc i18n)
 include("${CMAKE_CURRENT_LIST_DIR}/nathrTargets.cmake")
 check_required_components(nathr)

@@ -2,7 +2,7 @@
 
 This guide builds a small CPU inference engine for pretrained decoder-only Transformers. Start with fixed token IDs and a scalar forward pass. Then add a tokenizer, a key-value cache, and a generation loop. Keeping these pieces separate lets you swap checkpoints, test each operation, and add CPU optimizations without changing the model equations.
 
-Nathr is the worked implementation. SmolLM2-135M supplies concrete dimensions for the Llama walkthrough. GPT-2 shares its decoder runtime, and BERT and T5 show how the same tensor readers and CPU kernels work in an encoder and a sequence-to-sequence model. [Nathr model compatibility](../README.md#model-compatibility)
+Nathr is the worked implementation. SmolLM2-135M supplies concrete dimensions for the Llama walkthrough. GPT-2 shares its decoder runtime, and BERT and T5 show how the same tensor readers and CPU kernels work in an encoder and a sequence-to-sequence model. [Checkpoint support and limits](#checkpoint-support-and-limits)
 
 ```mermaid
 flowchart LR
@@ -159,13 +159,13 @@ Check the IDs directly on prompts with leading spaces, newlines, digits, non-ASC
 
 Causality means that appending token `p + 1` leaves the activations for positions `0..p` unchanged. For an attention-based decoder, save each layer's keys and values as you process tokens. The next query uses those stored vectors and the new token's Q, K, and V. When the model applies RoPE to Q and K, store the rotated keys so you can use them directly on later steps.
 
-Share the immutable weights across sessions. Give each session its own cache, temporary buffers, token history, and random number generator. Nathr uses separate key and value banks indexed by `[layer][kv_head][position][coordinate]`. It allocates both banks at the configured capacity `C`. The token history records how many positions are in use. [Nathr cache layout](../src/backend/cpu/scalar.hpp) · [Session implementation](../src/runtime/session.cpp)
+Share the immutable weights across sessions. Give each session its own cache, temporary buffers, token history, and random number generator. Nathr maps groups of 16 consecutive positions to independently allocated pages. Within each page, keys and values occupy separate banks indexed by `[layer][kv_head][position_in_page][coordinate]`. Attention reads the visible rows one page at a time. [Nathr cache layout](../src/backend/cpu/scalar.hpp) · [PagedAttention paper](https://arxiv.org/abs/2309.06180)
 
 ```text
-KV bytes = 2 * L * Hkv * C * D * bytes_per_element
+KV payload bytes = 2 * L * Hkv * allocated_positions * D * bytes_per_element
 ```
 
-This formula assumes keys and values have the same head width and element size. Substitute the session capacity you intend to allocate. A full 8,192-token session for SmolLM2-135M uses 360 MiB for the FP32 cache or 180 MiB for FP16. Weights and temporary buffers are separate. Nathr defaults to a session capacity of up to 2,048 tokens. Its FP16 cache rounds on writes and converts back to FP32 on reads. Weight precision and cache precision can be chosen independently. [Nathr cache storage and attention](../src/backend/cpu/scalar.cpp)
+The cache starts empty. Each call allocates any pages needed for its input before running the model. The last page stops at the configured capacity. When a SmolLM2-135M session fills all 8,192 slots, its cache payload is 360 MiB in FP32 or 180 MiB in FP16. Weights and temporary buffers are separate. Nathr defaults to a session capacity of up to 2,048 tokens. FP16 rounds cache entries on write and converts them back to FP32 on read. [Nathr cache storage and attention](../src/backend/cpu/scalar.cpp)
 
 **Prefill** runs the input prompt through the layers and fills the cache. Nathr evaluates groups of up to 16 tokens by default. A group can project and store all its keys and values before computing attention because a query at `p` reads only through `p`. Compute the vocabulary projection for the last prompt token when generating. Earlier prompt tokens still need to pass through all layers so their K and V can serve later tokens.
 
@@ -187,9 +187,17 @@ for step in 0..max_new_tokens-1:
     session.append([id])
 ```
 
-Use the checkpoint's EOS ID in the stopping rule. The logits at the end of prefill already predict the first new token. Appending a sampled ID computes logits for the following token. With `P` prompt tokens and a positive budget `N`, this loop needs room to consume at most `P + N - 1` tokens. Nathr reports the final emitted ID as `pending` so the caller can append it when resuming the session. [Nathr generation API](../include/nathr/generation.hpp)
+Use the checkpoint's EOS ID and any additional stop IDs in the stopping rule. Nathr reads supported sampling defaults from the checkpoint configuration, with `generation_config.json` taking precedence. The logits at the end of prefill already predict the first new token. Appending a sampled ID computes logits for the following token. With `P` prompt tokens and a positive budget `N`, this loop needs room to consume at most `P + N - 1` tokens. Nathr reports the final emitted ID as `pending` so the caller can append it when resuming the session. [Nathr generation API](../include/nathr/generation.hpp) · [Request defaults](../apps/requests.cpp)
 
-Look up each emitted ID's byte sequence and pass it to an incremental UTF-8 decoder. A token can end with byte `C3`, and the next can start with `A9`. Together they encode `é`. The decoder holds incomplete bytes until another token arrives and emits a replacement character for invalid or unfinished input. The CLI uses this path to stream text and skips special tokens in the displayed output. [UTF-8 stream](../src/tokenizer/tokenizer.cpp) · [CLI generation](../apps/nathr.cpp)
+Look up each emitted ID's byte sequence and pass it to an incremental UTF-8 decoder. A token can end with byte `C3`, and the next can start with `A9`. Together they encode `é`. To stop on text, hold back any suffix that could start a stop string. Drop a complete match and release an unmatched suffix when generation ends. For chat, render the checkpoint template before tokenization so the model sees its expected role markers. [Text streaming](../src/runtime/generation.cpp) · [Chat rendering](../apps/requests.cpp)
+
+### Schedule multiple requests
+
+The scheduler gives active requests one decode token per step, then divides the remaining token budget among prompt chunks. The causal decoder packs all scheduled rows into shared projection calls. Each row carries its absolute position and its request’s KV table, so it attends only to the visible rows of its own sequence. T5 encodes one whole source as a scheduling unit. [Batch scheduler](../src/runtime/batch.cpp) · [Decoder input rows](../src/models/decoder.hpp)
+
+Admission reserves enough KV capacity for a request’s token budget. The engine allocates pages as needed and returns them to a budgeted pool when a request finishes or is cancelled. It reuses matching pages and discards idle pages when a new allocation needs their space. Check seeded output against standalone execution and measure latency under mixed prompt lengths. [KV page pool](../src/backend/cpu/scalar.hpp) · [Batch CLI](../README.md#batch-requests)
+
+The HTTP frontend sends JSONL requests to one persistent worker for the loaded model. The server adapts completions, chat, and embeddings to the same request format used by the batch CLI. Its model endpoint uses the same capability descriptions as `inspect`, and the browser interface uses those capabilities to select which modes to show. The frontend bounds client count, request bodies, and response buffering. It drains results into per-request buffers and sends a cancellation between scheduler steps when a buffer fills or a client disconnects. [HTTP frontend](../apps/serve.py) · [Browser interface](../apps/web) · [HTTP endpoints](../README.md#serve-over-http)
 
 ## 7. Execute packed weights and make the CPU path faster
 
@@ -202,7 +210,7 @@ Add packed formats behind the row-dot interface. As a first implementation, unpa
 
 `Q8_0` reconstructs a weight as `d * q`. In `Q4_0`, the low nibbles form the first 16 weights and the high nibbles form the second 16. A nibble `n` represents `d * (n - 8)`. With `d = 0.25` and the first packed byte `0xB2`, weights `0` and `16` are `-1.5` and `0.75`. A known byte pattern makes a useful test for sign conversion, nibble order, and scale decoding.
 
-With one input token, a projection is a matrix-vector product. With several, a tile lets the kernel reuse each weight row across multiple input tokens. Nathr packs activation coordinates for up to 16 tokens next to each other within each column, then distributes sufficiently large ranges of output rows to a persistent worker pool. Each worker writes its own rows. The normalization, RoPE, attention, and feed-forward equations stay the same. [Projection and tiling](../src/backend/cpu/kernels.cpp) · [Worker pool](../src/backend/cpu/thread_pool.cpp)
+With one input token, a projection is a matrix-vector product. With several, a tile lets the kernel reuse each weight row across multiple input tokens. Nathr packs activation coordinates for up to 16 tokens next to each other within each column and reuses the packed tile across projections with the same input. It distributes sufficiently large ranges of output rows to a persistent worker pool. Each worker writes its own rows. [Projection and tiling](../src/backend/cpu/kernels.cpp) · [Worker pool](../src/backend/cpu/thread_pool.cpp)
 
 Select kernels when binding the weights. On x86, check CPU feature bits and whether the OS saves the vector register state before entering AVX2 code. Nathr has AVX2 projection kernels for common encodings and a scalar path for other supported encodings or systems without usable AVX2. Its AVX2 FP16 projection also requires F16C for conversion. Compare optimized rows against the scalar version on ordinary lengths and tail sizes. [CPU dispatch](../src/backend/cpu/kernels.cpp) · [AVX2 kernels](../src/backend/cpu/x86/avx2.cpp)
 
@@ -237,7 +245,9 @@ Both Llama fixture calls return 23 logits and a greedy ID of `2`. Compare their 
 
 `forward --trace FILE` writes intermediate activations for a short sequence. `forward --logits-f32` streams one little-endian FP32 vocabulary row per token for comparisons against an independent implementation using the same checkpoint. Use exact comparisons when the operations and their numeric behavior match. When precision or reduction order differs, use a tolerance that accounts for the expected rounding error. [CLI reference](../README.md#cli-reference)
 
-Once the numeric path agrees, try the CLI examples with full SmolLM2 and GPT-2 checkpoints. Reuse the prompt IDs returned by `tokenize` for reproducible forward comparisons. The benchmark uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [CLI examples](../README.md#examples)
+Once the numeric path agrees, try the CLI examples with full SmolLM2 and GPT-2 checkpoints. Reuse the prompt IDs returned by `tokenize` for reproducible forward comparisons. The `bench` command uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [CLI examples](../README.md#cli-examples)
+
+The compatibility checker verifies SHA-256 hashes, token IDs, sampled tensor values, and seeded generation across standalone and batched execution where supported. Transformers 4.57.6 supplies the dense tensor and two-turn chat reference values. The GGUF tensor values and seeded samples come from Nathr. The optional mixed-length GGUF benchmark reports short-request time to first token, p95 inter-token latency, output throughput, and KV memory for one and three active requests. [Run the compatibility checker](../README.md#check-model-compatibility) · [Reference values](../tests/checkpoints.json)
 
 ## 9. Bring up a second checkpoint
 
@@ -245,10 +255,27 @@ Choose a checkpoint that differs in vocabulary size, head geometry, or context. 
 
 For an architecture with different layer equations, add the configuration and weight binding rules alongside its forward pass. Define any additional state the session must carry. Reuse the tensor readers, sampling loop, and kernels whose interfaces still fit. Validate the new forward pass on a tiny fixture, then compare its uncached and cached outputs before testing a long continuation.
 
-Nathr's GPT-2 decoder follows this pattern. It binds learned position embeddings and affine LayerNorm weights, transposes the stored projections once when it loads the checkpoint, and splits a combined projection into queries, keys, and values. The session requests workspace from the decoder and supplies the same KV cache to both architectures. [Decoder interface](../src/models/decoder.hpp) · [GPT-2 implementation](../src/models/gpt2/model.cpp) · [Run GPT-2 small](../README.md#run-gpt-2-small)
+Nathr's GPT-2 decoder follows this pattern. It binds learned position embeddings and affine LayerNorm weights, transposes the stored projections once when it loads the checkpoint, and splits a combined projection into queries, keys, and values. The session requests workspace from the decoder and supplies the same KV cache to both architectures. [Decoder interface](../src/models/decoder.hpp) · [GPT-2 implementation](../src/models/gpt2/model.cpp) · [Download GPT-2 small](../README.md#choose-a-checkpoint)
 
 ### Add an encoder and cross-attention
 
 BERT learns a position embedding for each input position. Each layer projects the entire sequence to Q, K, and V, then lets every query see every input token. The last layer returns one hidden-state row per input token. To verify bidirectionality, change the final token and compare the first token's new hidden state against a reference. [BERT encoder](../src/models/bert/model.cpp) · [BERT reference checks](../tests/runtime.cpp)
 
 T5's encoder also sees the full input. Its self-attention adds a learned bias based on the bucketed distance between each query and key. During decoding, each layer reads two sets of keys and values. The causal self-attention cache grows with each decoder token. The cross-attention cache is projected once per decoder layer from the final encoder output. The decoder begins with the configured start token and uses the same sampling loop as the decoder-only models. [T5 model](../src/models/t5/model.cpp) · [T5 paper](https://jmlr.org/papers/volume21/20-074/20-074.pdf)
+
+### Expose checkpoint outputs
+
+Use a tensor name and shape as the common inference contract. A checkpoint describes which outputs exist and how many input tokens they take. A BERT checkpoint can expose all hidden states or bind weights for its pooler and a classification head. Sentence Transformers checkpoints describe extra pooling and normalization in their module configuration. T5 logits are indexed by decoder position and can be compared using an explicit decoder prefix. Generation wraps logits with a sampling loop and request state. [Model inference API](../include/nathr/nathr.hpp) · [Output examples](../README.md#request-a-named-output)
+
+## Checkpoint support and limits
+
+Nathr reads dimensions, attention head counts, context length, and boundary token IDs from the checkpoint. It loads single-file weights up to 1 GiB and supports vocabularies up to 65,536 tokens. Session capacity also depends on the KV cache budget. [Model limits](../src/core/limits.hpp) · [Session allocation](../src/runtime/session.cpp)
+
+| Architecture | Supported configuration |
+| --- | --- |
+| Llama-style | GGUF v3 or Safetensors with RMSNorm, SwiGLU, unscaled full-width RoPE, and bias-free projections |
+| GPT-2 | Safetensors with learned positions, affine LayerNorm, and the GPT-2 GELU variant |
+| BERT | Safetensors with absolute position embeddings and GELU. Uses unpadded inputs and optional segment IDs. Outputs depend on the checkpoint's heads and pooling modules |
+| T5 | Safetensors for original ReLU T5. The decoder uses FP32 caches. The source and decoder are each limited to 512 positions or the checkpoint context, whichever is smaller |
+
+The built-in tokenizers cover byte-level BPE, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering supports the SmolLM2 ChatML template and reads its default system message from the checkpoint. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)

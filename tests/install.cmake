@@ -13,4 +13,16 @@ execute_process(COMMAND "${stage}/consumer/nathr-consumer" "${NATHR_SOURCE_DIR}/
     COMMAND_ERROR_IS_FATAL ANY)
 execute_process(COMMAND "${prefix}/${NATHR_BINDIR}/nathr" forward
     --model "${NATHR_SOURCE_DIR}/tests/fixtures/tiny.gguf" --tokens 1,2,3 COMMAND_ERROR_IS_FATAL ANY)
+if(NOT EXISTS "${prefix}/${NATHR_BINDIR}/nathr-serve.py")
+    message(FATAL_ERROR "Installed CLI is missing its HTTP frontend")
+endif()
+foreach(asset IN ITEMS index.html app.css app.js)
+    if(NOT EXISTS "${prefix}/${NATHR_BINDIR}/nathr-web/${asset}")
+        message(FATAL_ERROR "Installed CLI is missing browser asset ${asset}")
+    endif()
+endforeach()
+set(model_data "${prefix}/${NATHR_DATADIR}/nathr")
+execute_process(COMMAND "${model_data}/setup.sh" --help COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${model_data}/models/manifest.json"
+    "${NATHR_SOURCE_DIR}/models/manifest.json" COMMAND_ERROR_IS_FATAL ANY)
 file(REMOVE_RECURSE "${stage}")
