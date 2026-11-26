@@ -1,4 +1,4 @@
-#include "models/llama/model.hpp"
+#include "models/model.hpp"
 
 #include <nathr/generation.hpp>
 
@@ -9,8 +9,8 @@ namespace nathr {
 struct Session::Impl {
     Impl(const Model& source, std::size_t limit, std::uint64_t start_seed, SessionOptions options)
         : model(source), cache(model.config(), limit, options.kv_precision),
-          chunk(std::min(limit, options.prefill_chunk)), scratch(model.config(), limit, chunk),
-          seed(start_seed), rng(seed) {
+          chunk(std::min(limit, options.prefill_chunk)),
+          scratch(model.impl_->decoder->workspace(limit, chunk)), seed(start_seed), rng(seed) {
         tokens.reserve(limit);
     }
 
@@ -24,7 +24,8 @@ struct Session::Impl {
             const auto count = std::min(chunk, ids.size() - i);
             const auto output =
                 (mode == LogitsMode::last_token && i + count != ids.size()) ? LogitsMode::none : mode;
-            model.impl_->execute(ids.subspan(i, count), start + i, &cache, scratch, output, sink, trace);
+            model.impl_->decoder->execute(*scratch,
+                                          {ids.subspan(i, count), start + i, &cache, output, sink, trace});
             i += count;
         }
         // The input may be a view of the already-consumed prefix.
@@ -37,7 +38,7 @@ struct Session::Impl {
     Model model;
     detail::Cache cache;
     const std::size_t chunk;
-    detail::Scratch scratch;
+    std::unique_ptr<detail::Workspace> scratch;
     std::vector<Token> tokens;
     SessionState state = SessionState::empty;
     bool has_logits = false;
@@ -80,7 +81,7 @@ void Session::append(std::span<const Token> tokens, LogitsMode mode, const Logit
 std::span<const float> Session::logits() const {
     if (state() != SessionState::ready || !impl_->has_logits)
         throw Error(ErrorCode::invalid_argument, "logits are unavailable");
-    return impl_->scratch.logits;
+    return impl_->scratch->logits;
 }
 
 Token Session::sample(Sampler& sampler) {
@@ -97,7 +98,7 @@ std::size_t Session::capacity() const noexcept {
     return impl_->cache.capacity;
 }
 SessionMemory Session::memory() const noexcept {
-    return {impl_->cache.bytes(), impl_->scratch.bytes(), impl_->tokens.capacity() * sizeof(Token)};
+    return {impl_->cache.bytes(), impl_->scratch->bytes(), impl_->tokens.capacity() * sizeof(Token)};
 }
 
 void Session::reset() noexcept {

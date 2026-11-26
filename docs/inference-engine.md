@@ -2,7 +2,7 @@
 
 This guide builds a small CPU inference engine for pretrained decoder-only Transformers. Start with fixed token IDs and a scalar forward pass. Then add a tokenizer, a key-value cache, and a generation loop. Keeping these pieces separate lets you swap checkpoints, test each operation, and add CPU optimizations without changing the model equations.
 
-Nathr is the worked implementation. Its decoder covers a subset of the Llama architecture, and its tokenizer supports two byte-level BPE pipelines. The core interfaces below also apply when a different model family needs different layer equations, tensor mappings, or tokenization. SmolLM2-135M supplies concrete dimensions and a reproducible text example. [Nathr model compatibility](../README.md#model-compatibility)
+Nathr is the worked implementation. It runs a subset of Llama-style models and GPT-2, and its tokenizer supports two byte-level BPE pipelines. SmolLM2-135M supplies concrete dimensions for the Llama walkthrough. GPT-2 shows how a second architecture can share tensor readers, the session API, and CPU kernels. [Nathr model compatibility](../README.md#model-compatibility)
 
 ```mermaid
 flowchart LR
@@ -213,7 +213,7 @@ Work outward from the first place results can diverge. Use an independent implem
 | Check | What to compare |
 | --- | --- |
 | Loader and kernels | Expected shapes and row values, including quantized blocks built from known bytes |
-| Transformer | Embeddings, normalization, Q and K before and after RoPE, attention output, residuals, and logits |
+| Transformer | Embeddings, normalization, Q and K before and after RoPE when used, attention output, residuals, and logits |
 | Cache | Cached and uncached logits for the same prefix, then logits after appending one fixed token at a time |
 | Tokenizer | Token IDs and decoded bytes for the same prompt and special-token settings |
 | Generation | Greedy IDs, EOS handling, context boundaries, and UTF-8 across token boundaries |
@@ -233,24 +233,16 @@ fixture=tests/fixtures/model/f32
 "$bin" forward "$fixture" --tokens 1,7,2 --cached --prefill-chunk 1 --json
 ```
 
-Both forward calls return 23 logits and a greedy ID of `2`. Compare the two `logits` arrays. The fixture tests compare full forward, chunked prefill, and repeated append. They also cover packed formats, malformed inputs, sampling, and allocation behavior. [Nathr runtime tests](../tests/runtime.cpp)
+Both Llama fixture calls return 23 logits and a greedy ID of `2`. Compare their `logits` arrays, then rerun the two forward calls with `fixture=tests/fixtures/gpt2` to exercise the GPT-2 path. The runtime tests compare full forward, chunked prefill, and repeated append. The GPT-2 fixture also checks logits against a Transformers reference. [Nathr runtime tests](../tests/runtime.cpp)
 
-`forward --trace FILE` writes intermediate activations for a short sequence. `forward --logits-f32` streams one little-endian FP32 vocabulary row per token for comparisons against an independent implementation using the same checkpoint. Use exact comparisons when the operations and their numeric behavior match. When precision or reduction order differs, use a tolerance that accounts for the expected rounding error. [CLI forward command](../apps/nathr.cpp)
+`forward --trace FILE` writes intermediate activations for a short sequence. `forward --logits-f32` streams one little-endian FP32 vocabulary row per token for comparisons against an independent implementation using the same checkpoint. Use exact comparisons when the operations and their numeric behavior match. When precision or reduction order differs, use a tolerance that accounts for the expected rounding error. [CLI reference](../README.md#cli-reference)
 
-Once the numeric path agrees, try a full checkpoint. The following commands assume you downloaded the Q4_0 GGUF example to the path used in the README. To use the Safetensors example, set `model` to `models/cache/SmolLM2-135M` instead. [Model download instructions](../README.md#2-download-a-model)
-
-```sh
-model=models/cache/SmolLM2-135M.Q4_0.gguf
-"$bin" tokenize "$model" "Once upon a time"
-"$bin" generate "$model" "Once upon a time" --greedy --max-new-tokens 16
-"$bin" bench "$model" --prompt-length 128 --decode-length 32 \
-    --context 512 --backend auto --threads 4
-```
-
-The SmolLM2 tokenizer encodes `Once upon a time` as `[6403, 1980, 253, 655]`. These IDs give you a fixed input for comparing logits. The benchmark uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [Nathr benchmark](../apps/nathr.cpp)
+Once the numeric path agrees, try the CLI examples with full SmolLM2 and GPT-2 checkpoints. Reuse the prompt IDs returned by `tokenize` for reproducible forward comparisons. The benchmark uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [CLI examples](../README.md#examples)
 
 ## 9. Bring up a second checkpoint
 
 Choose a checkpoint that differs in vocabulary size, head geometry, or context. For the same architecture, bind the tensors from its metadata and repeat the fixed-ID comparison. If it uses a different tokenizer, get reference IDs externally and check the decoder before enabling text input. Nathr can exercise compatible checkpoints this way with `forward --tokens` and `generate --tokens IDS --json`. Use IDs from the new checkpoint's tokenizer for those tests. [Nathr CLI](../apps/nathr.cpp)
 
 For an architecture with different layer equations, add the configuration and weight binding rules alongside its forward pass. Define any additional state the session must carry. Reuse the tensor readers, sampling loop, and kernels whose interfaces still fit. Validate the new forward pass on a tiny fixture, then compare its uncached and cached outputs before testing a long continuation.
+
+Nathr's GPT-2 decoder follows this pattern. It binds learned position embeddings and affine LayerNorm weights, transposes the stored projections once when it loads the checkpoint, and splits a combined projection into queries, keys, and values. The session requests workspace from the decoder and supplies the same KV cache to both architectures. [Decoder interface](../src/models/decoder.hpp) · [GPT-2 implementation](../src/models/gpt2/model.cpp) · [Run GPT-2 small](../README.md#run-gpt-2-small)

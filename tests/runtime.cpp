@@ -246,7 +246,7 @@ void compare(std::span<const float> actual, std::span<const float> expected, dou
 
 std::size_t allocation_test(const Model& model, std::span<const Token> prompt, Token next,
                             SessionOptions options = {}) {
-    auto session = Session::create(model, 512, 0, options);
+    auto session = Session::create(model, std::min<std::size_t>(512, model.config().context), 0, options);
     session.prefill(prompt);
     session.reset();
     start_allocation_count();
@@ -433,6 +433,34 @@ void model_and_sessions() {
     compare(short_session.logits(), std::span(expected).last(23));
 }
 
+void gpt2_and_sessions() {
+    const auto path = fixtures / "gpt2";
+    const auto model = Model::load(path);
+    expect(model.architecture() == "gpt2" && model.config().context == 24 && model.config().bos == 17 &&
+               model.config().eos == 22,
+           "GPT-2 checkpoint configuration");
+    const auto expected = read_json(path / "logits.json", mib).get<std::vector<std::vector<float>>>();
+    expect(expected.size() == ids.size(), "GPT-2 reference length");
+    std::vector<std::vector<float>> actual;
+    model.forward(ids, LogitsMode::all_tokens, {}, [&](std::size_t pos, std::span<const float> logits) {
+        expect(pos == actual.size(), "GPT-2 forward positions");
+        compare(logits, expected.at(pos), 3e-6);
+        actual.emplace_back(logits.begin(), logits.end());
+    });
+    expect(actual.size() == ids.size(), "all GPT-2 forward positions delivered");
+    for (auto precision : {KvPrecision::f32, KvPrecision::f16}) {
+        auto session = Session::create(model, 24, 0, {precision, 2});
+        const LogitsSink sink = [&](std::size_t pos, std::span<const float> logits) {
+            compare(logits, actual.at(pos), precision == KvPrecision::f32 ? 0 : 8e-4);
+        };
+        session.prefill(std::span(ids).first(5), LogitsMode::all_tokens, sink);
+        session.append(std::span(ids).subspan(5), LogitsMode::all_tokens, sink);
+        expect(std::ranges::equal(session.history(), ids), "GPT-2 cache tracks appended positions");
+        compare(session.logits(), actual.back(), precision == KvPrecision::f32 ? 0 : 8e-4);
+    }
+    expect(allocation_test(model, ids, 4) == 0, "warmed GPT-2 prefill and append allocate no heap");
+}
+
 void tokenizer_and_sampling() {
     const auto tokenizer = Tokenizer::load(fixture / "tokenizer.json");
     expect(tokenizer.encode("abc<x>>ab") == std::vector<Token>({256, 258, 4}),
@@ -545,7 +573,13 @@ void gguf_tokenizer_metadata() {
     auto json = read_json(fixture / "tokenizer.json", mib);
     const auto sequence = json.at("pre_tokenizer");
     json["pre_tokenizer"] = sequence.at("pretokenizers").at(1);
+    json["pre_tokenizer"].erase("use_regex");
+    json["decoder"].erase("use_regex");
+    json["post_processor"] = {{"type", "ByteLevel"}, {"add_prefix_space", true}, {"trim_offsets", false}};
     auto& bpe = json.at("model");
+    bpe.erase("type");
+    bpe["continuing_subword_prefix"] = "";
+    bpe["end_of_word_suffix"] = "";
     bpe["vocab"] = Json::object();
     for (std::size_t id = 0; id < tokens.size(); ++id)
         bpe["vocab"][tokens[id]] = id;
@@ -553,12 +587,14 @@ void gguf_tokenizer_metadata() {
     json["added_tokens"] = Json::array({{{"id", 1},
                                          {"content", "🙂"},
                                          {"special", true},
-                                         {"normalized", false},
+                                         {"normalized", true},
                                          {"single_word", false},
                                          {"lstrip", false},
                                          {"rstrip", false}}});
     const auto write_sidecar = [&] { std::ofstream(sidecar) << json; };
     write_sidecar();
+    expect(Tokenizer::load(sidecar).encode("12🙂xy") == std::vector<Token>{3, 1, 6},
+           "legacy ByteLevel tokenizer serialization");
 
     write_model("gpt-2", control_types);
     expect(Gguf(model).architecture().at("example.block_count") == 2,
@@ -849,6 +885,7 @@ int main(int argc, char** argv) try {
         kernels();
         parser();
         model_and_sessions();
+        gpt2_and_sessions();
         threaded_cache_and_chunks();
         tokenizer_and_sampling();
         gguf_tokenizer_metadata();

@@ -28,6 +28,8 @@ assert_command(1 "invalid number for --tokens" forward --model "${model}" --toke
 assert_command(1 "require --cached" forward --model "${model}" --tokens 1 --kv-cache f16)
 assert_command(0 "greedy_id" forward --model "${model}" --tokens 1,7,2 --cached --kv-cache f16 --threads 2)
 assert_command(0 "safetensors" inspect "${model}")
+assert_command(0 "\"architecture\":[ ]*\"gpt2\"" inspect "${NATHR_FIXTURES}/gpt2")
+assert_command(0 "greedy_id" forward "${NATHR_FIXTURES}/gpt2" --tokens 1,7,2 --cached)
 assert_command(0 "\"ids\"" tokenize "${NATHR_FIXTURES}/model" "ab ab")
 set(positional_output "${command_output}")
 assert_command(0 "\"ids\"" tokenize --model "${NATHR_FIXTURES}/model" --prompt "ab ab")

@@ -223,30 +223,37 @@ Json gguf_info(const std::filesystem::path& path, BackendOptions options) {
 Json model_info(const Model& model) {
     const auto& c = model.config();
     const auto m = model.memory();
-    return {{"format", "safetensors"},
-            {"backend", model.backend()},
-            {"linear_kernels", kernel_info(model)},
-            {"cpu_features", capabilities()},
-            {"threads", model.threads()},
-            {"layers", c.layers},
-            {"hidden", c.hidden},
-            {"intermediate", c.intermediate},
-            {"query_heads", c.query_heads},
-            {"kv_heads", c.kv_heads},
-            {"head_dim", c.head_dim},
-            {"context", c.context},
-            {"vocabulary", c.vocabulary},
-            {"tied_embeddings", c.tied_embeddings},
-            {"rope_theta", c.rope_theta},
-            {"rms_epsilon", c.rms_epsilon},
-            {"bos_id", c.bos},
-            {"eos_id", c.eos},
-            {"owned_file_bytes", m.file_bytes},
-            {"mapped_weight_bytes", 0},
-            {"encoded_weight_bytes", m.encoded_weight_bytes},
-            {"stored_parameters", m.stored_parameters},
-            {"tensors", m.tensors},
-            {"dtype_histogram", {{"F32", m.f32_tensors}, {"F16", m.f16_tensors}, {"BF16", m.bf16_tensors}}}};
+    Json info = {
+        {"format", "safetensors"},
+        {"backend", model.backend()},
+        {"linear_kernels", kernel_info(model)},
+        {"cpu_features", capabilities()},
+        {"threads", model.threads()},
+        {"layers", c.layers},
+        {"hidden", c.hidden},
+        {"intermediate", c.intermediate},
+        {"query_heads", c.query_heads},
+        {"kv_heads", c.kv_heads},
+        {"head_dim", c.head_dim},
+        {"context", c.context},
+        {"vocabulary", c.vocabulary},
+        {"tied_embeddings", c.tied_embeddings},
+        {"bos_id", c.bos},
+        {"eos_id", c.eos},
+        {"owned_file_bytes", m.file_bytes},
+        {"mapped_weight_bytes", 0},
+        {"encoded_weight_bytes", m.encoded_weight_bytes},
+        {"stored_parameters", m.stored_parameters},
+        {"tensors", m.tensors},
+        {"dtype_histogram", {{"F32", m.f32_tensors}, {"F16", m.f16_tensors}, {"BF16", m.bf16_tensors}}}};
+    if (model.architecture() == "gpt2") {
+        info["architecture"] = model.architecture();
+        info["layer_norm_epsilon"] = c.rms_epsilon;
+    } else {
+        info["rope_theta"] = c.rope_theta;
+        info["rms_epsilon"] = c.rms_epsilon;
+    }
+    return info;
 }
 
 class TraceFile {

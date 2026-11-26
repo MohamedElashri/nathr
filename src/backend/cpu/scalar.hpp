@@ -26,9 +26,11 @@ struct Cache {
 };
 
 struct Scalar {
-    static void embedding(TensorView table, Token token, std::span<float> output);
+    static void embedding(TensorView table, std::size_t index, std::span<float> output);
     static void rms_norm(TensorView weight, std::span<const float> input, std::span<float> output,
                          float epsilon);
+    static void layer_norm(TensorView gain, TensorView bias, std::span<const float> input,
+                           std::span<float> output, float epsilon);
     static void rope(std::span<float> query, std::span<float> key, std::span<const float> frequency,
                      std::size_t position);
     static void store(Cache& cache, std::size_t layer, std::size_t position, std::span<const float> key,
@@ -38,6 +40,8 @@ struct Scalar {
                           std::span<const float> query, std::span<float> output, std::span<float> scores);
     static void softmax(std::span<float> scores);
     static void swiglu(std::span<float> gate, std::span<const float> up);
+    static void gelu(std::span<float> values);
+    static void add_bias(std::span<float> output, TensorView bias);
     static void add(std::span<float> output, std::span<const float> residual);
 };
 

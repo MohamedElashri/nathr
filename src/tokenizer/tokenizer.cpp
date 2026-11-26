@@ -206,6 +206,32 @@ detail::Json pretokenizer_config(Pretokenizer pre) {
             {"pretokenizers", Json::array({{{"type", "Digits"}, {"individual_digits", true}}, bytes})}};
 }
 
+bool has_type(const detail::Json& config, std::string_view type) {
+    const auto field = config.find("type");
+    return field != config.end() && *field == type;
+}
+
+bool byte_level_pretokenizer(const detail::Json& config) {
+    return has_type(config, "ByteLevel") && !config.value("add_prefix_space", true) &&
+           config.value("use_regex", true);
+}
+
+Pretokenizer read_pretokenizer(const detail::Json& config) {
+    if (byte_level_pretokenizer(config))
+        return Pretokenizer::byte_level;
+    if (has_type(config, "Sequence")) {
+        const auto& stages = config.at("pretokenizers");
+        if (stages.is_array() && stages.size() == 2 && has_type(stages[0], "Digits") &&
+            stages[0].value("individual_digits", false) && byte_level_pretokenizer(stages[1]))
+            return Pretokenizer::digits_byte_level;
+    }
+    throw Error(ErrorCode::unsupported, "unsupported byte-level BPE pretokenizer");
+}
+
+bool empty_affix(const detail::Json& value) {
+    return value.is_null() || value == "";
+}
+
 std::pair<std::string_view, std::string_view> merge_pair(const detail::Json& entry) {
     if (entry.is_string()) {
         const std::string_view pair = entry.get_ref<const std::string&>();
@@ -234,22 +260,15 @@ struct Tokenizer::Impl {
     explicit Impl(const detail::Json& json) {
         if (json.at("version") != "1.0" || !json.at("normalizer").is_null() ||
             !json.at("truncation").is_null() || !json.at("padding").is_null() ||
-            (!json.at("post_processor").is_null() && json.at("post_processor") != byte_level_config(false) &&
-             json.at("post_processor") != byte_level_config(true)) ||
-            json.at("decoder") != byte_level_config(true))
+            (!json.at("post_processor").is_null() && !has_type(json.at("post_processor"), "ByteLevel")) ||
+            !has_type(json.at("decoder"), "ByteLevel"))
             throw Error(ErrorCode::unsupported, "unsupported tokenizer pipeline");
-        const auto& pre_config = json.at("pre_tokenizer");
-        if (pre_config == pretokenizer_config(Pretokenizer::byte_level))
-            pre = Pretokenizer::byte_level;
-        else if (pre_config == pretokenizer_config(Pretokenizer::digits_byte_level))
-            pre = Pretokenizer::digits_byte_level;
-        else
-            throw Error(ErrorCode::unsupported, "unsupported byte-level BPE pretokenizer");
+        pre = read_pretokenizer(json.at("pre_tokenizer"));
         const auto& model = json.at("model");
-        if (model.at("type") != "BPE" || !model.at("dropout").is_null() || !model.at("unk_token").is_null() ||
-            !model.at("continuing_subword_prefix").is_null() || !model.at("end_of_word_suffix").is_null() ||
-            model.value("fuse_unk", false) || model.value("byte_fallback", false) ||
-            model.value("ignore_merges", false)) {
+        if (model.value("type", std::string("BPE")) != "BPE" || !model.at("dropout").is_null() ||
+            !model.at("unk_token").is_null() || !empty_affix(model.at("continuing_subword_prefix")) ||
+            !empty_affix(model.at("end_of_word_suffix")) || model.value("fuse_unk", false) ||
+            model.value("byte_fallback", false) || model.value("ignore_merges", false)) {
             throw Error(ErrorCode::unsupported, "unsupported BPE options");
         }
         const auto& vocab = model.at("vocab");
@@ -269,7 +288,7 @@ struct Tokenizer::Impl {
         if (!adds.is_array() || adds.size() > 64)
             throw Error(ErrorCode::malformed, "invalid added-token list");
         for (const auto& entry : adds) {
-            if (!entry.at("special").get<bool>() || entry.at("normalized").get<bool>() ||
+            if (!entry.at("special").get<bool>() || !entry.at("normalized").is_boolean() ||
                 entry.at("single_word").get<bool>() || entry.at("lstrip").get<bool>() ||
                 entry.at("rstrip").get<bool>()) {
                 throw Error(ErrorCode::unsupported, "unsupported added-token flags");

@@ -1,124 +1,70 @@
 #include "models/llama/model.hpp"
-#include "models/llama/config.hpp"
+
+#include "formats/gguf.hpp"
+#include "formats/safetensors.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <system_error>
 #include <type_traits>
-#include <utility>
 
 namespace nathr::detail {
+namespace {
 
-Scratch::Scratch(const ModelConfig& c, std::size_t positions, std::size_t block) {
+struct LlamaWorkspace final : Workspace {
+    LlamaWorkspace(const ModelConfig& c, std::size_t positions, std::size_t block);
+    std::span<float> hidden, query, keys, values, norm, attention, projection, gate, up;
+};
+
+LlamaWorkspace::LlamaWorkspace(const ModelConfig& c, std::size_t positions, std::size_t block) {
     const auto hidden_rows = product({block, c.hidden}, "hidden workspace");
     const auto kv_rows = product({block, c.kv_heads, c.head_dim}, "KV workspace");
     const auto intermediate_rows = product({block, c.intermediate}, "feed-forward workspace");
     const auto packing =
         block == 1 ? 0 : product({batch_tile, std::max(c.hidden, c.intermediate)}, "matrix tile workspace");
-    const std::pair<std::span<float>*, std::size_t> buffers[] = {
-        {&hidden, hidden_rows},     {&query, hidden_rows},      {&keys, kv_rows},
-        {&values, kv_rows},         {&norm, hidden_rows},       {&attention, hidden_rows},
-        {&projection, hidden_rows}, {&gate, intermediate_rows}, {&up, intermediate_rows},
-        {&packed, packing},         {&scores, positions},       {&logits, c.vocabulary},
-    };
-    std::size_t count = 0;
-    for (const auto& buffer : buffers)
-        count = sum(count, buffer.second, "workspace");
-    if (count > max_workspace_bytes / sizeof(float))
-        throw Error(ErrorCode::resource_limit, "workspace exceeds 32 MiB");
-    storage.resize(count);
-    auto remaining = std::span(storage);
-    for (const auto& [buffer, width] : buffers) {
-        *buffer = remaining.first(width);
-        remaining = remaining.subspan(width);
+    allocate({{&hidden, hidden_rows},
+              {&query, hidden_rows},
+              {&keys, kv_rows},
+              {&values, kv_rows},
+              {&norm, hidden_rows},
+              {&attention, hidden_rows},
+              {&projection, hidden_rows},
+              {&gate, intermediate_rows},
+              {&up, intermediate_rows},
+              {&packed, packing},
+              {&scores, positions},
+              {&logits, c.vocabulary}});
+}
+
+struct LayerWeights {
+    TensorView input_norm, q, k, v, o, post_attention_norm, gate, up, down;
+};
+
+class Llama final : public Decoder {
+  public:
+    template <class File>
+    Llama(File& file, const std::filesystem::path& path, const ModelConfig& config, CpuBackend& backend);
+    std::unique_ptr<Workspace> workspace(std::size_t positions, std::size_t block) const override {
+        return std::make_unique<LlamaWorkspace>(config, positions, block);
     }
-}
+    void execute(Workspace& scratch, const Evaluation& evaluation) const override;
 
-std::size_t Scratch::bytes() const noexcept {
-    return storage.capacity() * sizeof(float);
-}
-
-void validate_tokens(std::span<const Token> tokens, const ModelConfig& config, std::size_t limit) {
-    if (tokens.empty())
-        throw Error(ErrorCode::invalid_argument, "token span must be nonempty");
-    if (tokens.size() > limit)
-        throw Error(ErrorCode::invalid_argument, "token span exceeds capacity");
-    if (std::ranges::any_of(tokens, [&](Token token) { return token >= config.vocabulary; })) {
-        throw Error(ErrorCode::invalid_argument, "token ID exceeds model vocabulary");
-    }
-}
-
-void validate_mode(LogitsMode mode, const LogitsSink& sink) {
-    if ((mode != LogitsMode::all_tokens && mode != LogitsMode::last_token && mode != LogitsMode::none) ||
-        ((mode == LogitsMode::all_tokens) != static_cast<bool>(sink))) {
-        throw Error(ErrorCode::invalid_argument,
-                    "all-token logits mode requires a sink, other modes take no sink");
-    }
-}
-
-} // namespace nathr::detail
-
-namespace nathr {
-using namespace detail;
-
-namespace {
-std::filesystem::path weights_path(const std::filesystem::path& directory) {
-    std::error_code error;
-    if (std::filesystem::exists(directory / "model.safetensors.index.json", error)) {
-        throw Error(ErrorCode::unsupported, directory.string() + ": sharded Safetensors");
-    }
-    if (error)
-        throw Error(ErrorCode::io, directory.string() + ": " + error.message());
-    return directory / "model.safetensors";
-}
-
-std::span<float> row(std::span<float> values, std::size_t width, std::size_t index) {
-    return values.subspan(width * index, width);
-}
-} // namespace
-
-Model::Impl::WeightFile Model::Impl::open(const std::filesystem::path& path, bool hf_directory) {
-    if (hf_directory)
-        return WeightFile(std::in_place_type<SafeTensors>, weights_path(path));
-    return WeightFile(std::in_place_type<Gguf>, path);
-}
-
-Model::Impl::Impl(const std::filesystem::path& path, bool hf_directory, BackendOptions options,
-                  CpuFeatures features)
-    : config(hf_directory ? load_llama_config(path / "config.json") : ModelConfig{}),
-      tensors(open(path, hf_directory)), thread_count(options.threads), pool(thread_count) {
-    if (!hf_directory)
-        config = load_llama_config(std::get<Gguf>(tensors));
-    std::visit([&](auto& file) { bind(file, path, options.policy, features); }, tensors);
-    const bool use_avx2 = options.policy != ExecutionPolicy::scalar && features.avx2;
-    active_backend = use_avx2 ? "avx2" : "scalar";
-    frequency.resize(config.head_dim / 2);
-    for (std::size_t i = 0; i < frequency.size(); ++i) {
-        const double power = static_cast<double>(i) / static_cast<double>(frequency.size());
-        frequency[i] = static_cast<float>(1.0 / std::pow(static_cast<double>(config.rope_theta), power));
-    }
-}
+  private:
+    const ModelConfig& config;
+    const CpuBackend& backend;
+    TensorView embedding, output, norm;
+    std::vector<LayerWeights> layers;
+    std::vector<float> frequency;
+};
 
 template <class File>
-void Model::Impl::bind(File& file, const std::filesystem::path& path, ExecutionPolicy policy,
-                       CpuFeatures features) {
+Llama::Llama(File& file, const std::filesystem::path& path, const ModelConfig& c, CpuBackend& cpu)
+    : config(c), backend(cpu) {
     constexpr bool gguf = std::is_same_v<File, Gguf>;
     const auto h = config.hidden;
     const auto kv = config.kv_heads * config.head_dim;
     const auto ff = config.intermediate;
     const auto take = [&](std::string_view name, std::initializer_list<std::size_t> shape) {
-        const auto view = file.take(name, shape);
-        const auto type = view.desc.dtype;
-        const auto format = encoding(type);
-        auto& kernel = kernels[static_cast<std::size_t>(type)];
-        if (!kernel.dot)
-            kernel = select_kernel(type, policy, features);
-        if (!kernel.dot || (shape.size() == 1 && format->elements != 1)) {
-            throw Error(ErrorCode::unsupported, path.string() + ": no execution kernel for " +
-                                                    std::string(name) + " (" + std::string(format->name) +
-                                                    ")");
-        }
-        return view;
+        return cpu.bind(file.take(name, shape), path, name);
     };
     embedding = take(gguf ? "token_embd.weight" : "model.embed_tokens.weight", {config.vocabulary, h});
     norm = take(gguf ? "output_norm.weight" : "model.norm.weight", {h});
@@ -154,10 +100,18 @@ void Model::Impl::bind(File& file, const std::filesystem::path& path, ExecutionP
         throw Error(ErrorCode::unsupported, path.string() + ": unexpected tensor " + std::string(name));
     if constexpr (gguf)
         file.discard_metadata();
+    frequency.resize(config.head_dim / 2);
+    for (std::size_t i = 0; i < frequency.size(); ++i) {
+        const double power = static_cast<double>(i) / static_cast<double>(frequency.size());
+        frequency[i] = static_cast<float>(1.0 / std::pow(static_cast<double>(config.rope_theta), power));
+    }
 }
 
-void Model::Impl::execute(std::span<const Token> tokens, std::size_t start, Cache* cache, Scratch& w,
-                          LogitsMode mode, const LogitsSink& sink, const TraceSink& trace) const {
+void Llama::execute(Workspace& scratch, const Evaluation& evaluation) const {
+    auto& w = static_cast<LlamaWorkspace&>(scratch);
+    const auto tokens = evaluation.tokens;
+    const auto start = evaluation.start;
+    auto* const cache = evaluation.cache;
     const auto h = config.hidden;
     const auto kv = config.kv_heads * config.head_dim;
     const auto ff = config.intermediate;
@@ -172,19 +126,11 @@ void Model::Impl::execute(std::span<const Token> tokens, std::size_t start, Cach
     const auto gate = w.gate.first(count * ff);
     const auto up = w.up.first(count * ff);
     const auto linear = [&](TensorView weight, std::span<const float> input, std::span<float> result,
-                            std::size_t rows) {
-        project(kernels[static_cast<std::uint32_t>(weight.desc.dtype)], pool, weight, input, result, rows,
-                w.packed);
-    };
-    const auto record = [&](std::string_view name, std::size_t layer, std::size_t index,
-                            std::span<const float> data) {
-        if (trace)
-            trace({name, layer, start + index, data});
-    };
+                            std::size_t rows) { backend.project(weight, input, result, rows, w.packed); };
     for (std::size_t i = 0; i < count; ++i) {
         auto activation = row(hidden, h, i);
         Scalar::embedding(embedding, tokens[i], activation);
-        record("embedding", TraceEvent::model_level, i, activation);
+        evaluation.record("embedding", TraceEvent::model_level, i, activation);
     }
 
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
@@ -192,9 +138,9 @@ void Model::Impl::execute(std::span<const Token> tokens, std::size_t start, Cach
         for (std::size_t i = 0; i < count; ++i) {
             auto activation = row(hidden, h, i);
             auto norm_row = row(norms, h, i);
-            record("layer_input", layer, i, activation);
+            evaluation.record("layer_input", layer, i, activation);
             Scalar::rms_norm(weights.input_norm, activation, norm_row, config.rms_epsilon);
-            record("input_norm", layer, i, norm_row);
+            evaluation.record("input_norm", layer, i, norm_row);
         }
         linear(weights.q, norms, queries, count);
         linear(weights.k, norms, keys, count);
@@ -203,12 +149,12 @@ void Model::Impl::execute(std::span<const Token> tokens, std::size_t start, Cach
             auto q = row(queries, h, i);
             auto k = row(keys, kv, i);
             auto v = row(values, kv, i);
-            record("q_before_rope", layer, i, q);
-            record("k_before_rope", layer, i, k);
-            record("value", layer, i, v);
+            evaluation.record("q_before_rope", layer, i, q);
+            evaluation.record("k_before_rope", layer, i, k);
+            evaluation.record("value", layer, i, v);
             Scalar::rope(q, k, frequency, start + i);
-            record("q_after_rope", layer, i, q);
-            record("key_after_rope", layer, i, k);
+            evaluation.record("q_after_rope", layer, i, q);
+            evaluation.record("key_after_rope", layer, i, k);
             if (cache)
                 Scalar::store(*cache, layer, start + i, k, v);
         }
@@ -216,97 +162,59 @@ void Model::Impl::execute(std::span<const Token> tokens, std::size_t start, Cach
             auto result = row(attention, h, i);
             Scalar::attention(config, layer, start + i, cache, keys, values, row(queries, h, i), result,
                               w.scores);
-            record("attention", layer, i, result);
+            evaluation.record("attention", layer, i, result);
         }
         linear(weights.o, attention, projection, count);
         for (std::size_t i = 0; i < count; ++i) {
             auto activation = row(hidden, h, i);
             auto result = row(projection, h, i);
             auto norm_row = row(norms, h, i);
-            record("attention_projection", layer, i, result);
+            evaluation.record("attention_projection", layer, i, result);
             Scalar::add(activation, result);
-            record("attention_residual", layer, i, activation);
+            evaluation.record("attention_residual", layer, i, activation);
             Scalar::rms_norm(weights.post_attention_norm, activation, norm_row, config.rms_epsilon);
-            record("post_attention_norm", layer, i, norm_row);
+            evaluation.record("post_attention_norm", layer, i, norm_row);
         }
         linear(weights.gate, norms, gate, count);
         linear(weights.up, norms, up, count);
         for (std::size_t i = 0; i < count; ++i) {
             auto g = row(gate, ff, i);
             auto u = row(up, ff, i);
-            record("gate", layer, i, g);
-            record("up", layer, i, u);
+            evaluation.record("gate", layer, i, g);
+            evaluation.record("up", layer, i, u);
             Scalar::swiglu(g, u);
-            record("swiglu", layer, i, g);
+            evaluation.record("swiglu", layer, i, g);
         }
         linear(weights.down, gate, projection, count);
         for (std::size_t i = 0; i < count; ++i) {
             auto result = row(projection, h, i);
             auto activation = row(hidden, h, i);
-            record("down", layer, i, result);
+            evaluation.record("down", layer, i, result);
             Scalar::add(activation, result);
-            record("layer_output", layer, i, activation);
+            evaluation.record("layer_output", layer, i, activation);
         }
     }
     for (std::size_t i = 0; i < tokens.size(); ++i) {
-        if (mode == LogitsMode::none || (mode == LogitsMode::last_token && i + 1 != tokens.size()))
+        if (!evaluation.wants_logits(i))
             continue;
         const auto final_norm = w.norm.first(h);
         Scalar::rms_norm(norm, row(hidden, h, i), final_norm, config.rms_epsilon);
-        record("final_norm", TraceEvent::model_level, i, final_norm);
+        evaluation.record("final_norm", TraceEvent::model_level, i, final_norm);
         linear(output, final_norm, w.logits, 1);
-        if (!std::ranges::all_of(w.logits, [](float val) { return std::isfinite(val); })) {
-            throw Error(ErrorCode::backend, "output projection produced non-finite logits");
-        }
-        record("logits", TraceEvent::model_level, i, w.logits);
-        if (mode == LogitsMode::all_tokens)
-            sink(start + i, w.logits);
+        evaluation.publish_logits(i, w.logits);
     }
 }
 
-Model Model::load(const std::filesystem::path& path, BackendOptions options) {
-    validate_thread_count(options.threads);
-    if (options.policy != ExecutionPolicy::scalar && options.policy != ExecutionPolicy::automatic &&
-        options.policy != ExecutionPolicy::avx2)
-        throw Error(ErrorCode::unsupported, "unknown execution policy");
-    const auto features = cpu_features();
-    if (options.policy == ExecutionPolicy::avx2 && !features.avx2)
-        throw Error(ErrorCode::unsupported, "AVX2 was requested but CPU or OS AVX2 state is unavailable");
-    return Model(std::make_shared<Impl>(path, is_model_directory(path), options, features));
+} // namespace
+
+std::unique_ptr<Decoder> load_llama(SafeTensors& file, const std::filesystem::path& path,
+                                    const ModelConfig& config, CpuBackend& backend) {
+    return std::make_unique<Llama>(file, path, config, backend);
 }
 
-const ModelConfig& Model::config() const noexcept {
-    return impl_->config;
+std::unique_ptr<Decoder> load_llama(Gguf& file, const std::filesystem::path& path, const ModelConfig& config,
+                                    CpuBackend& backend) {
+    return std::make_unique<Llama>(file, path, config, backend);
 }
 
-ModelMemory Model::memory() const noexcept {
-    return std::visit([](const auto& file) { return file.memory(); }, impl_->tensors);
-}
-
-std::string_view Model::backend() const noexcept {
-    return impl_->active_backend;
-}
-
-unsigned Model::threads() const noexcept {
-    return impl_->thread_count;
-}
-
-std::string_view Model::kernel(std::uint32_t id) const noexcept {
-    return id < impl_->kernels.size() ? impl_->kernels[id].name : std::string_view{};
-}
-
-void Model::forward(std::span<const Token> tokens, LogitsMode mode, std::span<float> last_logits,
-                    const LogitsSink& sink, const TraceSink& trace) const {
-    validate_tokens(tokens, config(), std::min(config().context, max_uncached_tokens));
-    validate_mode(mode, sink);
-    if ((mode == LogitsMode::last_token && last_logits.size() != config().vocabulary) ||
-        (mode != LogitsMode::last_token && !last_logits.empty())) {
-        throw Error(ErrorCode::invalid_argument, "last-token mode requires a vocabulary-sized output span");
-    }
-    Scratch scratch(config(), tokens.size(), tokens.size());
-    impl_->execute(tokens, 0, nullptr, scratch, mode, sink, trace);
-    if (mode == LogitsMode::last_token)
-        std::ranges::copy(scratch.logits, last_logits.begin());
-}
-
-} // namespace nathr
+} // namespace nathr::detail

@@ -1,0 +1,17 @@
+{
+  "model_type": "gpt2",
+  "architectures": [
+    "GPT2LMHeadModel"
+  ],
+  "n_layer": 2,
+  "n_embd": 8,
+  "n_head": 2,
+  "vocab_size": 23,
+  "n_positions": 24,
+  "n_inner": 13,
+  "bos_token_id": 17,
+  "eos_token_id": 22,
+  "activation_function": "gelu_new",
+  "layer_norm_epsilon": 1e-05,
+  "tie_word_embeddings": true
+}

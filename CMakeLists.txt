@@ -44,8 +44,10 @@ add_library(nathr_lib
     src/backend/cpu/kernels.cpp
     src/backend/cpu/thread_pool.cpp
     src/backend/cpu/x86/avx2.cpp
+    src/models/model.cpp
     src/models/llama/config.cpp
     src/models/llama/model.cpp
+    src/models/gpt2/model.cpp
     src/runtime/session.cpp
     src/runtime/generation.cpp
     src/tokenizer/tokenizer.cpp

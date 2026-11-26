@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <functional>
+#include <numeric>
 #include <type_traits>
 
 namespace nathr::detail {
@@ -162,17 +163,17 @@ std::size_t Cache::bytes() const noexcept {
     return std::visit([](const auto& bank) { return bank.capacity() * sizeof(bank.front()); }, storage);
 }
 
-void Scalar::embedding(TensorView table, Token token, std::span<float> output) {
+void Scalar::embedding(TensorView table, std::size_t index, std::span<float> output) {
     const auto& format = *encoding(table.desc.dtype);
     if (const auto unpack = scalar_kernel(table.desc.dtype).unpack) {
         const auto blocks = output.size() / format.elements;
-        const auto* start = table.bytes.data() + token * blocks * format.bytes;
+        const auto* start = table.bytes.data() + index * blocks * format.bytes;
         for (std::size_t i = 0; i < blocks; ++i)
             unpack(start + i * format.bytes, output.data() + i * format.elements);
         return;
     }
     dispatch(table.desc.dtype, [&]<DType dtype> {
-        const auto start = token * output.size();
+        const auto start = index * output.size();
         for (std::size_t i = 0; i < output.size(); ++i)
             output[i] = value_at<dtype>(table.bytes.data(), start + i);
     });
@@ -184,6 +185,27 @@ void Scalar::rms_norm(TensorView weight, std::span<const float> input, std::span
     dispatch(weight.desc.dtype, [&]<DType dtype> {
         for (std::size_t i = 0; i < input.size(); ++i)
             output[i] = static_cast<float>((input[i] * scale) * value_at<dtype>(weight.bytes.data(), i));
+    });
+}
+
+void Scalar::layer_norm(TensorView gain, TensorView bias, std::span<const float> input,
+                        std::span<float> output, float epsilon) {
+    const double count = static_cast<double>(input.size());
+    const double mean = std::accumulate(input.begin(), input.end(), 0.0) / count;
+    double square = 0;
+    for (float value : input) {
+        const auto centered = value - mean;
+        square += centered * centered;
+    }
+    const double scale = 1.0 / std::sqrt(square / count + epsilon);
+    dispatch(gain.desc.dtype, [&]<DType G> {
+        dispatch(bias.desc.dtype, [&]<DType B> {
+            for (std::size_t i = 0; i < input.size(); ++i) {
+                const auto normalized = (input[i] - mean) * scale;
+                output[i] = static_cast<float>(normalized * value_at<G>(gain.bytes.data(), i) +
+                                               value_at<B>(bias.bytes.data(), i));
+            }
+        });
     });
 }
 
@@ -316,6 +338,21 @@ void Scalar::swiglu(std::span<float> gate, std::span<const float> up) {
         const double g = gate[i];
         gate[i] = static_cast<float>((g / (1.0 + std::exp(-g))) * up[i]);
     }
+}
+
+void Scalar::gelu(std::span<float> values) {
+    constexpr double sqrt_two_over_pi = 0.7978845608028654;
+    for (float& value : values) {
+        const double x = value;
+        value = static_cast<float>(0.5 * x * (1 + std::tanh(sqrt_two_over_pi * (x + 0.044715 * x * x * x))));
+    }
+}
+
+void Scalar::add_bias(std::span<float> output, TensorView bias) {
+    dispatch(bias.desc.dtype, [&]<DType dtype> {
+        for (std::size_t i = 0; i < output.size(); ++i)
+            output[i] += value_at<dtype>(bias.bytes.data(), i);
+    });
 }
 
 void Scalar::add(std::span<float> output, std::span<const float> residual) {

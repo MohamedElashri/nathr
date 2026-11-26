@@ -3,12 +3,13 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Usage: ./setup.sh [gguf|safetensors|all]
+Usage: ./setup.sh [gguf|safetensors|all|gpt2]
 
-Build and test Nathr, then verify generation with the selected SmolLM2-135M checkpoint.
-  gguf         Download the Q4_0 GGUF checkpoint (default).
-  safetensors  Download the original Safetensors checkpoint.
-  all          Download and test both formats.
+Build and test Nathr, then verify generation with the selected checkpoint.
+  gguf         Download SmolLM2-135M Q4_0 GGUF (default).
+  safetensors  Download the original SmolLM2-135M Safetensors checkpoint.
+  all          Download and test both SmolLM2-135M formats.
+  gpt2         Download the GPT-2 small Safetensors checkpoint.
 USAGE
 }
 
@@ -18,7 +19,7 @@ if (( $# > 1 )); then
 fi
 selection=${1-gguf}
 case "$selection" in
-    gguf|safetensors|all) ;;
+    gguf|safetensors|all|gpt2) ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -110,6 +111,11 @@ if [[ $selection == safetensors || $selection == all ]]; then
     download_checkpoint HuggingFaceTB/SmolLM2-135M "$safetensors_path" \
         config.json model.safetensors tokenizer.json
     models+=("$safetensors_path")
+fi
+if [[ $selection == gpt2 ]]; then
+    gpt2_path=models/cache/gpt2
+    download_checkpoint openai-community/gpt2 "$gpt2_path" config.json model.safetensors tokenizer.json
+    models+=("$gpt2_path")
 fi
 
 cmake --build --preset release --parallel 2

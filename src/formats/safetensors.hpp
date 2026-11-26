@@ -13,6 +13,8 @@ class SafeTensors {
     SafeTensors(const SafeTensors&) = delete;
     SafeTensors& operator=(const SafeTensors&) = delete;
     [[nodiscard]] TensorView take(std::string_view name, std::initializer_list<std::size_t> shape);
+    [[nodiscard]] TensorView take_transposed_matrix(std::string_view name, std::size_t rows,
+                                                    std::size_t columns);
     [[nodiscard]] bool contains(std::string_view name) const;
     [[nodiscard]] std::string_view first_unbound() const noexcept {
         return tensors_.empty() ? std::string_view{} : tensors_.begin()->first;

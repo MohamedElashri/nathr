@@ -28,7 +28,7 @@ using Token = std::uint32_t;
 
 struct ModelConfig {
     std::size_t layers, hidden, intermediate, query_heads, kv_heads, head_dim, vocabulary, context;
-    float rope_theta, rms_epsilon;
+    float rope_theta, rms_epsilon; // rms_epsilon also carries the LayerNorm epsilon for GPT-2.
     Token bos, eos;
     bool tied_embeddings;
 };
@@ -66,6 +66,7 @@ class Model {
     static Model load(const std::filesystem::path& path, BackendOptions options = {});
     [[nodiscard]] const ModelConfig& config() const noexcept;
     [[nodiscard]] ModelMemory memory() const noexcept;
+    [[nodiscard]] std::string_view architecture() const noexcept;
     [[nodiscard]] std::string_view backend() const noexcept;
     [[nodiscard]] unsigned threads() const noexcept;
     [[nodiscard]] std::string_view kernel(std::uint32_t encoding_id) const noexcept;

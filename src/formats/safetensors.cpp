@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <fstream>
 
 namespace nathr::detail {
@@ -137,6 +138,22 @@ TensorView SafeTensors::take(std::string_view name, std::initializer_list<std::s
         throw Error(ErrorCode::malformed, path_.string() + ": wrong shape for " + std::string(name));
     }
     tensors_.erase(item);
+    return tensor;
+}
+
+TensorView SafeTensors::take_transposed_matrix(std::string_view name, std::size_t rows, std::size_t columns) {
+    auto tensor = take(name, {columns, rows});
+    const auto width = encoding(tensor.desc.dtype)->bytes;
+    std::vector<std::byte> transposed(tensor.bytes.size());
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t column = 0; column < columns; ++column) {
+            std::memcpy(transposed.data() + (row * columns + column) * width,
+                        tensor.bytes.data() + (column * rows + row) * width, width);
+        }
+    }
+    const auto offset = tensor.bytes.data() - bytes_.data();
+    std::ranges::copy(transposed, bytes_.begin() + offset);
+    std::swap(tensor.desc.shape[0], tensor.desc.shape[1]);
     return tensor;
 }
 

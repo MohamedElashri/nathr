@@ -36,8 +36,7 @@ void set_boundary_tokens(ModelConfig& c, const Json& bos_id, const Json& eos_id,
 
 } // namespace
 
-ModelConfig load_llama_config(const std::filesystem::path& config_path) {
-    const auto json = read_json(config_path, mib);
+ModelConfig load_llama_config(const Json& json, const std::filesystem::path& config_path) {
     const auto path = config_path.string();
     try {
         const auto field = [&](std::string_view name) {
