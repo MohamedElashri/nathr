@@ -3,7 +3,7 @@
 Private implementation ledger for Nathr, a standalone C++ LLM inference engine. This file is the canonical plan and progress record. Keep it current as implementation proceeds. Do not create separate phase plans, progress reports or implementation ledgers.
 
 Target: v1.0, SmolLM2-135M on x86-64 Linux.
-Status: Phases 0, 1 and 3 are complete. The Phase 2 GGUF execution slice is validated, with performance qualification deferred at the user’s direction. Phase 4 implementation and correctness validation are complete, with local performance qualification blocked on repeatability. Phase 5 hardening, packaging and local correctness validation are complete. Release qualification remains blocked on controlled timing and hosted verification.
+Status: Phases 0, 1 and 3 are complete. Phases 2 and 4 passed correctness validation and still need repeatable matched timing. Phase 5 hardening, packaging, local correctness validation and Git diff review are complete. Release qualification remains blocked on controlled timing and GitHub Actions verification.
 
 Project identifiers: repository and executable `nathr`, C++ namespace `nathr`, library `libnathr`, CMake target `nathr::nathr`.
 
@@ -354,7 +354,7 @@ taskset -c 0 ./build/release/nathr bench --model "$MODEL" --backend scalar --thr
 - [x] Runtime dispatch works on baseline x86-64 and tested ISA extensions without unsupported instructions. Forced unsupported paths fail cleanly; fallbacks are reported. Threaded execution is correct and race-tested.
 - [ ] Benchmark suite reports reproducible scalar/optimized/external baselines and quantization quality, with limitations and hardware details. End-to-end decode and prefill improvements meet the predeclared hardware-specific gates; no arbitrary unsupported performance claims.
 - [x] Malformed input, resource limits, lifetime, parser/quant-block fuzzing and cache-boundary tests pass. ASan/UBSan and TSan (supported subset) are clean, or environmental limitations explicitly block affected claims. No skipped required validation is marked passed.
-- [ ] README and API/architecture/numerical/quantization/performance docs describe usage, exact supported artifacts, backend selection, reproduction commands and limitations. The ledger records completion evidence and deviations. Final diff is reviewed.
+- [x] README and API/architecture/numerical/quantization/performance docs describe usage, exact supported artifacts, backend selection, reproduction commands and limitations. The ledger records completion evidence and deviations. Final diff is reviewed.
 
 ## Test Plan
 
@@ -570,7 +570,7 @@ Acceptance criteria:
 - Controlled floating GGUF and quantized slice execute end to end with independently verified math, packed storage, tokenizer and dispatch. Tested acceleration meets declared slice gate on supported hardware; unsupported hardware is reported and not silently passed. Architecture is proven with a small quantized workload before broad implementation.
 
 Status:
-- GGUF execution and correctness validation are complete. The user approved proceeding to Phase 3 with performance qualification deferred. The Phase 2 timing gate remains open.
+- GGUF execution and correctness validation are complete. The user approved proceeding to Phase 3 with performance qualification deferred. The v1.0 follow-up reopened the timing gate and retried both artifacts on logical CPU 14 with the original benchmark executable and probe. The largest first-batch CV was 14.59% for Q8_0 and 28.71% for Q4_0, both above 5%. [v1.0 qualification evidence](benchmarks/phase5.json)
 
 Completion notes:
 
@@ -683,6 +683,7 @@ Acceptance criteria:
 Status:
 - Implementation and correctness validation complete. Performance qualification is blocked by measured variability. The earlier Phase 2 timing deferral is tracked separately from its completed correctness work.
 - The Phase 5 retry repeated the exact Q8_0 workload on the recorded Phase 3 and Phase 4 binaries. First-batch prefill/decode CV was 34.47%/39.61% on the one-core AVX2 baseline, 23.19%/28.06% for four-core repeated GEMV and 31.21%/44.71% for four-core blocked prefill. Each pair exceeded the 5% limit. Q8_0 alone established the mandatory gate remained blocked on this host.
+- The v1.0 follow-up repeated all three artifacts with the saved Phase 3 executable and the validated release binary. The largest first-batch CV was 21.19% for F32, 15.66% for Q8_0 and 18.46% for Q4_0. Each artifact stopped after its first batch under the same 5% rule. The pinned llama.cpp and Q8_0 SMT comparisons were recorded separately. [v1.0 qualification evidence](benchmarks/phase5.json)
 
 Completion notes:
 - The Phase 3 release executable and component probe were saved before optimization. A one-core `32/8/512` pilot on CPU 12 with one warmup and three measured runs gave 24.68/19.83 prefill/decode tokens/s for F32, 25.67/19.92 for Q8_0 and 23.77/19.04 for Q4_0. Cached weights exceed the shared 16 MiB L3. A 256 MiB-buffer copy gave 20.21 GB/s median logical traffic. Hardware counters remained unavailable with `perf_event_paranoid=4`. These exploratory results select dense, Q8_0 and Q4_0 kernels for tuning. The matched `128/32/512` acceptance workloads retain the 5% repeatability and drift limits and 10% prefill and decode improvement targets for the representative comparisons.
@@ -734,13 +735,13 @@ Deliverables:
 - [x] Run GCC/Clang Debug/Release, ASan/UBSan, separate TSan, offline build and dependency audit. Run bounded coverage-guided fuzz campaigns for Safetensors, GGUF, tokenizer and quant blocks; preserve minimized regression cases. Record duration, seeds and unavailable tests.
 - [ ] Run release benchmark matrix on controlled hardware, including sustained decoding, prefill, TTFT, peak RSS, mapped/owned allocations, executable size and quality results. Publish machine-readable reproducibility metadata and comparison limitations. No timing gates on shared CI.
 - [x] Finalize `nathr::nathr` consumer/installation smoke test, public headers, CLI help/error handling, documentation and notices. Document precise artifact compatibility, optional sidecar requirements, kernel fallback, numerical policy and memory/CPU limits.
-- [ ] Review final diff, remove unused abstractions and temporary artifacts without touching user work. Verify all top-level acceptance criteria against recorded evidence; do not label skipped mandatory checks as passed. Release/tag only with authorization.
+- [x] Review final diff, remove unused abstractions and temporary artifacts without touching user work. Verify all top-level acceptance criteria against recorded evidence; do not label skipped mandatory checks as passed. Release/tag only with authorization.
 
 Acceptance criteria:
 - All top-level acceptance criteria have recorded evidence. Nathr is independently implemented, usable, numerically validated, resource-bounded and reproducible on the stated x86 target. Required unresolved gaps block v1.0 unless user explicitly approves a scoped deviation. No unrelated changes remain.
 
 Status:
-- Blocked for v1.0. Packaging, hardening, the frozen artifact replay and the real full-context boundary check passed locally. Sustained characterization is recorded. Controlled matched timing, hosted verification and Git-based final diff review remain open.
+- Blocked for v1.0. Packaging, hardening, the frozen artifact replay and the real full-context boundary check passed locally. Sustained characterization and the Git diff review are complete. Controlled timing and GitHub Actions verification remain open.
 
 Completion notes:
 - The offline GCC 13.3 and Clang 23.1 Debug and Release matrix passed the model-free CTest suite, including CLI and relocated static package tests. A separate GCC shared-library Release build passed the same tests. The installed CLI, CMake target, public headers and bundled notices are documented in the [README](README.md) and [architecture guide](docs/architecture.md). The CLI's direct dynamic dependencies are `libstdc++.so.6`, `libm.so.6`, `libgcc_s.so.1` and `libc.so.6`. QEMU's Nehalem profile produced the same tiny-model output under automatic and forced scalar dispatch and rejected forced AVX2.
@@ -751,8 +752,9 @@ Completion notes:
 - The real four-thread Q4_0 check completed an 8,191-token prefill and one append with FP16 KV. It used 188,743,680 cache bytes, 1,138,688 workspace bytes and 283,156 KiB peak RSS. The shared-host prefill took about 79 minutes. This one-shot check verifies the boundary without a timing gate.
 - The local four-core, 128/128/512 sustained run recorded one warmup and three samples per model, including 384 inter-token latencies per model. Median prefill/decode throughput was 18.29/12.49 tokens/s for native, 28.63/10.87 for Q8_0, and 28.60/9.36 for Q4_0. Median TTFT was 7.00, 4.47 and 4.48 seconds respectively. Peak RSS was 291,164, 173,588 and 121,600 KiB. Both quantized files stayed mapped with zero owned file bytes. The GCC Release CLI was 814,880 bytes, or 698,704 bytes stripped. The fixed 112-target corpus yielded perplexity 40.38, 41.33 and 50.71 respectively. [Phase 5 measurements and validation evidence](benchmarks/phase5.json)
 - Reviewed the changed workspace files and confirmed the archived Q8_0 integer experiment still applies with a dry run. The integer dispatch remains disabled in production.
+- The private GitHub repository starts at the Phase 5 workspace snapshot `6e31161`. Reviewed the Git diff for the release workflow update and qualification evidence against that snapshot. The release workflow verifies hashes for the archived Phase 2 executable and probe and the Phase 3 baseline, and enforces the Phase 2 gate alongside the Phase 4 gate. The workflow shell and gate logic passed local checks with passing and failing inputs. [Nathr repository](https://github.com/MohamedElashri/nathr)
 
 Deviation notes:
-- LeakSanitizer could not start under sandbox tracing. Local sanitizer and fuzz runs disabled leak detection. Valgrind independently covered the model-free suite.
+- LeakSanitizer could not start under sandbox tracing during the original Phase 5 checks. Valgrind independently covered that model-free suite. The follow-up enabled leak detection outside tracing. Both model-free CTests and all four 45-second fuzz campaigns passed, with 7,159,908 fuzz inputs and no findings. [Follow-up sanitizer evidence](benchmarks/phase5.json)
 - The shared-host sustained samples overlapped the Q4_0 full-context check on disjoint physical cores of the same CPU package. These samples characterize the local run. The 5% matched repeatability and the speedup gates remain open.
-- The sandbox exposes empty Git metadata and no configured controlled model runner. Hosted validation and Git-based final diff review remain unverified. The installed package version is 0.4.0.
+- GitHub Actions blocked the initial hosted C++ run before any job started, citing an account payment or spending-limit issue. The repository has no configured self-hosted runner for pinned model validation or controlled timing. The installed package version is 0.4.0. [Hosted C++ run](https://github.com/MohamedElashri/nathr/actions/runs/45735887951)
