@@ -1,7 +1,6 @@
 #include <nathr/tokenizer.hpp>
 
 #include "core/input.hpp"
-#include "core/sha256.hpp"
 #include "formats/gguf.hpp"
 #include "tokenizer/unicode_tables.hpp"
 
@@ -18,6 +17,9 @@ constexpr std::size_t input_limit = detail::mib;
 constexpr std::size_t vocab_limit = 65536;
 constexpr Token missing = std::numeric_limits<Token>::max();
 constexpr std::string_view replacement = "\xef\xbf\xbd";
+
+enum class Pretokenizer { byte_level, digits_byte_level, unsupported };
+enum class GgufTokenType : std::size_t { normal = 1, control = 3 };
 
 enum class Utf8Status { valid, invalid, incomplete };
 struct Codepoint {
@@ -168,7 +170,11 @@ void byte_level(std::string_view text, std::span<const Unit> cp, std::size_t beg
 }
 
 void split(std::string_view text, std::span<const Unit> cp, std::size_t begin, std::size_t end,
-           const auto& emit) {
+           Pretokenizer pre, const auto& emit) {
+    if (pre == Pretokenizer::byte_level) {
+        byte_level(text, cp, begin, end, emit);
+        return;
+    }
     auto chunk = begin;
     for (auto i = begin; i < end; ++i) {
         if (in_ranges(cp[i].cp, detail::numbers_17)) {
@@ -184,19 +190,34 @@ std::uint64_t pair_id(Token a, Token b) {
     return (std::uint64_t(a) << 32) | b;
 }
 
-detail::Json expected_pipeline() {
+detail::Json byte_level_config(bool add_prefix_space) {
     using detail::Json;
-    const Json pre = {{"type", "Sequence"},
-                      {"pretokenizers", Json::array({{{"type", "Digits"}, {"individual_digits", true}},
-                                                     {{"type", "ByteLevel"},
-                                                      {"add_prefix_space", false},
-                                                      {"trim_offsets", true},
-                                                      {"use_regex", true}}})}};
-    const Json decoder = {
-        {"type", "ByteLevel"}, {"add_prefix_space", true}, {"trim_offsets", true}, {"use_regex", true}};
-    return {{"version", "1.0"},      {"normalizer", nullptr}, {"post_processor", nullptr},
-            {"truncation", nullptr}, {"padding", nullptr},    {"pre_tokenizer", pre},
-            {"decoder", decoder}};
+    return Json{{"type", "ByteLevel"},
+                {"add_prefix_space", add_prefix_space},
+                {"trim_offsets", true},
+                {"use_regex", true}};
+}
+
+detail::Json pretokenizer_config(Pretokenizer pre) {
+    using detail::Json;
+    const auto bytes = byte_level_config(false);
+    if (pre == Pretokenizer::byte_level)
+        return bytes;
+    return {{"type", "Sequence"},
+            {"pretokenizers", Json::array({{{"type", "Digits"}, {"individual_digits", true}}, bytes})}};
+}
+
+std::pair<std::string_view, std::string_view> merge_pair(const detail::Json& entry) {
+    if (entry.is_string()) {
+        const std::string_view pair = entry.get_ref<const std::string&>();
+        const auto space = pair.find(' ');
+        if (space == pair.npos)
+            throw Error(ErrorCode::malformed, "BPE merge has no delimiter");
+        return {pair.substr(0, space), pair.substr(space + 1)};
+    }
+    if (entry.is_array() && entry.size() == 2)
+        return {entry[0].get_ref<const std::string&>(), entry[1].get_ref<const std::string&>()};
+    throw Error(ErrorCode::malformed, "invalid BPE merge pair");
 }
 
 } // namespace
@@ -212,12 +233,19 @@ struct Tokenizer::Impl {
     };
 
     explicit Impl(const detail::Json& json) {
-        using detail::Json;
-        const auto pipeline = expected_pipeline();
-        for (const auto& [key, value] : pipeline.items()) {
-            if (json.at(key) != value)
-                throw Error(ErrorCode::unsupported, "unsupported tokenizer pipeline");
-        }
+        if (json.at("version") != "1.0" || !json.at("normalizer").is_null() ||
+            !json.at("truncation").is_null() || !json.at("padding").is_null() ||
+            (!json.at("post_processor").is_null() && json.at("post_processor") != byte_level_config(false) &&
+             json.at("post_processor") != byte_level_config(true)) ||
+            json.at("decoder") != byte_level_config(true))
+            throw Error(ErrorCode::unsupported, "unsupported tokenizer pipeline");
+        const auto& pre_config = json.at("pre_tokenizer");
+        if (pre_config == pretokenizer_config(Pretokenizer::byte_level))
+            pre = Pretokenizer::byte_level;
+        else if (pre_config == pretokenizer_config(Pretokenizer::digits_byte_level))
+            pre = Pretokenizer::digits_byte_level;
+        else
+            throw Error(ErrorCode::unsupported, "unsupported byte-level BPE pretokenizer");
         const auto& model = json.at("model");
         if (model.at("type") != "BPE" || !model.at("dropout").is_null() || !model.at("unk_token").is_null() ||
             !model.at("continuing_subword_prefix").is_null() || !model.at("end_of_word_suffix").is_null() ||
@@ -226,7 +254,7 @@ struct Tokenizer::Impl {
             throw Error(ErrorCode::unsupported, "unsupported BPE options");
         }
         const auto& vocab = model.at("vocab");
-        if (!vocab.is_object() || vocab.size() < 256 || vocab.size() > vocab_limit) {
+        if (!vocab.is_object() || vocab.empty() || vocab.size() > vocab_limit) {
             throw Error(ErrorCode::malformed, "invalid BPE vocabulary size");
         }
         raw.resize(vocab.size());
@@ -236,9 +264,7 @@ struct Tokenizer::Impl {
             const auto id = checked_id(value);
             if (text.empty() || text.size() > 1024 || !raw[id].empty())
                 throw Error(ErrorCode::malformed, "empty, oversized or duplicate BPE token");
-            raw[id] = as_bytes(text, "BPE vocabulary");
-            if (raw[id].size() == 1)
-                byte_tokens[static_cast<unsigned char>(raw[id][0])] = id;
+            raw[id] = text;
         }
         const auto& adds = json.at("added_tokens");
         if (!adds.is_array() || adds.size() > 64)
@@ -251,39 +277,33 @@ struct Tokenizer::Impl {
             }
             auto text = entry.at("content").get<std::string>();
             const auto id = checked_id(entry.at("id"));
-            if (text.size() < 2 || text.size() > 128 || !text.starts_with('<') || !text.ends_with('>') ||
-                special[id] || !vocab.contains(text) || checked_id(vocab.at(text)) != id) {
+            if (text.empty() || text.size() > 128 || special[id] || raw[id] != text) {
                 throw Error(ErrorCode::malformed, "invalid or duplicate added token");
             }
             special[id] = true;
+            added_starts[static_cast<unsigned char>(text.front())] = true;
             added.push_back({std::move(text), id});
         }
         std::ranges::sort(added,
                           [](const Added& a, const Added& b) { return a.text.size() > b.text.size(); });
+
+        for (std::size_t id = 0; id < raw.size(); ++id) {
+            if (special[id])
+                continue;
+            raw[id] = as_bytes(raw[id], "BPE vocabulary");
+            if (raw[id].size() == 1)
+                byte_tokens[static_cast<unsigned char>(raw[id][0])] = static_cast<Token>(id);
+        }
 
         const auto& pairs = model.at("merges");
         if (!pairs.is_array() || pairs.size() > vocab.size())
             throw Error(ErrorCode::malformed, "invalid BPE merge list");
         merges.reserve(pairs.size());
         for (std::size_t rank = 0; rank < pairs.size(); ++rank) {
-            const auto& entry = pairs[rank];
-            std::string first, second;
-            if (entry.is_string()) {
-                const auto& pair = entry.get_ref<const std::string&>();
-                const auto space = pair.find(' ');
-                if (space == pair.npos)
-                    throw Error(ErrorCode::malformed, "BPE merge has no delimiter");
-                first = pair.substr(0, space);
-                second = pair.substr(space + 1);
-            } else if (entry.is_array() && entry.size() == 2) {
-                first = entry[0].get<std::string>();
-                second = entry[1].get<std::string>();
-            } else {
-                throw Error(ErrorCode::malformed, "invalid BPE merge pair");
-            }
+            const auto [first, second] = merge_pair(pairs[rank]);
             const auto left = checked_id(vocab.at(first));
             const auto right = checked_id(vocab.at(second));
-            const auto result = checked_id(vocab.at(first + second));
+            const auto result = checked_id(vocab.at(std::string(first) + std::string(second)));
             if (!merges.emplace(pair_id(left, right), Merge{result, rank}).second) {
                 throw Error(ErrorCode::malformed, "duplicate BPE merge");
             }
@@ -317,7 +337,7 @@ struct Tokenizer::Impl {
         };
         std::vector<Node> nodes;
         nodes.reserve(input.size());
-        // The pinned BPE has neither an unknown token nor byte fallback.
+        // This BPE subset uses no unknown token or byte fallback.
         for (const unsigned char byte : input) {
             const auto token = byte_tokens[byte];
             if (token != missing) {
@@ -368,6 +388,8 @@ struct Tokenizer::Impl {
     std::vector<std::string> raw;
     std::vector<bool> special;
     std::array<Token, 256> byte_tokens;
+    std::array<bool, 256> added_starts{};
+    Pretokenizer pre = Pretokenizer::unsupported;
     std::unordered_map<std::uint64_t, Merge> merges;
     std::vector<Added> added;
 };
@@ -396,44 +418,68 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
     const detail::Gguf container(model);
     try {
         const auto& metadata = container.tokenizer();
+        if (metadata.value("tokenizer.ggml.model", std::string{}) != "gpt2")
+            throw Error(ErrorCode::unsupported, "expected a GGUF byte-level BPE tokenizer");
         const auto& tokens = metadata.at("tokenizer.ggml.tokens");
         const auto& merges = metadata.at("tokenizer.ggml.merges");
-        if (!tokens.is_array() || tokens.size() != 49152 || !merges.is_array() || merges.size() != 48900 ||
-            metadata.at("tokenizer.ggml.bos_token_id") != 0 ||
-            metadata.at("tokenizer.ggml.eos_token_id") != 0)
-            throw Error(ErrorCode::unsupported,
-                        "GGUF is missing the canonical SmolLM2 vocabulary or boundary IDs");
+        if (!tokens.is_array() || tokens.empty() || tokens.size() > vocab_limit || !merges.is_array() ||
+            merges.size() > tokens.size())
+            throw Error(ErrorCode::malformed, "invalid GGUF BPE vocabulary or merge list");
+        const auto types = metadata.find("tokenizer.ggml.token_type");
+        if (types != metadata.end() && (!types->is_array() || types->size() != tokens.size()))
+            throw Error(ErrorCode::malformed, "GGUF token types must match vocabulary length");
 
-        if (!sidecar.empty()) {
-            auto bytes = detail::read_file(sidecar, 8 * detail::mib);
-            if (detail::sha256(bytes) != "9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c")
-                throw Error(ErrorCode::unsupported,
-                            sidecar.string() + ": expected the pinned SmolLM2 tokenizer.json");
-            auto json = detail::parse_json(bytes, sidecar);
-            const auto& bpe = json.at("model");
-            const auto& vocab = bpe.at("vocab");
-            for (std::size_t id = 0; id < tokens.size(); ++id) {
-                const auto& text = tokens[id].get_ref<const std::string&>();
-                if (!vocab.contains(text) || vocab.at(text) != id)
-                    throw Error(ErrorCode::malformed, "GGUF vocabulary differs from the tokenizer sidecar");
-            }
-            if (bpe.at("merges") != merges)
-                throw Error(ErrorCode::malformed, "GGUF merges differ from the tokenizer sidecar");
-            return Tokenizer(std::make_shared<Impl>(json));
-        }
+        const auto name = metadata.value("tokenizer.ggml.pre", std::string{});
+        auto pre = Pretokenizer::unsupported;
+        if (name == "smollm")
+            pre = Pretokenizer::digits_byte_level;
+        else if (name == "gpt-2")
+            pre = Pretokenizer::byte_level;
+        if (metadata.value("tokenizer.ggml.add_space_prefix", false))
+            throw Error(ErrorCode::unsupported, "GGUF tokenizer prefix spaces are unsupported");
 
-        const auto fingerprint = container.tokenizer_fingerprint();
-        if (fingerprint != "46646ba36ecae43de6f9f649d217774b889e0fd405af92205319b882927493fc" &&
-            fingerprint != "8183bac60a960542a17ba286ecdd3063046e57c91c3bbf4b1b4b3e797d193a41")
-            throw Error(ErrorCode::unsupported,
-                        "unknown GGUF tokenizer fingerprint; supply a pinned tokenizer sidecar");
-        auto json = expected_pipeline();
-        Json vocabulary = Json::object(), added = Json::array();
+        Json vocabulary = Json::object();
+        std::vector<bool> special(tokens.size());
         for (std::size_t id = 0; id < tokens.size(); ++id) {
             const auto& text = tokens[id].get_ref<const std::string&>();
+            if (vocabulary.contains(text))
+                throw Error(ErrorCode::malformed, "duplicate GGUF vocabulary token");
             vocabulary[text] = id;
-            if (id < 17) {
-                added.push_back({{"content", text},
+            if (types != metadata.end()) {
+                const auto type =
+                    static_cast<GgufTokenType>(detail::natural((*types)[id], "GGUF token type"));
+                if (type != GgufTokenType::normal && type != GgufTokenType::control)
+                    throw Error(ErrorCode::unsupported, "expected normal or control GGUF BPE tokens");
+                special[id] = type == GgufTokenType::control;
+            }
+        }
+
+        if (!sidecar.empty()) {
+            const auto json = detail::read_json(sidecar, 8 * detail::mib);
+            const auto& bpe = json.at("model");
+            if (bpe.at("vocab") != vocabulary)
+                throw Error(ErrorCode::malformed, "GGUF vocabulary differs from the tokenizer sidecar");
+            const auto& sidecar_merges = bpe.at("merges");
+            const auto same_pair = [](const Json& a, const Json& b) {
+                return merge_pair(a) == merge_pair(b);
+            };
+            if (!sidecar_merges.is_array() || !std::ranges::equal(merges, sidecar_merges, same_pair))
+                throw Error(ErrorCode::malformed, "GGUF merges differ from the tokenizer sidecar");
+            auto impl = std::make_shared<Impl>(json);
+            if (types != metadata.end() && impl->special != special)
+                throw Error(ErrorCode::malformed, "GGUF token types differ from the tokenizer sidecar");
+            if (pre != Pretokenizer::unsupported && impl->pre != pre)
+                throw Error(ErrorCode::malformed, "GGUF pretokenizer differs from the tokenizer sidecar");
+            return Tokenizer(std::move(impl));
+        }
+
+        if (pre == Pretokenizer::unsupported || types == metadata.end())
+            throw Error(ErrorCode::unsupported,
+                        "unsupported or incomplete GGUF pretokenizer; supply a matching tokenizer.json");
+        auto added = Json::array();
+        for (std::size_t id = 0; id < tokens.size(); ++id) {
+            if (special[id]) {
+                added.push_back({{"content", tokens[id]},
                                  {"id", id},
                                  {"special", true},
                                  {"normalized", false},
@@ -442,6 +488,13 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
                                  {"rstrip", false}});
             }
         }
+        Json json = {{"version", "1.0"},
+                     {"normalizer", nullptr},
+                     {"post_processor", nullptr},
+                     {"truncation", nullptr},
+                     {"padding", nullptr},
+                     {"pre_tokenizer", pretokenizer_config(pre)},
+                     {"decoder", byte_level_config(true)}};
         json["model"] = {{"type", "BPE"},
                          {"vocab", std::move(vocabulary)},
                          {"merges", merges},
@@ -471,7 +524,7 @@ std::vector<Token> Tokenizer::encode(std::string_view text) const {
     for (std::size_t i = 0; i < count;) {
         const auto rest = text.substr(cp[i].byte);
         const auto match =
-            cp[i].cp == U'<'
+            impl_->added_starts[static_cast<unsigned char>(rest.front())]
                 ? std::ranges::find_if(impl_->added,
                                        [&](const auto& token) { return rest.starts_with(token.text); })
                 : impl_->added.end();
@@ -479,21 +532,22 @@ std::vector<Token> Tokenizer::encode(std::string_view text) const {
             ++i;
             continue;
         }
-        split(text, cp, begin, i, emit);
+        split(text, cp, begin, i, impl_->pre, emit);
         result.push_back(match->id);
         const auto finish = cp[i].byte + match->text.size();
         while (cp[i].byte < finish)
             ++i;
         begin = i;
     }
-    split(text, cp, begin, count, emit);
+    split(text, cp, begin, count, impl_->pre, emit);
     return result;
 }
 
 std::vector<std::string> Tokenizer::pretokenize(std::string_view text) const {
     const auto cp = units(text);
     std::vector<std::string> result;
-    split(text, cp, 0, cp.size() - 1, [&](std::string_view part) { result.push_back(as_alphabet(part)); });
+    split(text, cp, 0, cp.size() - 1, impl_->pre,
+          [&](std::string_view part) { result.push_back(as_alphabet(part)); });
     return result;
 }
 

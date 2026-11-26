@@ -26,6 +26,4 @@ class SafeTensors {
     ModelMemory memory_{};
 };
 
-ModelConfig read_config(const std::filesystem::path& path);
-
 } // namespace nathr::detail

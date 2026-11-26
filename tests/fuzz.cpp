@@ -2,6 +2,7 @@
 
 #if defined(NATHR_FUZZ_gguf)
 #include "formats/gguf.hpp"
+#include "models/llama/config.hpp"
 #elif defined(NATHR_FUZZ_safetensors)
 #include "formats/safetensors.hpp"
 #elif defined(NATHR_FUZZ_quant)
@@ -107,7 +108,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         nathr::detail::SafeTensors parsed(path);
 #elif defined(NATHR_FUZZ_gguf)
         nathr::detail::Gguf parsed(path);
-        (void)parsed.config();
+        (void)load_llama_config(parsed);
         (void)parsed.tokenizer_fingerprint();
 #elif defined(NATHR_FUZZ_tokenizer)
         const auto parsed = Tokenizer::load(path);

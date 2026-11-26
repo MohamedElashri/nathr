@@ -1,7 +1,6 @@
 #include "formats/safetensors.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <fstream>
 
 namespace nathr::detail {
@@ -148,59 +147,6 @@ TensorView SafeTensors::take(std::string_view name, std::initializer_list<std::s
     }
     tensors_.erase(item);
     return tensor;
-}
-
-ModelConfig read_config(const std::filesystem::path& path) {
-    const auto json = read_json(path, mib);
-    try {
-        const auto field = [&](std::string_view name) {
-            return natural(json.at(name), path.string() + ": " + std::string(name));
-        };
-        if (json.at("model_type") != "llama" || json.at("hidden_act") != "silu" ||
-            (json.contains("architectures") &&
-             json.at("architectures") != Json::array({"LlamaForCausalLM"})) ||
-            json.value("attention_bias", false) || json.value("mlp_bias", false) ||
-            json.value("rope_interleaved", false) ||
-            (json.contains("rope_scaling") && !json.at("rope_scaling").is_null()) ||
-            (json.contains("pretraining_tp") && field("pretraining_tp") != 1)) {
-            throw Error(ErrorCode::unsupported, path.string() + ": unsupported Llama configuration");
-        }
-        auto config = ModelConfig{};
-        config.layers = field("num_hidden_layers");
-        config.hidden = field("hidden_size");
-        config.intermediate = field("intermediate_size");
-        config.query_heads = field("num_attention_heads");
-        config.kv_heads = field("num_key_value_heads");
-        config.vocabulary = field("vocab_size");
-        config.context = field("max_position_embeddings");
-        if (!config.layers || config.layers > 56 || !config.hidden || !config.intermediate ||
-            !config.query_heads || !config.kv_heads || config.query_heads % config.kv_heads ||
-            config.hidden % config.query_heads || !config.context || config.context > 8192 ||
-            !config.vocabulary || config.vocabulary > 65536) {
-            throw Error(ErrorCode::unsupported, path.string() + ": unsupported dimensions or head geometry");
-        }
-        config.head_dim = config.hidden / config.query_heads;
-        if (config.head_dim % 2 || (json.contains("head_dim") && field("head_dim") != config.head_dim)) {
-            throw Error(ErrorCode::unsupported, path.string() + ": unsupported rotary head width");
-        }
-        const auto bos = field("bos_token_id");
-        const auto eos = field("eos_token_id");
-        if (bos >= config.vocabulary || eos >= config.vocabulary) {
-            throw Error(ErrorCode::malformed, path.string() + ": special token ID exceeds vocabulary");
-        }
-        config.bos = static_cast<Token>(bos);
-        config.eos = static_cast<Token>(eos);
-        config.rope_theta = json.at("rope_theta").get<float>();
-        config.rms_epsilon = json.at("rms_norm_eps").get<float>();
-        config.tied_embeddings = json.at("tie_word_embeddings").get<bool>();
-        if (!(config.rope_theta > 0) || !(config.rms_epsilon > 0) || !std::isfinite(config.rope_theta) ||
-            !std::isfinite(config.rms_epsilon)) {
-            throw Error(ErrorCode::malformed, path.string() + ": invalid RMSNorm epsilon or RoPE theta");
-        }
-        return config;
-    } catch (const Json::exception& error) {
-        throw Error(ErrorCode::malformed, path.string() + ": " + error.what());
-    }
 }
 
 } // namespace nathr::detail

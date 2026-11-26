@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <bit>
 #include <cerrno>
-#include <cmath>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -69,6 +68,7 @@ class Reader {
     }
 
     [[nodiscard]] std::size_t position() const noexcept { return position_; }
+    void seek(std::size_t position) noexcept { position_ = position; }
 
   private:
     Json scalar(std::uint32_t type, bool keep) {
@@ -166,6 +166,12 @@ Gguf::Gguf(const std::filesystem::path& path) : path_(path), file_(path) {
     const auto keys = reader.uint(8);
     if (tensors > 512 || keys > 2048)
         reader.fail("GGUF tensor or metadata count exceeds limit", ErrorCode::resource_limit);
+    struct MetadataEntry {
+        std::string key;
+        std::size_t offset;
+        std::uint32_t type;
+    };
+    std::vector<MetadataEntry> deferred;
     std::unordered_set<std::string> seen;
     for (std::uint64_t i = 0; i < keys; ++i) {
         auto key = reader.text();
@@ -180,13 +186,27 @@ Gguf::Gguf(const std::filesystem::path& path) : path_(path), file_(path) {
                 reader.fail("invalid GGUF alignment");
         } else if (key.starts_with("tokenizer.")) {
             tokenizer_[std::move(key)] = reader.value(type, true);
-        } else if (key == "general.architecture" || key.starts_with("llama.")) {
+        } else if (key == "general.architecture") {
             architecture_[std::move(key)] = reader.value(type, true);
         } else if (key.starts_with("split.")) {
             split_[std::move(key)] = reader.value(type, true);
         } else {
+            deferred.push_back({std::move(key), reader.position(), type});
             (void)reader.value(type, false);
         }
+    }
+    const auto metadata_end = reader.position();
+    const auto arch = architecture_.find("general.architecture");
+    if (arch != architecture_.end() && arch->is_string() && !arch->get_ref<const std::string&>().empty()) {
+        // Metadata keys can appear before general.architecture in the file.
+        const auto prefix = arch->get_ref<const std::string&>() + ".";
+        for (auto& entry : deferred) {
+            if (entry.key.starts_with(prefix)) {
+                reader.seek(entry.offset);
+                architecture_[std::move(entry.key)] = reader.value(entry.type, true);
+            }
+        }
+        reader.seek(metadata_end);
     }
 
     std::vector<Record*> by_offset;
@@ -284,69 +304,6 @@ void Gguf::discard_metadata() {
     tokenizer_ = {};
     split_ = {};
     tensors_.clear();
-}
-
-ModelConfig Gguf::config() const {
-    if (!split_.empty())
-        throw Error(ErrorCode::unsupported, path_.string() + ": split GGUF execution is unsupported");
-    if (!architecture_.contains("general.architecture") || architecture_["general.architecture"] != "llama")
-        throw Error(ErrorCode::unsupported, path_.string() + ": expected a GGUF Llama architecture");
-    try {
-        const auto size = [&](std::string_view key) {
-            return natural(architecture_.at(key), path_.string() + ": " + std::string(key));
-        };
-        constexpr std::string_view supported[] = {"general.architecture",
-                                                  "llama.block_count",
-                                                  "llama.context_length",
-                                                  "llama.embedding_length",
-                                                  "llama.feed_forward_length",
-                                                  "llama.attention.head_count",
-                                                  "llama.attention.head_count_kv",
-                                                  "llama.attention.key_length",
-                                                  "llama.attention.value_length",
-                                                  "llama.rope.freq_base",
-                                                  "llama.attention.layer_norm_rms_epsilon",
-                                                  "llama.vocab_size",
-                                                  "llama.rope.dimension_count"};
-        for (const auto& [key, ignored] : architecture_.items()) {
-            if (std::ranges::find(supported, key) == std::end(supported))
-                throw Error(ErrorCode::unsupported,
-                            path_.string() + ": unsupported architecture metadata " + key);
-        }
-        ModelConfig c{};
-        c.layers = size("llama.block_count");
-        c.hidden = size("llama.embedding_length");
-        c.intermediate = size("llama.feed_forward_length");
-        c.query_heads = size("llama.attention.head_count");
-        c.kv_heads = size("llama.attention.head_count_kv");
-        c.head_dim = size("llama.rope.dimension_count");
-        c.vocabulary = size("llama.vocab_size");
-        c.context = size("llama.context_length");
-        c.rope_theta = architecture_.at("llama.rope.freq_base").get<float>();
-        c.rms_epsilon = architecture_.at("llama.attention.layer_norm_rms_epsilon").get<float>();
-        c.tied_embeddings = !tensors_.contains("output.weight");
-        if (!c.layers || c.layers > 56 || !c.hidden || !c.intermediate || !c.query_heads || !c.kv_heads ||
-            c.query_heads % c.kv_heads || c.hidden % c.query_heads ||
-            c.head_dim != c.hidden / c.query_heads || c.head_dim % 2 || !c.context || c.context > 8192 ||
-            !c.vocabulary || c.vocabulary > 65536 ||
-            (architecture_.contains("llama.attention.key_length") &&
-             size("llama.attention.key_length") != c.head_dim) ||
-            (architecture_.contains("llama.attention.value_length") &&
-             size("llama.attention.value_length") != c.head_dim) ||
-            !(c.rope_theta > 0) || !std::isfinite(c.rope_theta) || !(c.rms_epsilon > 0) ||
-            !std::isfinite(c.rms_epsilon))
-            throw Error(ErrorCode::unsupported,
-                        path_.string() + ": unsupported GGUF dimensions, RoPE or RMSNorm");
-        const auto bos = natural(tokenizer_.at("tokenizer.ggml.bos_token_id"), "GGUF BOS");
-        const auto eos = natural(tokenizer_.at("tokenizer.ggml.eos_token_id"), "GGUF EOS");
-        if (bos >= c.vocabulary || eos >= c.vocabulary)
-            throw Error(ErrorCode::malformed, path_.string() + ": special token ID exceeds vocabulary");
-        c.bos = static_cast<Token>(bos);
-        c.eos = static_cast<Token>(eos);
-        return c;
-    } catch (const Json::exception& error) {
-        throw Error(ErrorCode::malformed, path_.string() + ": " + error.what());
-    }
 }
 
 } // namespace nathr::detail

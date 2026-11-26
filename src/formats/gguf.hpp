@@ -36,10 +36,10 @@ class Gguf {
     [[nodiscard]] std::string tokenizer_fingerprint() const;
     [[nodiscard]] const Json& architecture() const noexcept { return architecture_; }
     [[nodiscard]] const Json& split() const noexcept { return split_; }
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
     [[nodiscard]] std::size_t alignment() const noexcept { return alignment_; }
     [[nodiscard]] std::size_t data_offset() const noexcept { return data_offset_; }
     [[nodiscard]] ModelMemory memory() const noexcept { return memory_; }
-    [[nodiscard]] ModelConfig config() const;
     void discard_metadata();
 
   private:

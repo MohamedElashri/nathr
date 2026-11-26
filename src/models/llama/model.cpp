@@ -1,4 +1,5 @@
 #include "models/llama/model.hpp"
+#include "models/llama/config.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -82,10 +83,10 @@ Model::Impl::WeightFile Model::Impl::open(const std::filesystem::path& path, boo
 }
 
 Model::Impl::Impl(const std::filesystem::path& path, bool hf_directory, BackendOptions options)
-    : config(hf_directory ? read_config(path / "config.json") : ModelConfig{}),
+    : config(hf_directory ? load_llama_config(path / "config.json") : ModelConfig{}),
       tensors(open(path, hf_directory)), thread_count(options.threads), pool(thread_count) {
     if (!hf_directory)
-        config = std::get<Gguf>(tensors).config();
+        config = load_llama_config(std::get<Gguf>(tensors));
     std::visit([&](auto& file) { bind(file, path); }, tensors);
     const auto features = cpu_features();
     const bool use_avx2 = options.policy != ExecutionPolicy::scalar && features.avx2;

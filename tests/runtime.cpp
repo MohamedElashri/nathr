@@ -7,6 +7,7 @@
 #include "core/sha256.hpp"
 #include "formats/gguf.hpp"
 #include "formats/safetensors.hpp"
+#include "models/llama/config.hpp"
 
 #include <algorithm>
 #include <array>
@@ -413,13 +414,28 @@ void model_and_sessions() {
     auto survivor = detached();
     survivor.prefill(ids);
     compare(survivor.logits(), std::span(expected).last(23));
+
+    Temporary temp;
+    const auto config_path = temp.directory / "config.json";
+    auto config = read_json(fixture / "f32/config.json", mib);
+    config["max_position_embeddings"] = 16384;
+    config["bos_token_id"] = 7;
+    config["eos_token_id"] = 13;
+    std::ofstream(config_path) << config;
+    std::filesystem::copy_file(fixture / "f32/model.safetensors", temp.directory / "model.safetensors");
+    const auto variant = Model::load(temp.directory);
+    expect(variant.config().context == 16384 && variant.config().bos == 7 && variant.config().eos == 13,
+           "checkpoint sets context and boundary tokens");
+    auto short_session = Session::create(variant, ids.size());
+    short_session.prefill(ids);
+    compare(short_session.logits(), std::span(expected).last(23));
 }
 
 void tokenizer_and_sampling() {
     const auto tokenizer = Tokenizer::load(fixture / "tokenizer.json");
     expect(tokenizer.encode("abc<x>>ab") == std::vector<Token>({256, 258, 4}),
            "BPE merges and longest special");
-    expect(tokenizer.encode("\x04").empty(), "missing byte is skipped by the pinned pipeline");
+    expect(tokenizer.encode("\x04").empty(), "missing byte is skipped when byte fallback is disabled");
     expect(tokenizer.decode(std::array<Token, 3>{256, 258, 4}, true) == "abcab", "skip special decode");
     expect(tokenizer.pretokenize("  a 1٢") == std::vector<std::string>({"Ġ", "Ġa", "Ġ", "1", "Ù¢"}),
            "ordered regex stages");
@@ -470,10 +486,112 @@ void tokenizer_and_sampling() {
            "continuation appends once");
 }
 
+void gguf_tokenizer_metadata() {
+    Temporary temp;
+    const auto model = temp.directory / "tokenizer.gguf";
+    constexpr std::array<std::string_view, 7> tokens{"1", "🙂", "2", "12", "x", "y", "xy"};
+    constexpr std::array control_types{1, 3, 1, 1, 1, 1, 1};
+    const auto write_model = [&](std::string_view pre, std::span<const int> types) {
+        std::vector<char> bytes;
+        const auto number = [&](std::uint64_t value, unsigned width) {
+            for (unsigned i = 0; i < width; ++i)
+                bytes.push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+        };
+        const auto string = [&](std::string_view value) {
+            number(value.size(), 8);
+            bytes.insert(bytes.end(), value.begin(), value.end());
+        };
+        const auto entry = [&](std::string_view key, unsigned type) {
+            string(key);
+            number(type, 4);
+        };
+        number(0x46554747, 4);
+        number(3, 4);
+        number(0, 8);
+        number(types.empty() ? 6 : 7, 8);
+        entry("example.block_count", 4);
+        number(2, 4);
+        entry("general.architecture", 8);
+        string("example");
+        entry("tokenizer.ggml.model", 8);
+        string("gpt2");
+        entry("tokenizer.ggml.pre", 8);
+        string(pre);
+        entry("tokenizer.ggml.tokens", 9);
+        number(8, 4);
+        number(tokens.size(), 8);
+        for (auto token : tokens)
+            string(token);
+        entry("tokenizer.ggml.merges", 9);
+        number(8, 4);
+        number(2, 8);
+        string("1 2");
+        string("x y");
+        if (!types.empty()) {
+            entry("tokenizer.ggml.token_type", 9);
+            number(5, 4);
+            number(types.size(), 8);
+            for (int type : types)
+                number(type, 4);
+        }
+        bytes.resize((bytes.size() + 31) / 32 * 32);
+        std::ofstream file(model, std::ios::binary);
+        file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    };
+
+    const auto sidecar = temp.directory / "tokenizer.json";
+    auto json = read_json(fixture / "tokenizer.json", mib);
+    const auto sequence = json.at("pre_tokenizer");
+    json["pre_tokenizer"] = sequence.at("pretokenizers").at(1);
+    auto& bpe = json.at("model");
+    bpe["vocab"] = Json::object();
+    for (std::size_t id = 0; id < tokens.size(); ++id)
+        bpe["vocab"][tokens[id]] = id;
+    bpe["merges"] = Json::array({{"1", "2"}, {"x", "y"}});
+    json["added_tokens"] = Json::array({{{"id", 1},
+                                         {"content", "🙂"},
+                                         {"special", true},
+                                         {"normalized", false},
+                                         {"single_word", false},
+                                         {"lstrip", false},
+                                         {"rstrip", false}}});
+    const auto write_sidecar = [&] { std::ofstream(sidecar) << json; };
+    write_sidecar();
+
+    write_model("gpt-2", control_types);
+    expect(Gguf(model).architecture().at("example.block_count") == 2,
+           "GGUF retains metadata for the declared architecture regardless of key order");
+    rejects([&] { (void)Model::load(model); }, ErrorCode::unsupported);
+    const auto embedded = Tokenizer::load_model(model);
+    const std::vector<Token> expected{3, 1, 6};
+    expect(embedded.vocabulary() == tokens.size() && embedded.encode("12🙂xy") == expected &&
+               embedded.decode(expected) == "12🙂xy" && embedded.decode(expected, true) == "12xy",
+           "GGUF uses the declared pretokenizer, vocabulary, and control token type");
+    expect(Tokenizer::load_model(model, sidecar).encode("12🙂xy") == expected,
+           "GGUF matches sidecars using pair arrays or strings");
+    std::swap(bpe["merges"][0], bpe["merges"][1]);
+    write_sidecar();
+    rejects([&] { (void)Tokenizer::load_model(model, sidecar); }, ErrorCode::malformed);
+    std::swap(bpe["merges"][0], bpe["merges"][1]);
+    write_sidecar();
+
+    write_model("smollm", control_types);
+    expect(Tokenizer::load_model(model).encode("12🙂xy") == std::vector<Token>{0, 2, 1, 6},
+           "digit isolation comes from tokenizer metadata");
+    rejects([&] { (void)Tokenizer::load_model(model, sidecar); }, ErrorCode::malformed);
+    write_model("gpt-2", std::span(control_types).first(2));
+    rejects([&] { (void)Tokenizer::load_model(model); }, ErrorCode::malformed);
+    write_model("unrecognized", {});
+    rejects([&] { (void)Tokenizer::load_model(model); }, ErrorCode::unsupported);
+    expect(Tokenizer::load_model(model, sidecar).encode("12🙂xy") == expected,
+           "matching sidecar supplies missing tokenizer behavior");
+}
+
 void gguf_layout() {
     const auto golden = fixtures / "tiny.gguf";
     const Gguf metadata(golden);
-    expect(metadata.alignment() == 32 && metadata.records().size() == 20 && metadata.config().tied_embeddings,
+    expect(metadata.alignment() == 32 && metadata.records().size() == 20 &&
+               load_llama_config(metadata).tied_embeddings,
            "GGUF inventory");
     expect(metadata.memory().mapped_file_bytes == std::filesystem::file_size(golden),
            "GGUF mapping accounting");
@@ -732,6 +850,7 @@ int main(int argc, char** argv) try {
         model_and_sessions();
         threaded_cache_and_chunks();
         tokenizer_and_sampling();
+        gguf_tokenizer_metadata();
         gguf_layout();
         packed_kernels();
         packed_encodings();
