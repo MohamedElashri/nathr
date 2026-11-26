@@ -1,0 +1,313 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-25",
+  "host": {
+    "cpu": "AMD Ryzen 7 7735HS",
+    "physical_cores": 8,
+    "logical_cpus": 16,
+    "l3_mib": 16,
+    "ram_gib": 59,
+    "os": "Zorin OS 18.1",
+    "kernel": "7.0.0-43-generic",
+    "cpu_affinity": [
+      0
+    ],
+    "observed_scaling_governor": "powersave",
+    "git_revision": null
+  },
+  "artifact": {
+    "model": "HuggingFaceTB/SmolLM2-135M",
+    "revision": "93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+    "sha256": "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1",
+    "storage_dtype": "BF16"
+  },
+  "workload": {
+    "token_id": "17 + (i * 7919 + 12345) % (49152 - 17)",
+    "prompt_length": 128,
+    "decode_length": 32,
+    "context": 512,
+    "output": "last position per operation",
+    "kv_dtype": "F32",
+    "sampling": false,
+    "threads": 1,
+    "warmups_per_batch": 2,
+    "samples_per_batch": 7
+  },
+  "build": {
+    "compiler": "13.3.0",
+    "flags": [
+      "-O3",
+      "-DNDEBUG",
+      "-std=c++20",
+      "-march=x86-64",
+      "-ffp-contract=off"
+    ],
+    "verified_release_size_bytes": 587976,
+    "verified_stripped_size_bytes": 493896,
+    "runtime_libraries": [
+      "libstdc++.so.6",
+      "libm.so.6",
+      "libgcc_s.so.1",
+      "libc.so.6"
+    ]
+  },
+  "batches": [
+    {
+      "backend": "scalar",
+      "compiler": "13.3.0",
+      "context": 512,
+      "cpu_policy": "x86-64 scalar FP32",
+      "decode_length": 32,
+      "decode_ms": {
+        "coefficient_of_variation": 0.42129381812552286,
+        "median": 15023.088213,
+        "median_absolute_deviation": 841.1794529999988,
+        "p95": 18318.983274799997
+      },
+      "decode_samples_ms": [
+        4984.095729,
+        5656.554147,
+        15023.088213,
+        14218.313251,
+        15131.206089,
+        15864.267666,
+        19371.00425
+      ],
+      "decode_tokens_s": 2.1300547228571345,
+      "encoded_weight_bytes": 269030016,
+      "history_bytes": 2048,
+      "kv_cache_bytes": 23592960,
+      "mapped_weight_bytes": 0,
+      "model_load_ms": 334.638306,
+      "owned_file_bytes": 269060552,
+      "peak_rss_kib": 290572,
+      "prefill_ms": {
+        "coefficient_of_variation": 0.4631175018992553,
+        "median": 45522.910605,
+        "median_absolute_deviation": 4145.023966000001,
+        "p95": 49593.623290899995
+      },
+      "prefill_samples_ms": [
+        13627.298913,
+        14530.769745,
+        27235.185579,
+        45522.910605,
+        45839.445068,
+        49667.934571,
+        49420.230304
+      ],
+      "prefill_tokens_s": 2.8117710027517693,
+      "prompt_length": 128,
+      "threads": 1,
+      "warmups": 2,
+      "workspace_bytes": 224000
+    },
+    {
+      "backend": "scalar",
+      "compiler": "13.3.0",
+      "context": 512,
+      "cpu_policy": "x86-64 scalar FP32",
+      "decode_length": 32,
+      "decode_ms": {
+        "coefficient_of_variation": 0.28423269592780903,
+        "median": 14203.00596,
+        "median_absolute_deviation": 3276.9194679999982,
+        "p95": 17063.3319886
+      },
+      "decode_samples_ms": [
+        16091.28063,
+        17479.925428,
+        10456.740242,
+        7222.773448,
+        14742.593719,
+        14203.00596,
+        10327.472489
+      ],
+      "decode_tokens_s": 2.2530441858661305,
+      "encoded_weight_bytes": 269030016,
+      "history_bytes": 2048,
+      "kv_cache_bytes": 23592960,
+      "mapped_weight_bytes": 0,
+      "model_load_ms": 1364.104442,
+      "owned_file_bytes": 269060552,
+      "peak_rss_kib": 290516,
+      "prefill_ms": {
+        "coefficient_of_variation": 0.32486708517160007,
+        "median": 38668.550655,
+        "median_absolute_deviation": 12325.153024,
+        "p95": 54223.5471901
+      },
+      "prefill_samples_ms": [
+        50993.703679,
+        51924.724389,
+        55208.756962,
+        27352.648035,
+        38668.550655,
+        28992.012951,
+        25055.154115
+      ],
+      "prefill_tokens_s": 3.3101835427454556,
+      "prompt_length": 128,
+      "threads": 1,
+      "warmups": 2,
+      "workspace_bytes": 224000
+    }
+  ],
+  "allocation_probe": {
+    "cpp_allocations": 0,
+    "prefill_tokens": 128,
+    "append_tokens": 4
+  },
+  "repeatability": {
+    "maximum_cv_and_median_drift": 0.05,
+    "coefficients_of_variation": {
+      "prefill": [
+        0.4631175018992553,
+        0.32486708517160007
+      ],
+      "decode": [
+        0.42129381812552286,
+        0.28423269592780903
+      ]
+    },
+    "median_drift_vs_first": {
+      "prefill": 0.15056945742057082,
+      "decode": 0.05458812737918658
+    },
+    "passed": false
+  },
+  "next_optimization_gates": {
+    "phase_2_decode_relative_improvement": 0.1,
+    "phase_2_maximum_prefill_relative_regression": 0.05,
+    "phase_4_minimum_prefill_relative_improvement": 0.1,
+    "requires_stable_matched_workload_and_encoding": true
+  },
+  "limitations": [
+    "CPU affinity was fixed but the host was shared and thermal conditions were uncontrolled.",
+    "Both scenarios use warm filesystem loading, reported separately from inference.",
+    "The buffer loader was revised between invocations to validate the header before reading the payload. Scalar compute and the workload were unchanged.",
+    "The allocation audit counts C++ scalar/array and aligned operator new calls. It does not count OS page faults or resident bytes."
+  ],
+  "short_workload_repeat": {
+    "prompt_length": 32,
+    "decode_length": 32,
+    "context": 512,
+    "batches": [
+      {
+        "backend": "scalar",
+        "compiler": "13.3.0",
+        "context": 512,
+        "cpu_policy": "x86-64 scalar FP32",
+        "decode_length": 32,
+        "decode_ms": {
+          "coefficient_of_variation": 0.4995577584755011,
+          "median": 17466.187727,
+          "median_absolute_deviation": 6707.304726,
+          "p95": 27063.404854099997
+        },
+        "decode_samples_ms": [
+          7552.270885,
+          7546.486555,
+          10758.883001,
+          17466.187727,
+          28335.046064,
+          24096.242031,
+          17550.019519
+        ],
+        "decode_tokens_s": 1.8321113055788925,
+        "encoded_weight_bytes": 269030016,
+        "history_bytes": 2048,
+        "kv_cache_bytes": 23592960,
+        "mapped_weight_bytes": 0,
+        "model_load_ms": 707.456123,
+        "owned_file_bytes": 269060552,
+        "peak_rss_kib": 290516,
+        "prefill_ms": {
+          "coefficient_of_variation": 0.5163884397755655,
+          "median": 12205.289936,
+          "median_absolute_deviation": 5965.4016409999995,
+          "p95": 20480.8502872
+        },
+        "prefill_samples_ms": [
+          6239.888295,
+          6084.065984,
+          6226.366262,
+          12205.289936,
+          14543.692696,
+          18050.667451,
+          21522.357217
+        ],
+        "prefill_tokens_s": 2.6218139976842907,
+        "prompt_length": 32,
+        "threads": 1,
+        "warmups": 2,
+        "workspace_bytes": 224000
+      }
+    ],
+    "passed": false,
+    "note": "Both metrics failed the within-batch gate. The optional second short batch was stopped because it could not change that outcome."
+  },
+  "phase2_alternate_core_retest": {
+    "affinity": [
+      14
+    ],
+    "observed_governor": "powersave",
+    "workload": "32/32/512",
+    "batch": {
+      "backend": "scalar",
+      "compiler": "13.3.0",
+      "context": 512,
+      "cpu_policy": "x86-64 scalar FP32",
+      "decode_length": 32,
+      "decode_ms": {
+        "coefficient_of_variation": 0.4402139425315902,
+        "median": 12300.477124,
+        "median_absolute_deviation": 1941.1319000000003,
+        "p95": 25812.078881599995
+      },
+      "decode_samples_ms": [
+        28586.845592,
+        19337.623224,
+        12300.477124,
+        14241.609024,
+        11512.258846,
+        11661.671372,
+        9020.066062
+      ],
+      "decode_tokens_s": 2.601525101620928,
+      "encoded_weight_bytes": 269030016,
+      "history_bytes": 2048,
+      "kv_cache_bytes": 23592960,
+      "mapped_weight_bytes": 0,
+      "model_load_ms": 1619.958984,
+      "owned_file_bytes": 269060552,
+      "peak_rss_kib": 290532,
+      "prefill_ms": {
+        "coefficient_of_variation": 0.45440740676657426,
+        "median": 9752.968912,
+        "median_absolute_deviation": 1845.0330990000002,
+        "p95": 21812.395476499994
+      },
+      "prefill_samples_ms": [
+        24298.822727,
+        16010.731892,
+        13145.665183,
+        9320.866495,
+        9752.968912,
+        9013.451405,
+        7907.935813
+      ],
+      "prefill_tokens_s": 3.2810521892084954,
+      "prompt_length": 32,
+      "threads": 1,
+      "warmups": 2,
+      "workspace_bytes": 224000
+    },
+    "process_cpu_time": {
+      "wall_s": 264.68,
+      "user_s": 263.03,
+      "system_s": 1.63
+    },
+    "passed": false
+  }
+}

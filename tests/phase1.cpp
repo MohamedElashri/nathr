@@ -1,0 +1,808 @@
+#include <nathr/generation.hpp>
+#include <nathr/tokenizer.hpp>
+
+#include "allocation_counter.hpp"
+#include "backend/cpu/scalar.hpp"
+#include "backend/cpu/thread_pool.hpp"
+#include "core/sha256.hpp"
+#include "formats/gguf.hpp"
+#include "formats/safetensors.hpp"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iostream>
+#include <limits>
+#include <new>
+#include <sys/types.h>
+#include <thread>
+#include <unistd.h>
+
+namespace {
+using namespace nathr;
+using namespace nathr::detail;
+const std::filesystem::path fixture = std::filesystem::path(NATHR_FIXTURES) / "phase1";
+constexpr std::array<Token, 8> ids{1, 7, 2, 18, 0, 3, 21, 13};
+
+void expect(bool truth, std::string_view description) {
+    if (!truth)
+        throw std::runtime_error(std::string(description));
+}
+
+void rejects(const auto& operation, ErrorCode code) {
+    try {
+        operation();
+    } catch (const Error& error) {
+        if (error.code() != code)
+            throw;
+        return;
+    }
+    throw std::runtime_error("expected a typed error");
+}
+
+void close(float actual, double expected, double epsilon, std::string_view description) {
+    if (!std::isfinite(actual) || std::abs(actual - expected) > epsilon) {
+        throw std::runtime_error(std::string(description) + ": actual " + std::to_string(actual) +
+                                 ", expected " + std::to_string(expected));
+    }
+}
+
+template <std::size_t Size> TensorView floats(const std::array<float, Size>& values) {
+    return {{DType::f32, {}, 1, values.size()}, std::as_bytes(std::span(values))};
+}
+
+void kernels() {
+    close(half_to_float(0x3c00), 1.0, 0, "F16 one");
+    close(half_to_float(1), std::ldexp(1.0, -24), 0, "F16 subnormal");
+    close(half_to_float(0x7bff), 65504, 0, "F16 maximum finite");
+    expect(std::signbit(half_to_float(0x8000)), "F16 negative zero");
+    expect(std::isinf(half_to_float(0x7c00)) && std::isnan(half_to_float(0x7e00)), "F16 specials");
+    close(bf16_to_float(0xc040), -3.0, 0, "BF16 minus three");
+    expect(std::bit_cast<std::uint32_t>(bf16_to_float(1)) == 0x10000u, "BF16 subnormal");
+    expect(std::isinf(bf16_to_float(0x7f80)) && std::isnan(bf16_to_float(0x7fc0)), "BF16 specials");
+
+    const auto ref = read_json(fixture.parent_path() / "phase0/fp64.json", mib);
+    const std::array x{1.0f, -2.0f, 3.0f};
+    const std::array y{-3.0f, 2.0f, 4.0f};
+    std::array<float, 1> dot{};
+    Scalar::linear(floats(y), x, dot);
+    close(dot[0], ref.at("dot").get<double>(), 0, "FP64 reference linear");
+
+    // The same serialized scalar kernels support unaligned weight data.
+    std::array<std::byte, sizeof(y) + 1> bytes{};
+    std::ranges::copy(std::as_bytes(std::span(y)), bytes.begin() + 1);
+    Scalar::linear({floats(y).desc, std::span(bytes).subspan(1)}, x, dot);
+    close(dot[0], ref.at("dot").get<double>(), 0, "unaligned linear");
+
+    std::array<float, 513> cancellation{}, weights{};
+    double sum = 0, magnitude = 0;
+    for (std::size_t i = 0; i < cancellation.size(); ++i) {
+        weights[i] = (i % 2 ? 1.0f : -1.0f) * (1.0f + static_cast<float>(i % 7) / 65.0f);
+        cancellation[i] = 1.0f + static_cast<float>(i % 13) / 53.0f;
+        const double term = static_cast<double>(weights[i]) * static_cast<double>(cancellation[i]);
+        sum += term;
+        magnitude += std::abs(term);
+    }
+    Scalar::linear(floats(weights), cancellation, dot);
+    const double n_u = (weights.size() + 1) * std::numeric_limits<float>::epsilon() / 2;
+    close(dot[0], sum, n_u / (1 - n_u) * magnitude, "FP64 linear cancellation bound");
+
+    std::array<float, 17> cancelling_weights{}, ones;
+    cancelling_weights[0] = 0x1p25f;
+    cancelling_weights[8] = 1.0f;
+    cancelling_weights[16] = -0x1p25f;
+    ones.fill(1.0f);
+    const auto cancelling_view = floats(cancelling_weights);
+    for (const auto policy : {ExecutionPolicy::scalar, ExecutionPolicy::automatic}) {
+        const auto kernel = select_kernel(DType::f32, policy, cpu_features());
+        linear_with(kernel.dot, cancelling_view, ones, dot);
+        close(dot[0], 1.0, 0.0, "preserve small term through scalar and SIMD cancellation");
+    }
+
+    std::array<float, 3> norm{};
+    Scalar::rms_norm(floats(y), x, norm, 1e-5f);
+    for (std::size_t i = 0; i < norm.size(); ++i)
+        close(norm[i], ref["rmsnorm"][i].get<double>(), 1e-6, "FP64 RMSNorm");
+    auto s = x;
+    Scalar::softmax(s);
+    for (std::size_t i = 0; i < s.size(); ++i)
+        close(s[i], ref["softmax"][i].get<double>(), 1e-6, "FP64 softmax");
+    auto shifted = std::array{1001.0f, 998.0f, 1003.0f};
+    Scalar::softmax(shifted);
+    expect(s == shifted, "softmax shift invariance");
+    std::array keys{0.0f, 1.0f, 2.0f, 2.0f, 1.0f, -3.0f};
+    std::array values{1.0f, 2.0f, 0.0f, 4.0f, -2.0f, 0.0f};
+    std::array query{1.0f, -2.0f, 3.0f, 1.0f, -2.0f, 3.0f};
+    std::array<float, 6> attention{};
+    std::array<float, 2> scores{};
+    auto config = ModelConfig{};
+    config.head_dim = 3;
+    config.kv_heads = 1;
+    config.query_heads = 2;
+    Scalar::attention(config, 0, 1, nullptr, keys, values, query, attention, scores);
+    for (std::size_t i = 0; i < 2; ++i) {
+        close(attention[i], ref["attention"]["output"][i].get<double>(), 1e-6, "FP64 GQA");
+        expect(attention[i] == attention[i + 3], "grouped query mapping");
+    }
+    Scalar::attention(config, 0, 0, nullptr, keys, values, query, attention, scores);
+    expect(attention == std::array{1.0f, 2.0f, 0.0f, 1.0f, 2.0f, 0.0f}, "future positions are masked");
+    const std::array frequency{1.0f, 0.125f};
+    for (std::size_t pos : {0, 1, 127, 8191}) {
+        std::array q{1.0f, 0.0f, 0.0f, 1.0f};
+        auto k = q;
+        Scalar::rope(q, k, frequency, pos);
+        close(q[0], std::cos(static_cast<double>(pos)), 1e-7, "RoPE split half real");
+        close(q[2], std::sin(static_cast<double>(pos)), 1e-7, "RoPE split half imaginary");
+        close(q[1], -std::sin(static_cast<double>(pos) / 8), 1e-7, "RoPE second coordinate");
+        expect(q == k, "same RoPE convention applied to Q and K");
+    }
+    std::array gate{-3.0f, 0.0f, 2.0f};
+    Scalar::swiglu(gate, x);
+    close(gate[0], -3.0 / (1 + std::exp(3.0)), 1e-7, "SiLU negative");
+    close(gate[1], 0, 0, "SiLU zero");
+    close(gate[2], 6.0 / (1 + std::exp(-2.0)), 1e-6, "SiLU positive");
+    Scalar::add(gate, x);
+    close(gate[1], -2, 0, "residual addition");
+}
+
+class Temporary {
+  public:
+    Temporary() {
+        auto pattern = std::filesystem::temp_directory_path() / "nathr-test-XXXXXX";
+        std::string path = pattern.string();
+        auto* result = mkdtemp(path.data());
+        if (!result)
+            throw std::runtime_error("mkdtemp failed");
+        directory = result;
+    }
+    ~Temporary() {
+        std::error_code error;
+        std::filesystem::remove_all(directory, error);
+    }
+    std::filesystem::path directory;
+};
+
+void parser() {
+    const auto parse = [](std::string_view content) {
+        return parse_json(std::as_bytes(std::span(content)), "test.json");
+    };
+    expect(parse(R"({"a":{"x":1},"b":{"x":2}})").is_object(), "nested unique JSON keys");
+    rejects([&] { (void)parse(R"({"a":{"x":1,"x":2}})"); }, ErrorCode::malformed);
+    rejects([&] { (void)parse(R"({"a":-1,})"); }, ErrorCode::malformed);
+    const std::string_view masked_tail("{}\0{}", 5);
+    rejects([&] { (void)parse(masked_tail); }, ErrorCode::malformed);
+    rejects([&] { (void)product({std::numeric_limits<std::size_t>::max(), 2}, "test"); },
+            ErrorCode::resource_limit);
+
+    Temporary temp;
+    const auto path = temp.directory / "model.safetensors";
+    const auto write = [&](std::string_view header, std::string_view payload) {
+        const auto length = static_cast<std::uint64_t>(header.size());
+        std::ofstream file(path, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(&length), sizeof(length));
+        file.write(header.data(), static_cast<std::streamsize>(header.size()));
+        file.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    };
+    write(
+        R"({"a":{"shape":[],"dtype":"F32","data_offsets":[0,4]},"b":{"shape":[0],"dtype":"BF16","data_offsets":[4,4]}})",
+        "abcd");
+    SafeTensors valid(path);
+    expect(valid.take("a", {}).bytes.size() == 4 && valid.take("b", {0}).bytes.empty(),
+           "scalar and empty tensors");
+    for (
+        auto header :
+        {R"({"a":{"shape":[2],"dtype":"F16","data_offsets":[0,4]},"b":{"shape":[2],"dtype":"F16","data_offsets":[0,4]}})",
+         R"({"a":{"shape":[1],"dtype":"F16","data_offsets":[2,4]}})",
+         R"({"a":{"shape":[1],"dtype":"F16","data_offsets":[0,2]}})",
+         R"({"a":{"shape":[1],"dtype":"F16","data_offsets":[0,2],"shape":[2]}})",
+         R"({"a":{"shape":[1],"dtype":"F16","data_offsets":[-1,1]}})",
+         R"({"a":{"shape":[3],"dtype":"F16","data_offsets":[0,6]}})"}) {
+        write(header, "abcd");
+        rejects([&] { SafeTensors malformed(path); }, ErrorCode::malformed);
+    }
+    write(R"({"a":{"shape":[1],"dtype":"I32","data_offsets":[0,4]}})", "abcd");
+    rejects([&] { SafeTensors unsupported(path); }, ErrorCode::unsupported);
+    write(std::string(mib + 1, ' '), "");
+    rejects([&] { SafeTensors oversized(path); }, ErrorCode::resource_limit);
+}
+
+void compare(std::span<const float> actual, std::span<const float> expected, double tolerance = 1e-6) {
+    expect(actual.size() == expected.size(), "output shape");
+    for (std::size_t i = 0; i < actual.size(); ++i)
+        close(actual[i], expected[i], tolerance, "fixture output");
+}
+
+std::size_t allocation_test(const Model& model, std::span<const Token> prompt, Token next,
+                            SessionOptions options = {}) {
+    auto session = Session::create(model, 512, 0, options);
+    session.prefill(prompt);
+    session.reset();
+    start_allocation_count();
+    try {
+        session.prefill(prompt);
+        for (unsigned i = 0; i < 4; ++i)
+            session.append(std::span(&next, 1));
+    } catch (...) {
+        (void)stop_allocation_count();
+        throw;
+    }
+    return stop_allocation_count();
+}
+
+void threaded_cache_and_chunks() {
+    for (unsigned bits = 0; bits <= 0xffff; ++bits) {
+        if ((bits & 0x7c00) != 0x7c00)
+            expect(float_to_half(half_to_float(bits)) == bits, "finite half storage round trip");
+    }
+    expect(float_to_half(1.f + 0x1p-11f) == 0x3c00 && float_to_half(1.f + 0x1.8p-10f) == 0x3c02,
+           "halfway rounds to even");
+    expect(float_to_half(0x1p-25f) == 0 && float_to_half(-0x1p-25f) == 0x8000 &&
+               float_to_half(65520.f) == 0x7c00,
+           "half underflow, sign and overflow rounding");
+
+    rejects([] { ThreadPool invalid(0); }, ErrorCode::invalid_argument);
+    ThreadPool pool(4);
+    constexpr std::size_t rows = 259, columns = 521, tokens = 19;
+    std::vector<float> weights(rows * columns), input(tokens * columns);
+    for (std::size_t i = 0; i < weights.size(); ++i)
+        weights[i] = static_cast<float>(static_cast<int>(i % 31) - 15) / 16;
+    for (std::size_t i = 0; i < input.size(); ++i)
+        input[i] = static_cast<float>(static_cast<int>(i % 19) - 9) / 16;
+    const TensorView matrix{{DType::f32, {rows, columns}, 2, weights.size()},
+                            std::as_bytes(std::span(weights))};
+    const auto scalar = scalar_kernel(DType::f32);
+    std::vector<float> expected(tokens * rows);
+    for (std::size_t i = 0; i < tokens; ++i)
+        linear_with(scalar.dot, matrix, std::span(input).subspan(i * columns, columns),
+                    std::span(expected).subspan(i * rows, rows));
+    const auto selected = select_kernel(DType::f32, ExecutionPolicy::automatic, cpu_features());
+    const auto submit = [&](std::span<float> output) {
+        std::array<float, columns * batch_tile> packed{};
+        project(selected, pool, matrix, input, output, tokens, packed);
+    };
+    std::vector<float> first(expected.size()), second(expected.size());
+    bool failed = false;
+    try {
+        pool.rows(rows, columns, [](std::size_t begin, std::size_t) {
+            if (begin > 0)
+                throw std::runtime_error("worker test");
+        });
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    expect(failed, "CPU worker exception reaches the submitting caller");
+    {
+        std::jthread a([&] { submit(first); });
+        std::jthread b([&] { submit(second); });
+    }
+    compare(first, expected, 0);
+    compare(second, expected, 0);
+
+    auto model = Model::load(fixture / "f32", {ExecutionPolicy::automatic, 3});
+    auto run = [&](KvPrecision precision, std::size_t chunk) {
+        SessionOptions options{precision, chunk};
+        auto session = Session::create(model, 19, 0, options);
+        std::vector<float> logits;
+        const auto sink = [&](std::size_t position, std::span<const float> values) {
+            expect(position * model.config().vocabulary == logits.size(), "absolute logit positions");
+            logits.insert(logits.end(), values.begin(), values.end());
+        };
+        session.prefill(ids, LogitsMode::all_tokens, sink);
+        session.append(ids, LogitsMode::all_tokens, sink);
+        session.append(std::span(ids).first(3), LogitsMode::all_tokens, sink);
+        const auto& c = model.config();
+        expect(session.memory().cache_bytes ==
+                   2 * c.layers * 19 * c.kv_heads * c.head_dim * (precision == KvPrecision::f16 ? 2 : 4),
+               "KV precision bytes");
+        return logits;
+    };
+    for (auto precision : {KvPrecision::f16, KvPrecision::f32}) {
+        const auto sequential = run(precision, 1);
+        for (auto chunk : {3u, 7u, 16u, 32u})
+            compare(run(precision, chunk), sequential, 0);
+    }
+    expect(allocation_test(model, ids, 3, {KvPrecision::f16, 3}) == 0,
+           "warmed FP16 chunking and append allocate no heap");
+    rejects([&] { (void)Session::create(model, 19, 0, {KvPrecision::f32, 33}); },
+            ErrorCode::invalid_argument);
+}
+
+void model_and_sessions() {
+    SafeTensors oracle(fixture / "expected.safetensors");
+    const auto data = oracle.take("logits", {ids.size(), 23});
+    std::vector<float> expected(data.desc.elements);
+    std::memcpy(expected.data(), data.bytes.data(), data.bytes.size());
+    for (auto storage : {"f32", "f16", "bf16"}) {
+        auto model = Model::load(fixture / storage);
+        const auto memory = model.memory();
+        expect(memory.tensors == 20 && model.config().tied_embeddings, "tied tensor inventory");
+        expect(memory.encoded_weight_bytes ==
+                   memory.stored_parameters * (std::string_view(storage) == "f32" ? 4 : 2),
+               "native storage accounting");
+
+        std::size_t projected = 0;
+        model.forward(ids, LogitsMode::all_tokens, {}, [&](std::size_t pos, std::span<const float> logits) {
+            compare(logits, std::span(expected).subspan(pos * 23, 23));
+            ++projected;
+        });
+        expect(projected == ids.size(), "all positions delivered");
+        std::vector<float> last(23);
+        model.forward(ids, LogitsMode::last_token, last);
+        compare(last, std::span(expected).last(23));
+
+        auto session = Session::create(model, ids.size());
+        std::size_t logits_calls = 0;
+        const TraceSink counter = [&](const TraceEvent& event) {
+            if (event.operation == "logits")
+                ++logits_calls;
+        };
+        session.prefill(std::span(ids).first(3), LogitsMode::none, {}, counter);
+        rejects([&] { (void)session.logits(); }, ErrorCode::invalid_argument);
+        expect(logits_calls == 0, "None avoids output projection");
+        const std::array<Token, 2> bad{1, 23};
+        rejects([&] { session.append(bad); }, ErrorCode::invalid_argument);
+        expect(session.history().size() == 3 && session.state() == SessionState::ready,
+               "invalid input is atomic");
+        session.append(std::span(ids).subspan(3, 2), LogitsMode::none, {}, counter);
+        session.append(std::span(ids).last(3), LogitsMode::last_token, {}, counter);
+        expect(logits_calls == 1, "LastToken projects only the final token");
+        compare(session.logits(), last, 0);
+        rejects([&] { session.append(std::span(ids).first(1)); }, ErrorCode::invalid_argument);
+        expect(session.memory().cache_bytes == 2 * 2 * 2 * 2 * ids.size() * sizeof(float),
+               "cache memory accounting");
+        session.reset();
+        const LogitsSink broken = [](std::size_t, std::span<const float>) { throw std::logic_error("sink"); };
+        bool caught = false;
+        try {
+            session.prefill(ids, LogitsMode::all_tokens, broken);
+        } catch (const std::logic_error&) {
+            caught = true;
+        }
+        expect(caught && session.state() == SessionState::invalid, "partial failure invalidates session");
+        rejects([&] { session.append(std::span(ids).first(1)); }, ErrorCode::invalid_argument);
+        session.reset();
+        session.prefill(std::span(ids).first(2));
+        session.append(session.history());
+        expect(session.history().size() == 4 && session.history()[2] == ids[0], "append from history view");
+    }
+
+    auto shared = Model::load(fixture / "f32");
+    auto a = Session::create(shared);
+    auto b = Session::create(shared);
+    {
+        std::jthread first([&] { a.prefill(ids); });
+        std::jthread second([&] { b.prefill(ids); });
+    }
+    compare(a.logits(), b.logits(), 0);
+    expect(allocation_test(shared, ids, 3) == 0, "warmed scalar prefill and append allocate no heap");
+
+    const auto detached = [] {
+        auto local = Model::load(fixture / "bf16");
+        return Session::create(local, ids.size(), 153);
+    };
+    auto survivor = detached();
+    survivor.prefill(ids);
+    compare(survivor.logits(), std::span(expected).last(23));
+}
+
+void tokenizer_and_sampling() {
+    const auto tokenizer = Tokenizer::load(fixture / "tokenizer.json");
+    expect(tokenizer.encode("abc<x>>ab") == std::vector<Token>({256, 258, 4}),
+           "BPE merges and longest special");
+    expect(tokenizer.encode("\x04").empty(), "missing byte is skipped by the pinned pipeline");
+    expect(tokenizer.decode(std::array<Token, 3>{256, 258, 4}, true) == "abcab", "skip special decode");
+    expect(tokenizer.pretokenize("  a 1٢") == std::vector<std::string>({"Ġ", "Ġa", "Ġ", "1", "Ù¢"}),
+           "ordered regex stages");
+    rejects([&] { (void)tokenizer.encode("\xc0\xaf"); }, ErrorCode::invalid_argument);
+    rejects([&] { (void)tokenizer.encode("\xed\xa0\x80"); }, ErrorCode::invalid_argument);
+    Utf8Stream stream;
+    expect(stream.push("\xf0\x9f").empty() && stream.push("\x99").empty() && stream.push("\x82") == "🙂",
+           "cross-token UTF-8 buffering");
+    expect(stream.push("\xe2\x82").empty() && stream.finish() == "�" && stream.finish().empty(),
+           "partial terminal UTF-8 sequence");
+    expect(stream.push("\xe2\x82x\xff") == "�x�", "lossy UTF-8 invalid byte boundaries");
+
+    std::mt19937_64 rng(1);
+    std::array logits{3.0f, 3.0f, -1.0f, 1.0f};
+    Sampler greedy({}, 4);
+    expect(greedy.select(logits, rng) == 0, "lowest greedy tie ID");
+    Sampler top_k({false, 1, 1, 1}, 4);
+    Sampler top_p({false, 1, 0, 0.1}, 4);
+    for (int i = 0; i < 12; ++i) {
+        expect(top_k.select(logits, rng) == 0 && top_p.select(logits, rng) == 0, "top-k/top-p retain best");
+    }
+    Sampler stochastic({false, 0.8, 2, 1}, 4);
+    auto copy = rng;
+    for (int i = 0; i < 30; ++i) {
+        const auto id = stochastic.select(logits, rng);
+        expect(id < 2 && id == stochastic.select(logits, copy), "seeded filtered stochastic sampling");
+    }
+    logits[0] = std::numeric_limits<float>::infinity();
+    rejects([&] { (void)greedy.select(logits, rng); }, ErrorCode::invalid_argument);
+    rejects([] { Sampler invalid({false, 0, 0, 1}, 4); }, ErrorCode::invalid_argument);
+
+    const auto model = Model::load(fixture / "f32");
+    auto session = Session::create(model, 32);
+    session.prefill(ids);
+    Sampler sampler({}, model.config().vocabulary);
+    const Token first = session.sample(sampler);
+    expect(session.history().size() == ids.size(), "sampling leaves cache position unchanged");
+    std::vector<Token> emitted;
+    const auto sink = [&](Token id) { emitted.push_back(id); };
+    const auto eos = generate(session, sampler, first, 4, sink);
+    expect(eos.stopped_at_eos && eos.pending == first && eos.emitted == 1 && eos.consumed == 0,
+           "EOS stays pending");
+    const auto budget = generate(session, sampler, (first + 1) % model.config().vocabulary, 1, sink);
+    expect(!budget.stopped_at_eos && budget.pending == first && budget.emitted == 1 && budget.consumed == 0,
+           "last budget token stays pending");
+    session.append(std::span(&first, 1));
+    expect(session.history().size() == ids.size() + 1 && session.history().back() == first,
+           "continuation appends once");
+}
+
+void gguf_layout() {
+    const auto golden = fixture.parent_path() / "phase2/tiny.f32.gguf";
+    const Gguf metadata(golden);
+    expect(metadata.alignment() == 32 && metadata.records().size() == 20 && metadata.config().tied_embeddings,
+           "GGUF inventory");
+    expect(metadata.memory().mapped_file_bytes == std::filesystem::file_size(golden),
+           "GGUF mapping accounting");
+    Gguf structural(golden);
+    const auto table = structural.take("token_embd.weight", {23, 8});
+    expect(table.bytes.size() == 23 * 8 * sizeof(float), "GGUF row-major logical shapes");
+    rejects([&] { (void)structural.take("token_embd.weight", {23, 8}); }, ErrorCode::malformed);
+
+    Temporary temp;
+    const auto local = temp.directory / "only-model.gguf";
+    std::filesystem::copy_file(golden, local);
+    auto survivor = [&] {
+        const auto loaded = Model::load(local);
+        expect(loaded.kernel(0) == "scalar-f32", "GGUF default scalar execution");
+        return Session::create(loaded, 512);
+    }();
+    std::filesystem::remove(local);
+    survivor.prefill(ids);
+    auto hf = Session::create(Model::load(fixture / "f32"), 512);
+    hf.prefill(ids);
+    compare(survivor.logits(), hf.logits(), 0);
+
+    const auto valid = read_file(golden, mib);
+    const auto malformed = [&](auto edit, ErrorCode code) {
+        auto data = valid;
+        edit(data);
+        std::ofstream output(local, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+        output.close();
+        rejects([&] { Gguf invalid(local); }, code);
+    };
+    malformed([](auto& data) { data[0] = std::byte{0}; }, ErrorCode::malformed);
+    malformed([](auto& data) { data[4] = std::byte{2}; }, ErrorCode::unsupported);
+    malformed([](auto& data) { std::reverse(data.begin() + 4, data.begin() + 8); }, ErrorCode::unsupported);
+    malformed([](auto& data) { data[9] = std::byte{4}; }, ErrorCode::resource_limit);
+    malformed([](auto& data) { data[24] = std::byte{255}; }, ErrorCode::malformed);
+    malformed(
+        [](auto& data) {
+            data[25] = std::byte{255};
+            data[26] = std::byte{2};
+        },
+        ErrorCode::malformed);
+    const auto location = [&](std::string_view name) {
+        const std::string_view header(reinterpret_cast<const char*>(valid.data()), metadata.data_offset());
+        const auto offset = header.find(name);
+        expect(offset != header.npos, "locate GGUF fixture record");
+        return offset + name.size();
+    };
+    const auto q = location("blk.0.attn_q.weight");
+    const auto k = location("blk.0.attn_k.weight");
+    malformed([&](auto& data) { data[q + 4 + 16] = std::byte{2}; }, ErrorCode::malformed);
+    malformed([&](auto& data) { data[q + 4 + 16] = std::byte{100}; }, ErrorCode::unsupported);
+    malformed([&](auto& data) { data[q + 4 + 16 + 4] |= std::byte{1}; }, ErrorCode::malformed);
+    malformed(
+        [&](auto& data) {
+            std::copy_n(data.begin() + static_cast<std::ptrdiff_t>(k + 24), 8,
+                        data.begin() + static_cast<std::ptrdiff_t>(q + 24));
+        },
+        ErrorCode::malformed);
+    const auto arch = location("general.architecture");
+    malformed(
+        [&](auto& data) {
+            data[arch] = std::byte{9};
+            data[arch + 4] = std::byte{9};
+        },
+        ErrorCode::malformed);
+    malformed([&](auto& data) { data[arch] = std::byte{99}; }, ErrorCode::malformed);
+    malformed(
+        [&](auto& data) {
+            const auto& last = metadata.records().at("token_embd.weight");
+            const auto high = metadata.data_offset() + last.offset + last.view.bytes.size();
+            data.resize(high - 1);
+        },
+        ErrorCode::malformed);
+}
+
+void packed_kernels() {
+    expect(sha256("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "empty SHA-256");
+    expect(sha256("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "SHA-256");
+    expect(!usable_features({true, false, true, true, true, 6}).avx2, "OSXSAVE gate");
+    expect(!usable_features({true, true, true, true, true, 2}).avx2, "YMM state gate");
+    expect(!usable_features({false, true, true, true, true, 6}).avx2, "CPUID AVX gate");
+    const auto avx2_no_extras = usable_features({true, true, true, false, false, 6});
+    expect(avx2_no_extras.avx2 && !avx2_no_extras.fma && !avx2_no_extras.f16c, "independent feature bits");
+    expect(select_kernel(DType::f16, ExecutionPolicy::avx2, avx2_no_extras).name == "scalar-f16",
+           "F16C fallback");
+    expect(select_kernel(DType::f32, ExecutionPolicy::automatic, {}).name == "scalar-f32",
+           "automatic scalar fallback");
+    rejects([] { (void)select_kernel(DType::q4_0, ExecutionPolicy::avx2, {}); }, ErrorCode::unsupported);
+    expect(!select_kernel(static_cast<DType>(31), ExecutionPolicy::automatic, avx2_no_extras).dot,
+           "unknown encoding");
+    const auto features = cpu_features();
+    const auto golden = read_json(fixture.parent_path() / "phase2/blocks.json", mib);
+    for (const auto type : {DType::q4_0, DType::q8_0}) {
+        const auto& description = *encoding(type);
+        const auto& entry = golden.at(description.name);
+        std::vector<std::byte> packed(1); // exercise unaligned payload addresses
+        std::vector<float> decoded;
+        for (std::size_t index = 0; index < entry.at("blocks").size(); ++index) {
+            const auto& hex = entry["blocks"][index].get_ref<const std::string&>();
+            expect(hex.size() == 2 * description.bytes, "serialized fixture block size");
+            const auto offset = packed.size();
+            for (std::size_t i = 0; i < hex.size(); i += 2)
+                packed.push_back(static_cast<std::byte>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+            std::array<float, 32> block{};
+            if (type == DType::q4_0)
+                unpack_block<DType::q4_0>(packed.data() + offset, block.data());
+            else
+                unpack_block<DType::q8_0>(packed.data() + offset, block.data());
+            for (std::size_t i = 0; i < block.size(); ++i) {
+                expect(std::bit_cast<std::uint32_t>(block[i]) ==
+                           entry["fp32_bits"][index][i].get<std::uint32_t>(),
+                       "independent GGUF block decoder");
+                decoded.push_back(block[i]);
+            }
+        }
+        const auto storage = std::span(packed).subspan(1);
+        std::vector<float> input(decoded.size() + 1);
+        double exact = 0, magnitude = 0;
+        for (std::size_t i = 0; i < decoded.size(); ++i) {
+            input[i + 1] = static_cast<float>(static_cast<int>(i % 17) - 8) / 9;
+            const double term = static_cast<double>(input[i + 1]) * decoded[i];
+            exact += term;
+            magnitude += std::abs(term);
+        }
+        const auto gamma = (decoded.size() + 1) * std::numeric_limits<float>::epsilon() / 2;
+        const auto limit = gamma / (1 - gamma) * magnitude;
+        close(scalar_kernel(type).dot(storage.data(), input.data() + 1, decoded.size()), exact, limit,
+              "scalar packed dot");
+        if (features.avx2)
+            close(select_kernel(type, ExecutionPolicy::avx2, features)
+                      .dot(storage.data(), input.data() + 1, decoded.size()),
+                  exact, limit, "AVX2 packed dot");
+        TensorView embedding{{type, {1, decoded.size()}, 2, decoded.size()}, storage};
+        std::vector<float> row(decoded.size());
+        Scalar::embedding(embedding, 0, row);
+        expect(row == decoded, "packed embedding row");
+    }
+    if (features.avx2) {
+        std::array<float, 13> weights{}, input{};
+        for (std::size_t i = 0; i < weights.size(); ++i) {
+            weights[i] = static_cast<float>(i);
+            input[i] = static_cast<float>(i % 3);
+        }
+        std::array<std::byte, sizeof(weights) + 1> packed{};
+        std::ranges::copy(std::as_bytes(std::span(weights)), packed.begin() + 1);
+        const auto reference = scalar_kernel(DType::f32).dot(packed.data() + 1, input.data(), input.size());
+        close(select_kernel(DType::f32, ExecutionPolicy::avx2, features)
+                  .dot(packed.data() + 1, input.data(), input.size()),
+              reference, 0, "AVX2 dense tail and unaligned loads");
+        constexpr std::array<std::uint16_t, 4> half{0xbc00, 0x4000, 0x4200, 0x3c00};
+        constexpr std::array<std::uint16_t, 4> brain{0xbf80, 0x4000, 0x4040, 0x3f80};
+        for (const auto type : {DType::f16, DType::bf16}) {
+            if (type == DType::f16 && !features.f16c)
+                continue;
+            const auto& encodings = type == DType::f16 ? half : brain;
+            for (std::size_t i = 0; i < weights.size(); ++i) {
+                const auto value = encodings[i % encodings.size()];
+                std::memcpy(packed.data() + 1 + i * sizeof(value), &value, sizeof(value));
+            }
+            const auto expected = scalar_kernel(type).dot(packed.data() + 1, input.data(), input.size());
+            close(select_kernel(type, ExecutionPolicy::avx2, features)
+                      .dot(packed.data() + 1, input.data(), input.size()),
+                  expected, 0, "AVX2 narrow dense tail");
+        }
+    }
+}
+
+void all_frozen_packed_encodings() {
+    const auto atlas = read_json(fixture.parent_path() / "phase3/blocks.json", mib);
+    const auto features = cpu_features();
+    for (const auto& format : encodings) {
+        const auto scalar = scalar_kernel(format.type);
+        expect(scalar.dot && executable_encoding(format.type), format.name);
+        if (format.elements == 1 || format.type == DType::q4_0 || format.type == DType::q8_0)
+            continue;
+        const auto& entry = atlas.at(format.name);
+        const auto& blocks = entry.at("blocks");
+        expect(blocks.size() % 2 == 0 && scalar.unpack, "packed fixture row layout");
+        expect(select_kernel(format.type, ExecutionPolicy::automatic, features).name == scalar.name,
+               "observable packed scalar fallback");
+        std::vector<std::byte> storage(1);
+        std::vector<float> weights, block(format.elements);
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            const auto& raw = blocks[i].get_ref<const std::string&>();
+            const auto& expected = entry["fp32_le"][i].get_ref<const std::string&>();
+            expect(raw.size() == 2 * format.bytes && expected.size() == 8 * format.elements,
+                   "reference block dimensions");
+            const auto start = storage.size();
+            for (std::size_t j = 0; j < raw.size(); j += 2)
+                storage.push_back(static_cast<std::byte>(std::stoul(raw.substr(j, 2), nullptr, 16)));
+            scalar.unpack(storage.data() + start, block.data());
+            for (std::size_t j = 0; j < block.size(); ++j) {
+                std::uint32_t bits = 0;
+                for (unsigned b = 0; b < 4; ++b) {
+                    const auto value = std::stoul(expected.substr(8 * j + 2 * b, 2), nullptr, 16);
+                    bits |= static_cast<std::uint32_t>(value) << (8 * b);
+                }
+                expect(std::bit_cast<std::uint32_t>(block[j]) == bits,
+                       std::string(format.name) + ": FP32 block differs from independent oracles");
+                weights.push_back(std::bit_cast<float>(bits));
+            }
+        }
+        const auto width = weights.size() / 2;
+        const TensorView view{{format.type, {2, width}, 2, weights.size()}, std::span(storage).subspan(1)};
+        std::vector<float> decoded(width), activations(width);
+        std::array<float, 2> projected{};
+        for (std::size_t i = 0; i < width; ++i)
+            activations[i] = static_cast<float>(static_cast<int>(i % 23) - 11) / 12;
+        linear_with(scalar.dot, view, activations, projected);
+        const auto gamma = width * std::numeric_limits<double>::epsilon() / 2;
+        for (std::size_t row = 0; row < 2; ++row) {
+            const auto expected = std::span(weights).subspan(row * width, width);
+            Scalar::embedding(view, row, decoded);
+            expect(std::ranges::equal(expected, decoded), "packed embedding across rows and blocks");
+            double dot = 0, magnitude = 0;
+            for (std::size_t i = 0; i < width; ++i) {
+                const double term = static_cast<double>(expected[i]) * activations[i];
+                dot += term;
+                magnitude += std::abs(term);
+            }
+            const auto rounding = std::abs(dot) * std::numeric_limits<float>::epsilon() / 2 +
+                                  std::numeric_limits<float>::denorm_min() / 2.0;
+            close(projected[row], dot, gamma / (1 - gamma) * magnitude + rounding, format.name);
+        }
+    }
+}
+
+void gguf_probes(const std::filesystem::path& path) {
+    Gguf file(path);
+    const auto config = file.config();
+    const auto embedding = file.take("token_embd.weight", {config.vocabulary, config.hidden});
+    const auto tied = file.records().find("output.weight");
+    const auto head = tied == file.records().end()
+                          ? embedding
+                          : file.take("output.weight", {config.vocabulary, config.hidden});
+    const auto down = file.take("blk.0.ffn_down.weight", {config.hidden, config.intermediate});
+    if (!executable_encoding(embedding.desc.dtype) || !executable_encoding(head.desc.dtype))
+        throw std::runtime_error("GGUF component probe expects executable embedding and output weights");
+    const auto kind = down.desc.dtype;
+    if (kind != DType::q4_0 && kind != DType::q8_0)
+        throw std::runtime_error("GGUF component probe expects a controlled Q4_0 or Q8_0 model");
+    const auto unpack = kind == DType::q4_0 ? unpack_block<DType::q4_0> : unpack_block<DType::q8_0>;
+    const auto width = encoding(kind)->bytes;
+    const auto blocks = std::min<std::size_t>(8192, down.bytes.size() / width);
+    std::array<float, 32> decoded{};
+    const std::vector<float> hidden(config.hidden, 0.015625f), intermediate(config.intermediate, -0.03125f);
+    std::vector<float> rows(config.hidden), logits(config.vocabulary);
+    double checksum = 0;
+    const auto measure = [&](const auto& run) {
+        std::array<double, 7> timings{};
+        for (int rep = -2; rep < 7; ++rep) {
+            const auto start = std::chrono::steady_clock::now();
+            run();
+            const auto end = std::chrono::steady_clock::now();
+            if (rep >= 0)
+                timings[rep] = std::chrono::duration<double, std::milli>(end - start).count();
+        }
+        return timings;
+    };
+    Json samples = {{"encoding", encoding(kind)->name},
+                    {"dequantized_blocks_per_sample", blocks},
+                    {"embeddings_per_sample", 2048},
+                    {"dequantization_ms", measure([&] {
+                         for (std::size_t i = 0; i < blocks; ++i) {
+                             unpack(down.bytes.data() + i * width, decoded.data());
+                             checksum += decoded[i % decoded.size()];
+                         }
+                     })},
+                    {"embedding_ms", measure([&] {
+                         for (std::size_t i = 0; i < 2048; ++i) {
+                             Scalar::embedding(embedding, (i * 7919) % config.vocabulary, rows);
+                             checksum += rows[i % rows.size()];
+                         }
+                     })}};
+    const auto features = cpu_features();
+    for (const auto policy : {ExecutionPolicy::scalar, ExecutionPolicy::avx2}) {
+        if (policy == ExecutionPolicy::avx2 && !features.avx2)
+            continue;
+        const auto ff = select_kernel(kind, policy, features);
+        const auto projection = select_kernel(head.desc.dtype, policy, features);
+        samples[policy == ExecutionPolicy::scalar ? "scalar" : "avx2"] = {
+            {"down_kernel", ff.name},
+            {"output_kernel", projection.name},
+            {"ffn_down_gemv_ms", measure([&] {
+                 linear_with(ff.dot, down, intermediate, rows);
+                 checksum += rows.back();
+             })},
+            {"output_projection_ms", measure([&] {
+                 linear_with(projection.dot, head, hidden, logits);
+                 checksum += logits.back();
+             })}};
+        const auto model = Model::load(path, {policy, 1});
+        const std::array<Token, 4> ids{1, 2, 3, 42};
+        const auto count = allocation_test(model, ids, 100);
+        expect(count == 0, "GGUF warmed compute allocated");
+        samples[policy == ExecutionPolicy::scalar ? "scalar" : "avx2"]["cpp_allocations"] = count;
+    }
+    expect(std::isfinite(checksum) && checksum != 0, "component output checksum");
+    samples["checksum"] = checksum;
+    std::cout << samples.dump(2) << std::endl;
+}
+
+void context_boundary(KvPrecision precision) {
+    const auto model = Model::load(fixture / "f32");
+    auto session = Session::create(model, 8192, 0, {precision, 16});
+    const std::vector<Token> prompt(8191, 1);
+    session.prefill(prompt, LogitsMode::none);
+    session.append(std::span(ids).first(1));
+    expect(session.history().size() == 8192 && session.logits().size() == model.config().vocabulary,
+           "position 8191");
+    rejects([&] { session.append(std::span(ids).first(1)); }, ErrorCode::invalid_argument);
+    session.reset();
+    session.prefill(ids);
+    std::vector<float> baseline(model.config().vocabulary);
+    auto sequential = Session::create(model, 8192, 0, {precision, 1});
+    sequential.prefill(ids);
+    std::ranges::copy(sequential.logits(), baseline.begin());
+    compare(session.logits(), baseline, 0);
+}
+
+} // namespace
+
+int main(int argc, char** argv) try {
+    if (argc == 2 && std::string_view(argv[1]) == "--long") {
+        context_boundary(KvPrecision::f32);
+        context_boundary(KvPrecision::f16);
+    } else if (argc == 3 && std::string_view(argv[1]) == "--gguf-probes") {
+        gguf_probes(argv[2]);
+    } else if (argc == 3 && std::string_view(argv[1]) == "--real-allocations") {
+        const auto model = Model::load(argv[2], {ExecutionPolicy::automatic, 4});
+        std::array<Token, 128> prompt{};
+        for (std::size_t i = 0; i < prompt.size(); ++i)
+            prompt[i] = static_cast<Token>(17 + (i * 7919 + 12345) % (49152 - 17));
+        const auto count = allocation_test(model, prompt, 48702, {KvPrecision::f16, 16});
+        std::cout << "{\"cpp_allocations\":" << count << ",\"prefill_tokens\":128,\"append_tokens\":4}\n";
+        expect(count == 0, "real checkpoint post-warmup allocation count");
+        const auto f32_bytes = Session::create(model, 8192).memory().cache_bytes;
+        const auto f16_bytes = Session::create(model, 8192, 0, {KvPrecision::f16}).memory().cache_bytes;
+        expect(f32_bytes == 377487360 && f16_bytes == 188743680, "real checkpoint full-context cache");
+    } else if (argc == 1) {
+        kernels();
+        parser();
+        model_and_sessions();
+        threaded_cache_and_chunks();
+        tokenizer_and_sampling();
+        gguf_layout();
+        packed_kernels();
+        all_frozen_packed_encodings();
+    } else {
+        return 2;
+    }
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+}

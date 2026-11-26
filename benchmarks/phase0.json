@@ -1,0 +1,311 @@
+{
+  "schema_version": 1,
+  "date": "2026-11-25",
+  "host": {
+    "cpu": "AMD Ryzen 7 7735HS",
+    "physical_cores": 8,
+    "logical_cpus": 16,
+    "l3_mib": 16,
+    "os": "Zorin OS 18.1",
+    "kernel": "7.0.0-43-generic",
+    "compiler": "GCC 13.3.0",
+    "governor": "powersave"
+  },
+  "workload": {
+    "token_id": "17 + (i * 7919 + 12345) % (49152 - 17)",
+    "prompt_length": 128,
+    "decode_length": 32,
+    "allocated_context_where_applicable": 512,
+    "kv_dtype": "F32",
+    "sampling": false,
+    "logits": "last token per operation",
+    "warmups": 2,
+    "repetitions": 7,
+    "unstable_coefficient_of_variation_above": 0.05
+  },
+  "runs": [
+    {
+      "prompt_tokens": 128,
+      "decode_tokens": 32,
+      "context": 512,
+      "threads": 1,
+      "warmups": 2,
+      "prefill_and_decode_ms": [
+        [
+          544.238,
+          854.731
+        ],
+        [
+          542.912,
+          865.209
+        ],
+        [
+          546.136,
+          857.756
+        ],
+        [
+          549.145,
+          861.114
+        ],
+        [
+          549.85,
+          871.917
+        ],
+        [
+          557.762,
+          866.584
+        ],
+        [
+          555.459,
+          867.223
+        ]
+      ],
+      "cpu_affinity": [
+        0
+      ],
+      "peak_rss_kib": 617024,
+      "engine": "llama.cpp",
+      "revision": "b1b770d90d94cad9e9ea5b993bdbc383a522fb28",
+      "ggml": "1.0.0, installed build reported commit unknown",
+      "libllama_sha256": "b1de95805f86e542a2a1bf94ba0143a035de306f45635f5e81fc06ea408fafef",
+      "ggml_base_sha256": "9ef1d050e3a7ed5389ba5fd5a9e5f7435e39c801bf347cc7ab6dec38f6a7abb2",
+      "ggml_cpu_sha256": "868d9ef66b8fca95499aedde9d456b5f3629aaa829c37a4a93411674760bd3fc",
+      "load_ms": 94.9066,
+      "model_sha256": "64c98950052fe62e82f1b6454edab4764771452915888bd56c567cc6987ed6b6",
+      "cache_policy": "preallocated FP32, flash attention off",
+      "prefill_ms": {
+        "median": 549.145,
+        "p95": 557.0710999999999,
+        "median_absolute_deviation": 4.906999999999925,
+        "coefficient_of_variation": 0.010142768352083036
+      },
+      "decode_ms": {
+        "median": 865.209,
+        "p95": 870.5088000000001,
+        "median_absolute_deviation": 4.094999999999914,
+        "coefficient_of_variation": 0.006895469419493011
+      },
+      "median_prefill_tokens_s": 233.08962113831504,
+      "median_decode_tokens_s": 36.98528332460712,
+      "within_single_batch_variance_budget": true
+    },
+    {
+      "prompt_tokens": 128,
+      "decode_tokens": 32,
+      "context": 512,
+      "threads": 4,
+      "warmups": 2,
+      "prefill_and_decode_ms": [
+        [
+          273.395,
+          526.905
+        ],
+        [
+          243.584,
+          553.298
+        ],
+        [
+          253.305,
+          541.418
+        ],
+        [
+          233.657,
+          544.794
+        ],
+        [
+          230.668,
+          603.242
+        ],
+        [
+          215.216,
+          610.049
+        ],
+        [
+          245.712,
+          680.946
+        ]
+      ],
+      "cpu_affinity": [
+        0,
+        2,
+        4,
+        6
+      ],
+      "peak_rss_kib": 617220,
+      "engine": "llama.cpp",
+      "revision": "b1b770d90d94cad9e9ea5b993bdbc383a522fb28",
+      "ggml": "1.0.0, installed build reported commit unknown",
+      "libllama_sha256": "b1de95805f86e542a2a1bf94ba0143a035de306f45635f5e81fc06ea408fafef",
+      "ggml_base_sha256": "9ef1d050e3a7ed5389ba5fd5a9e5f7435e39c801bf347cc7ab6dec38f6a7abb2",
+      "ggml_cpu_sha256": "868d9ef66b8fca95499aedde9d456b5f3629aaa829c37a4a93411674760bd3fc",
+      "load_ms": 105.399,
+      "model_sha256": "64c98950052fe62e82f1b6454edab4764771452915888bd56c567cc6987ed6b6",
+      "cache_policy": "preallocated FP32, flash attention off",
+      "prefill_ms": {
+        "median": 243.584,
+        "p95": 267.368,
+        "median_absolute_deviation": 9.926999999999992,
+        "coefficient_of_variation": 0.0762150579951306
+      },
+      "decode_ms": {
+        "median": 553.298,
+        "p95": 659.6769,
+        "median_absolute_deviation": 26.39300000000003,
+        "coefficient_of_variation": 0.09413943233287766
+      },
+      "median_prefill_tokens_s": 525.4860746190226,
+      "median_decode_tokens_s": 57.83501838069178,
+      "within_single_batch_variance_budget": false
+    },
+    {
+      "prompt_tokens": 128,
+      "decode_tokens": 32,
+      "context": 512,
+      "threads": 1,
+      "warmups": 2,
+      "load_ms": 511.0737290015095,
+      "prefill_and_decode_ms": [
+        [
+          372.9585090004548,
+          1316.3998300005915
+        ],
+        [
+          394.841097000608,
+          1309.6879000004265
+        ],
+        [
+          406.15171899844427,
+          1330.189235999569
+        ],
+        [
+          391.4835640025558,
+          1476.3478439999744
+        ],
+        [
+          448.79613100056304,
+          1453.6219430010533
+        ],
+        [
+          424.60585099979653,
+          1516.1908170011884
+        ],
+        [
+          435.66168500183267,
+          1589.3140949992812
+        ]
+      ],
+      "torch": "2.11.0+cpu",
+      "cache_policy": "dynamic FP32 cache, active to 160 positions",
+      "cpu_affinity": [
+        0
+      ],
+      "peak_rss_kib": 1113288,
+      "engine": "PyTorch eager Transformers 4.57.6",
+      "model_sha256": "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1",
+      "prefill_ms": {
+        "median": 406.15171899844427,
+        "p95": 444.8557972009439,
+        "median_absolute_deviation": 18.454132001352264,
+        "coefficient_of_variation": 0.06544649988006421
+      },
+      "decode_ms": {
+        "median": 1453.6219430010533,
+        "p95": 1567.3771115998534,
+        "median_absolute_deviation": 123.43270700148423,
+        "coefficient_of_variation": 0.07717524368975053
+      },
+      "median_prefill_tokens_s": 315.1531657077396,
+      "median_decode_tokens_s": 22.01397698629596,
+      "within_single_batch_variance_budget": false
+    },
+    {
+      "prompt_tokens": 128,
+      "decode_tokens": 32,
+      "context": 512,
+      "threads": 4,
+      "warmups": 2,
+      "load_ms": 465.5587169982027,
+      "prefill_and_decode_ms": [
+        [
+          175.11631900197244,
+          1368.8763869977265
+        ],
+        [
+          174.51987900130916,
+          1558.9655529984157
+        ],
+        [
+          172.76542499894276,
+          1438.9735340009793
+        ],
+        [
+          219.142093003029,
+          1435.4152339983557
+        ],
+        [
+          180.46193299960578,
+          1312.0458640005381
+        ],
+        [
+          176.61906899957103,
+          1459.9018699991575
+        ],
+        [
+          183.60608500006492,
+          1671.8756569971447
+        ]
+      ],
+      "torch": "2.11.0+cpu",
+      "cache_policy": "dynamic FP32 cache, active to 160 positions",
+      "cpu_affinity": [
+        0,
+        2,
+        4,
+        6
+      ],
+      "peak_rss_kib": 1113276,
+      "engine": "PyTorch eager Transformers 4.57.6",
+      "model_sha256": "80521b40281d6ce74e35c9282c22539e75aa0ac8578892b2a59955ef78d55da1",
+      "prefill_ms": {
+        "median": 176.61906899957103,
+        "p95": 208.48129060213978,
+        "median_absolute_deviation": 3.8428640000347514,
+        "coefficient_of_variation": 0.08893616073112344
+      },
+      "decode_ms": {
+        "median": 1438.9735340009793,
+        "p95": 1638.002625797526,
+        "median_absolute_deviation": 70.09714700325276,
+        "coefficient_of_variation": 0.08171141432987149
+      },
+      "median_prefill_tokens_s": 724.7235574563632,
+      "median_decode_tokens_s": 22.238074046453047,
+      "within_single_batch_variance_budget": false
+    }
+  ],
+  "copy_bandwidth": {
+    "bytes_per_buffer": 268435456,
+    "warmups": 2,
+    "logical_gb_s": [
+      25.9179,
+      29.6908,
+      28.2346,
+      30.5886,
+      29.0928,
+      30.9978,
+      29.0197
+    ],
+    "cpu_affinity": [
+      0
+    ],
+    "median_logical_gb_s": 29.0928,
+    "method": "libc memcpy, read + write logical bytes, no hardware counters"
+  },
+  "limitations": [
+    "shared host without thermal or frequency control",
+    "one batch per engine and affinity",
+    "model loads measured with warm filesystem",
+    "cache allocation policies differ",
+    "logical copy traffic excludes hardware write allocation and other system traffic"
+  ]
+}

@@ -1,0 +1,6 @@
+/build/
+/.venv-reference/
+/models/cache/
+/fixtures/local/
+/traces/local/
+__pycache__/

@@ -1,0 +1,44 @@
+name: C++ checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        compiler: [g++, clang++]
+        preset: [dev, release]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake --preset ${{ matrix.preset }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+      - run: cmake --build --preset ${{ matrix.preset }} --parallel 2
+      - run: ctest --preset ${{ matrix.preset }}
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        preset: [asan-ubsan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up ThreadSanitizer shadow memory on the ephemeral runner
+        if: matrix.preset == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - run: cmake --preset ${{ matrix.preset }} -DCMAKE_CXX_COMPILER=g++
+      - run: cmake --build --preset ${{ matrix.preset }} --parallel 2
+      - run: ctest --preset ${{ matrix.preset }}
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: >-
+          cmake -S . -B build/fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTING=OFF -DNATHR_BUILD_FUZZERS=ON
+      - run: >-
+          cmake --build build/fuzz --parallel 2 --target
+          nathr_fuzz_safetensors nathr_fuzz_gguf nathr_fuzz_tokenizer nathr_fuzz_quant
+      - run: python3 reference/phase5_fuzz.py --build build/fuzz --work build/fuzz-smoke --seconds 10 --jobs 2
