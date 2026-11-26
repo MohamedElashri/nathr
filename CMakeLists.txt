@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(nathr VERSION 0.5.0 LANGUAGES CXX)
+project(nathr VERSION 0.6.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
     message(FATAL_ERROR "Nathr requires x86-64 Linux")
@@ -72,11 +72,21 @@ set(NATHR_TEST_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
 add_executable(nathr apps/nathr.cpp apps/batch.cpp apps/requests.cpp)
 file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-serve.py" INPUT "${CMAKE_CURRENT_SOURCE_DIR}/apps/serve.py")
+file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-data/model_store.py"
+    INPUT "${CMAKE_CURRENT_SOURCE_DIR}/apps/model_store.py")
+file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-data/models/manifest.json"
+    INPUT "${CMAKE_CURRENT_SOURCE_DIR}/models/manifest.json")
 foreach(asset IN ITEMS index.html app.css app.js)
     file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-web/${asset}"
         INPUT "${CMAKE_CURRENT_SOURCE_DIR}/apps/web/${asset}")
 endforeach()
-target_compile_definitions(nathr PRIVATE NATHR_VERSION="${PROJECT_VERSION}")
+if(IS_ABSOLUTE "${CMAKE_INSTALL_BINDIR}" OR IS_ABSOLUTE "${CMAKE_INSTALL_DATADIR}")
+    set(NATHR_BIN_TO_DATA "${CMAKE_INSTALL_FULL_DATADIR}/nathr")
+else()
+    file(RELATIVE_PATH NATHR_BIN_TO_DATA "/${CMAKE_INSTALL_BINDIR}" "/${CMAKE_INSTALL_DATADIR}/nathr")
+endif()
+target_compile_definitions(nathr PRIVATE NATHR_VERSION="${PROJECT_VERSION}"
+    NATHR_BIN_TO_DATA="${NATHR_BIN_TO_DATA}")
 target_link_libraries(nathr PRIVATE nathr::nathr)
 nathr_compile(nathr)
 if(BUILD_SHARED_LIBS AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}" AND
@@ -101,6 +111,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/nathrConfig.cmake"
 install(FILES third_party/json/LICENSE.MIT src/tokenizer/LICENSE.unicode src/quantization/LICENSE.ggml
     DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses")
 install(PROGRAMS setup.sh DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
+install(FILES apps/model_store.py DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
 install(FILES models/manifest.json DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr/models")
 
 set(CPACK_GENERATOR TGZ)

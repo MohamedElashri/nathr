@@ -1,5 +1,52 @@
 {
   "model": "HuggingFaceTB/SmolLM2-135M",
+  "default_checkpoint": "smollm2",
+  "checkpoints": [
+    {
+      "name": "smollm2",
+      "aliases": [
+        "instruct"
+      ],
+      "repository": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "description": "SmolLM2-135M-Instruct for chat"
+    },
+    {
+      "name": "gguf",
+      "repository": "QuantFactory/SmolLM2-135M-GGUF",
+      "file": "SmolLM2-135M.Q4_0.gguf",
+      "description": "Quantized SmolLM2-135M for text continuation"
+    },
+    {
+      "name": "safetensors",
+      "repository": "HuggingFaceTB/SmolLM2-135M",
+      "description": "Original SmolLM2-135M weights"
+    },
+    {
+      "name": "gpt2",
+      "repository": "openai-community/gpt2",
+      "description": "GPT-2 small for text continuation"
+    },
+    {
+      "name": "bert",
+      "repository": "google-bert/bert-base-uncased",
+      "description": "BERT base for hidden states"
+    },
+    {
+      "name": "t5",
+      "repository": "google-t5/t5-small",
+      "description": "T5 small for text-to-text generation"
+    },
+    {
+      "name": "minilm",
+      "repository": "sentence-transformers/paraphrase-MiniLM-L3-v2",
+      "description": "MiniLM for sentence embeddings"
+    },
+    {
+      "name": "tinybert",
+      "repository": "cross-encoder/ms-marco-TinyBERT-L2-v2",
+      "description": "TinyBERT for scoring text pairs"
+    }
+  ],
   "sources": [
     {
       "repository": "HuggingFaceTB/SmolLM2-135M",

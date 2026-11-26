@@ -686,12 +686,17 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
     cli::run_batch(Model::load(path, options), path, tokenizer, batch_options, io);
 }
 
-void serve(std::span<char*> options, bool help) {
+void launch_frontend(std::string_view action, std::span<char*> options, bool help) {
     const auto executable = std::filesystem::read_symlink("/proc/self/exe");
-    const auto script = executable.parent_path() / "nathr-serve.py";
+    const auto bin = executable.parent_path();
+    const auto script = bin / "nathr-serve.py";
     if (!std::filesystem::is_regular_file(script))
         throw Error(ErrorCode::io, "cannot find the installed nathr-serve.py beside nathr");
-    std::vector<std::string> arguments{"python3", "-I", script.string(), executable.string()};
+    auto data = bin / "nathr-data";
+    if (!std::filesystem::is_directory(data))
+        data = bin / NATHR_BIN_TO_DATA;
+    std::vector<std::string> arguments{
+        "python3", "-I", "-B", script.string(), executable.string(), data.string(), std::string(action)};
     if (help)
         arguments.emplace_back("--help");
     else
@@ -701,7 +706,7 @@ void serve(std::span<char*> options, bool help) {
         command.push_back(argument.data());
     command.push_back(nullptr);
     execvp(command.front(), command.data());
-    throw Error(ErrorCode::io, "cannot start Python 3 for nathr serve");
+    throw Error(ErrorCode::io, "cannot start Python 3 for nathr " + std::string(action));
 }
 
 long process_peak_rss_kib() {
@@ -833,6 +838,9 @@ struct CommandHelp {
 };
 
 constexpr CommandHelp commands[] = {
+    {"run", "Run a named or local model in the browser or terminal", "run [MODEL] [PROMPT]", ""},
+    {"models", "List pinned checkpoint names and cache status", "models", ""},
+    {"pull", "Download and verify a named checkpoint", "pull MODEL", ""},
     {"generate", "Continue a prompt or run chat messages",
      "generate MODEL (PROMPT | --stdin | --tokens IDS | --messages FILE)",
      "  --stdin                       Read one plain-text prompt through EOF.\n"
@@ -875,7 +883,7 @@ constexpr CommandHelp commands[] = {
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
      "  --stats                       Emit timings and KV stats after the batch drains.\n"},
-    {"serve", "Start the browser interface and local HTTP API", "serve MODEL", ""},
+    {"serve", "Start the browser interface and local HTTP API", "serve [MODEL]", ""},
     {"bench", "Measure decoder-only prefill and decode", "bench MODEL",
      "  --prompt-length N             Set the synthetic prompt length (default 128).\n"
      "  --decode-length N             Set the decode length (default 32).\n"
@@ -984,8 +992,8 @@ int main(int argc, char** argv) try {
     const auto* info = find_command(command);
     if (!info)
         invalid("unknown command: " + std::string(command));
-    if (command == "serve")
-        serve(arguments, help);
+    if (command == "serve" || command == "run" || command == "models" || command == "pull")
+        launch_frontend(command, arguments, help);
     if (help) {
         usage(info);
         return 0;

@@ -2,81 +2,70 @@
 
 Nathr runs small text Transformers locally. Chat, continue a prompt, or inspect model outputs in the browser. The same runtime is available from the CLI and as a C++ library. [How the engine works](docs/inference-engine.md)
 
-## Install the release
+## Quick start
 
-The prebuilt package targets Ubuntu 24.04 on x86-64. Install the runtime tools if needed.
+The installer is included in v0.6.0 and later. For v0.5.0, use the archive instructions for that release. [v0.5.0 installation guide](https://github.com/MohamedElashri/nathr/blob/v0.5.0/README.md#install-the-release)
 
-```sh
-sudo apt update
-sudo apt install ca-certificates curl libicu74 libstdc++6 python3
-```
-
-Download and verify the latest archive, then extract it into a new directory. [GitHub Releases](https://github.com/MohamedElashri/nathr/releases/latest)
+The prebuilt release targets Ubuntu 24.04 on x86-64. Install the runtime dependencies if needed.
 
 ```sh
-mkdir -p nathr
-cd nathr
-release=https://github.com/MohamedElashri/nathr/releases/latest/download
-curl -fLO "$release/nathr-linux-x86_64.tar.gz"
-curl -fLO "$release/nathr-linux-x86_64.tar.gz.sha256"
-sha256sum -c nathr-linux-x86_64.tar.gz.sha256 && \
-  tar -xzf nathr-linux-x86_64.tar.gz --strip-components=1
+sudo apt install curl ca-certificates python3 libicu74 libstdc++6
 ```
 
-## Start the browser app
-
-From the extracted directory, download the chat checkpoint (about 270 MB) and start Nathr.
+Download the installer and run Nathr. The installer verifies the archive and installs it for your user. [GitHub Releases](https://github.com/MohamedElashri/nathr/releases/latest)
 
 ```sh
-nathr=./bin/nathr
-get_model=./share/nathr/setup.sh
-"$get_model" --download-only --models-dir models/cache instruct
-chat_model=models/cache/SmolLM2-135M-Instruct
-"$nathr" serve "$chat_model"
+curl -fsSLO https://github.com/MohamedElashri/nathr/releases/latest/download/install.sh
+bash install.sh
+export PATH="$HOME/.local/bin:$PATH"
+nathr run
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) and enter a message. The available modes depend on the loaded checkpoint. The server stays in this terminal until you press Ctrl+C.
+On first run, Nathr downloads and verifies SmolLM2-Instruct (about 270 MB). It opens the app when a desktop browser is available. You can also open the local URL printed in the terminal. Press Ctrl+C to stop the app.
 
-## Choose a checkpoint
+To update, download and rerun the installer. Checkpoints are reused from the same cache. To install offline, download the archive and its adjacent checksum from the release and pass the archive to `bash install.sh --archive FILE`.
 
-Pass a GGUF file or a directory containing `config.json` and `model.safetensors` as `MODEL`. Text input for Safetensors also needs `tokenizer.json`. The downloader verifies pinned files before use. [Pinned revisions and SHA-256 hashes](models/manifest.json) · [Supported configurations](docs/inference-engine.md#checkpoint-support-and-limits)
+## Run a model
 
-| Downloader selection | Path under `models/cache/` | Use |
-| --- | --- | --- |
-| `gguf` | `SmolLM2-135M.Q4_0.gguf` | Text continuation |
-| `safetensors` | `SmolLM2-135M` | Text continuation with the original weights |
-| `instruct` | `SmolLM2-135M-Instruct` | Chat |
-| `gpt2` | `gpt2` | Text continuation |
-| `t5` | `t5-small` | Text-to-text generation |
-| `bert` | `bert-base-uncased` | Hidden states and pooler output |
-| `minilm` | `paraphrase-MiniLM-L3-v2` | Sentence embeddings |
-| `tinybert` | `ms-marco-TinyBERT-L2-v2` | Text-pair scores |
+```sh
+nathr models
+nathr run smollm2 "What is the capital of France?"
+nathr run minilm
+nathr run ./model.gguf
+```
 
-Use `"$get_model" --download-only --models-dir models/cache CHECKPOINT` to fetch another model. Restart the server with its path to use it in the browser. The `all` selection fetches both base SmolLM2 formats.
+`run` with a prompt prints generated text in the terminal. Without a prompt, it opens the browser app for the selected checkpoint, including encoder models such as MiniLM. Use `--no-open` to print the browser address without launching it. The `serve` command starts the same app and HTTP API on port 8000 by default.
+
+Named checkpoints download on first use and share a cache at `${XDG_CACHE_HOME:-$HOME/.cache}/nathr`. Use `NATHR_MODELS` or `--models-dir` to choose another cache. Use `nathr pull NAME` to prefetch a checkpoint and print its local path.
+
+You can also pass a local GGUF file or a Safetensors directory containing `config.json` and `model.safetensors`. Built-in text input for Safetensors also uses `tokenizer.json`. [Checkpoint catalog](models/manifest.json) · [Supported configurations](docs/inference-engine.md#checkpoint-support-and-limits)
 
 ## CLI reference
 
 ```sh
-"$nathr" --help
-"$nathr" generate --help
-"$nathr" help serve
+nathr --help
+nathr generate --help
+nathr help serve
 ```
 
 | Command | Use |
 | --- | --- |
+| `run [MODEL] [PROMPT]` | Open the browser app or run one prompt. Uses `smollm2` by default. |
+| `models` | List pinned checkpoint names and show which are cached. |
+| `pull MODEL` | Download a pinned checkpoint and print its path. |
 | `inspect MODEL --summary` | See checkpoint capabilities and output names. The default output is JSON. |
 | `generate MODEL PROMPT` | Generate from text, `--stdin`, `--tokens IDS`, or `--messages FILE`. Add `--json` for token IDs and the finish reason. |
 | `infer MODEL PROMPT --output NAME` | Return a named tensor as JSON. Accepts plain text from `--stdin` or raw IDs from `--tokens IDS`. |
 | `tokenize MODEL PROMPT` | Return token IDs. Use `--tokens IDS` to decode or `--stdin` to read one JSON string per line. |
 | `batch MODEL` | Run JSONL generation and tensor requests with one loaded checkpoint. |
-| `serve MODEL` | Start the browser interface and HTTP API on loopback. |
+| `serve [MODEL]` | Start the browser interface and HTTP API on loopback. |
 | `bench MODEL` | Measure decoder-only prefill and decode. |
 | `encode MODEL PROMPT` | Return BERT hidden states as JSON rows. |
 | `forward MODEL --tokens IDS` | Inspect decoder-only logits and intermediate activations. |
 
 Use `--model PATH` and `--prompt TEXT` for named arguments. Token lists use commas, as in `--tokens '1, 7, 2'`. Place `--` before a positional prompt that starts with `--`.
 
-Execution commands default to one CPU thread and the scalar backend. Use `--backend auto` to select available CPU kernels, `--threads N` to set the thread count, or `--backend avx2` to require AVX2. The server defaults to `auto`.
+Execution commands default to one CPU thread and the scalar backend. Use `--backend auto` to select available CPU kernels, `--threads N` to set the thread count, or `--backend avx2` to require AVX2. The `run` and `serve` commands default to `auto`.
 
 ## CLI examples
 
@@ -85,12 +74,11 @@ Execution commands default to one CPU thread and the scalar backend. Use `--back
 Download the smaller SmolLM2 GGUF checkpoint for text continuation.
 
 ```sh
-"$get_model" --download-only --models-dir models/cache gguf
-model=models/cache/SmolLM2-135M.Q4_0.gguf
-"$nathr" inspect "$model" --summary
-"$nathr" tokenize "$model" "Once upon a time"
+model=$(nathr pull gguf)
+nathr inspect "$model" --summary
+nathr tokenize "$model" "Once upon a time"
 printf '%s' 'Once upon a time' |
-    "$nathr" generate "$model" --stdin --sample --seed 7 --top-k 40 --max-new-tokens 8 --backend auto
+    nathr generate "$model" --stdin --sample --seed 7 --top-k 40 --max-new-tokens 8 --backend auto
 ```
 
 Use `--greedy` for highest-score selection or `--sample` with `--temperature`, `--top-k`, and `--top-p` to control sampling. Add repeatable `--stop TEXT` or comma-separated `--stop-ids IDS` to end generation early. `--stdin` in `generate` and `infer` reads a single plain-text prompt through EOF and preserves line breaks.
@@ -100,15 +88,14 @@ For a checkpoint with an external tokenizer, use `generate MODEL --tokens IDS --
 The same command runs T5 with a source prompt.
 
 ```sh
-"$get_model" --download-only --models-dir models/cache t5
-"$nathr" generate models/cache/t5-small "translate English to German: The sky is blue." \
-  --greedy --max-new-tokens 12 --backend auto
+nathr run t5 "translate English to German: The sky is blue." --max-new-tokens 12
 ```
 
 ### Run chat in the terminal
 
 ```sh
-"$nathr" generate "$chat_model" --messages - --greedy --max-new-tokens 16 --backend auto <<'JSON'
+chat_model=$(nathr pull smollm2)
+nathr generate "$chat_model" --messages - --greedy --max-new-tokens 16 --backend auto <<'JSON'
 [
   {"role":"user","content":"What is the capital of France?"},
   {"role":"assistant","content":"Paris."},
@@ -122,10 +109,9 @@ Use `--messages FILE` to read the same JSON array from disk. Messages can begin 
 ### Request a named output
 
 ```sh
-"$get_model" --download-only --models-dir models/cache minilm
-embedding_model=models/cache/paraphrase-MiniLM-L3-v2
-"$nathr" inspect "$embedding_model" --summary
-"$nathr" infer "$embedding_model" "The sky is blue." --output sentence_embedding --backend auto
+embedding_model=$(nathr pull minilm)
+nathr inspect "$embedding_model" --summary
+nathr infer "$embedding_model" "The sky is blue." --output sentence_embedding --backend auto
 ```
 
 `infer` returns `output`, `shape`, and flat row-major `values`. Use `--text-pair TEXT` for a BERT text pair, `--token-type-ids IDS` for segment IDs with raw tokens, or `--decoder-tokens IDS` for a T5 decoder prefix. Use `--tokenizer FILE` with a GGUF checkpoint that needs a matching external tokenizer.
@@ -135,7 +121,7 @@ embedding_model=models/cache/paraphrase-MiniLM-L3-v2
 Each input line supplies an ID and one input. Generation lines emit `token` and `done` events. A line with `output` returns a `result` event with a named tensor.
 
 ```sh
-"$nathr" batch "$model" --backend auto --stats <<'JSONL'
+nathr batch "$model" --backend auto --stats <<'JSONL'
 {"id":1,"prompt":"Once upon a time","max_new_tokens":8}
 {"id":2,"tokens":[6403,1980,253,655],"max_new_tokens":4,"greedy":false,"top_k":10,"seed":7}
 JSONL
@@ -146,14 +132,20 @@ Text input also emits decoded fragments. Send `{"cancel":2}` to cancel a pending
 ### Benchmark a decoder
 
 ```sh
-"$nathr" bench "$model" --prompt-length 16 --decode-length 4 --warmups 1 --repetitions 3 --backend auto
+nathr bench "$model" --prompt-length 16 --decode-length 4 --warmups 1 --repetitions 3 --backend auto
 ```
 
 The JSON report includes prefill and decode throughput, inter-token timings, and KV memory.
 
 ## Serve over HTTP
 
-With the server running, send a request from another terminal.
+Start the server for a known API address.
+
+```sh
+nathr serve
+```
+
+Send a request from another terminal.
 
 ```sh
 curl -fsS http://127.0.0.1:8000/model
@@ -178,15 +170,14 @@ Set `"stream":true` on a generation request for server-sent events. Embeddings a
 
 ### Prerequisites
 
-Build on x86-64 Linux with CMake 3.25+, Ninja, GCC 12+ or Clang 16+, and ICU 70+ development libraries (`libicu-dev` on Debian or Ubuntu). The setup script uses Git, Bash, Python 3, `curl`, `sha256sum`, and `flock`. Serving requires Python 3.10+.
+Build on x86-64 Linux with CMake 3.25+, Ninja, GCC 12+ or Clang 16+, and ICU 70+ development libraries (`libicu-dev` on Debian or Ubuntu). Source setup uses Git, Bash, Python 3.10+, `curl`, and `flock`.
 
 ```sh
 git clone https://github.com/MohamedElashri/nathr.git
 cd nathr
 ./setup.sh instruct
-nathr=./build/release/nathr
-get_model=./setup.sh
-"$nathr" serve models/cache/SmolLM2-135M-Instruct
+export PATH="$PWD/build/release:$PATH"
+nathr run --models-dir models/cache
 ```
 
 To build with an existing checkpoint, run `cmake --preset release`, `cmake --build --preset release`, and `ctest --preset release` from the source tree.
@@ -198,6 +189,8 @@ To install into a local prefix, run `cmake --install build/release --prefix "$PW
 From the source tree, run the checker after downloading the named checkpoints. It checks file hashes, token IDs, tensor values, and generation where supported.
 
 ```sh
+nathr pull gguf --models-dir models/cache
+nathr pull smollm2 --models-dir models/cache
 python3 tests/compatibility.py gguf instruct
 python3 tests/compatibility.py gguf --measure --threads 2 --repetitions 3
 ```

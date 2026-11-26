@@ -224,6 +224,19 @@ def chat_stdin(binary, checkpoint):
     assert len(result["prompt_ids"]) == 15 and result["emitted"] == 1
 
 
+def user_commands(binary, checkpoint, directory):
+    output = subprocess.check_output([binary, "models", "--models-dir", directory], text=True, timeout=10)
+    assert "smollm2" in output and "available" in output and "(default)" in output
+    result = subprocess.run([binary, "pull", "unknown", "--models-dir", directory],
+                            text=True, capture_output=True, timeout=10)
+    assert result.returncode != 0 and "nathr models" in result.stderr
+    reply = subprocess.check_output([binary, "run", checkpoint, "bbbb", "--max-new-tokens", "4"],
+                                    text=True, timeout=10)
+    expected = subprocess.check_output([binary, "generate", checkpoint, "--messages", "-", "--max-new-tokens", "4"],
+                                       input=json.dumps([{"role": "user", "content": "bbbb"}]), text=True, timeout=10)
+    assert reply == expected
+
+
 if __name__ == "__main__":
     executable, fixtures = map(Path, sys.argv[1:])
     help_text = subprocess.check_output([executable, "help", "serve"], text=True, timeout=10)
@@ -234,4 +247,5 @@ if __name__ == "__main__":
         http_checks(executable, checkpoint, fixtures / "bert")
         stalled_consumer(executable, checkpoint)
         chat_stdin(executable, checkpoint)
+        user_commands(executable, checkpoint, checkpoint / "empty cache")
         checkpoint_defaults(executable, checkpoint)

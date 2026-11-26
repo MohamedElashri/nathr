@@ -255,7 +255,7 @@ Choose a checkpoint that differs in vocabulary size, head geometry, or context. 
 
 For an architecture with different layer equations, add the configuration and weight binding rules alongside its forward pass. Define any additional state the session must carry. Reuse the tensor readers, sampling loop, and kernels whose interfaces still fit. Validate the new forward pass on a tiny fixture, then compare its uncached and cached outputs before testing a long continuation.
 
-Nathr's GPT-2 decoder follows this pattern. It binds learned position embeddings and affine LayerNorm weights, transposes the stored projections once when it loads the checkpoint, and splits a combined projection into queries, keys, and values. The session requests workspace from the decoder and supplies the same KV cache to both architectures. [Decoder interface](../src/models/decoder.hpp) · [GPT-2 implementation](../src/models/gpt2/model.cpp) · [Download GPT-2 small](../README.md#choose-a-checkpoint)
+Nathr's GPT-2 decoder follows this pattern. It binds learned position embeddings and affine LayerNorm weights, transposes the stored projections once when it loads the checkpoint, and splits a combined projection into queries, keys, and values. The session requests workspace from the decoder and supplies the same KV cache to both architectures. [Decoder interface](../src/models/decoder.hpp) · [GPT-2 implementation](../src/models/gpt2/model.cpp) · [Run a named checkpoint](../README.md#run-a-model)
 
 ### Add an encoder and cross-attention
 

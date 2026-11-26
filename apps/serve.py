@@ -7,8 +7,10 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import os
 from pathlib import Path
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -622,15 +624,75 @@ def bounded(low, high):
     return parse
 
 
-def main(executable, args):
-    parser = argparse.ArgumentParser(prog="nathr serve",
-                                     description="Start the browser interface and HTTP API on 127.0.0.1.",
+def run_prompt(worker, options):
+    metadata = worker.metadata
+    if not metadata["generation"]:
+        raise RequestError("this checkpoint returns named tensors. Run without a prompt to use the browser")
+    if not metadata["text"]:
+        raise RequestError("this checkpoint needs a tokenizer for text input")
+    maximum = min(metadata["max_new_tokens"], options.max_output_tokens)
+    count = options.max_new_tokens if options.max_new_tokens is not None else maximum
+    if count > options.max_output_tokens:
+        raise RequestError("--max-new-tokens exceeds --max-output-tokens")
+    value = {"max_new_tokens": count}
+    if metadata["chat"]:
+        value["messages"] = [{"role": "user", "content": options.prompt}]
+    else:
+        value["prompt"] = options.prompt
+    request = worker.submit(value)
+    deadline = time.monotonic() + options.request_timeout
+    try:
+        while (remaining := deadline - time.monotonic()) > 0:
+            event = worker.take(request, remaining)
+            if event is None:
+                break
+            if event["event"] == "error" or event.get("reason") == "error":
+                raise RequestError(event.get("message", "inference failed"))
+            if text := event.get("text"):
+                print(text, end="", flush=True)
+            if event["event"] == "done":
+                print()
+                return
+        raise RequestError("inference deadline exceeded")
+    finally:
+        worker.cancel(request)
+
+
+def start_browser(url):
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        if launcher := shutil.which("xdg-open"):
+            try:
+                subprocess.Popen([launcher, url], start_new_session=True, stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as error:
+                print(f"Could not open the browser: {error}", file=sys.stderr)
+
+
+def main(executable, directory, mode, args):
+    sys.path.insert(0, directory)
+    from model_store import ModelStore, command as model_command
+
+    if mode in ("models", "pull"):
+        model_command(mode, args)
+        return
+    run = mode == "run"
+    parser = argparse.ArgumentParser(prog=f"nathr {mode}",
+                                     description=("Open the local browser app or run one prompt." if run else
+                                                  "Start the browser interface and HTTP API on 127.0.0.1."),
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter, allow_abbrev=False)
-    model = parser.add_mutually_exclusive_group(required=True)
-    model.add_argument("model", nargs="?", metavar="MODEL", help="GGUF file or Safetensors checkpoint directory")
+    model = parser.add_mutually_exclusive_group()
+    model.add_argument("model", nargs="?", metavar="MODEL",
+                       help="checkpoint name or local path. Uses smollm2 when omitted")
     model.add_argument("--model", dest="model_path", metavar="PATH", help="path to the checkpoint")
+    parser.add_argument("--models-dir", help="cache directory for named checkpoints (overrides NATHR_MODELS)")
+    if run:
+        parser.add_argument("prompt", nargs="?", help="one prompt to run in the terminal")
+        parser.add_argument("--prompt", dest="prompt_text", help="run a prompt with the default model")
+        parser.add_argument("--no-open", action="store_true", help="print the browser address without opening it")
+        parser.add_argument("--max-new-tokens", type=bounded(0, 8192), help="limit tokens for a terminal prompt")
     parser.add_argument("--model-id", help="API model ID, otherwise the checkpoint filename or directory name")
-    parser.add_argument("--port", type=bounded(0, 65535), default=8000, help="HTTP port, or 0 for an available port")
+    parser.add_argument("--port", type=bounded(0, 65535), default=0 if run else 8000,
+                        help="HTTP port, or 0 for an available port")
     parser.add_argument("--backend", choices=("scalar", "auto", "avx2"), default="auto", help="CPU kernels")
     parser.add_argument("--threads", type=bounded(1, 64), default=1, help="CPU threads")
     parser.add_argument("--tokenizer", help="matching GGUF tokenizer sidecar")
@@ -655,11 +717,18 @@ def main(executable, args):
     limits.add_argument("--io-timeout", type=bounded(1, 60), default=5, help="socket I/O timeout in seconds")
     limits.add_argument("--request-timeout", type=bounded(1, 600), default=120, help="inference timeout in seconds")
     options = parser.parse_args(args)
-    options.model = options.model if options.model is not None else options.model_path
+    if run:
+        if options.prompt is not None and options.prompt_text is not None:
+            parser.error("pass one prompt")
+        if options.prompt_text is not None:
+            options.prompt = options.prompt_text
+        if options.max_new_tokens is not None and options.prompt is None:
+            parser.error("--max-new-tokens requires a terminal prompt")
     if options.max_active > options.step_tokens:
         parser.error("--step-tokens must cover all active slots")
-    options.model_id = options.model_id or Path(options.model).resolve().name
-    command = [executable, "batch", "--model", options.model, "--ready"]
+    model_path, model_id = ModelStore(options.models_dir).resolve(options.model or options.model_path)
+    options.model_id = options.model_id or model_id
+    command = [executable, "batch", "--model", str(model_path), "--ready"]
     for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens", "max_queued",
                  "max_queued_tokens", "kv_budget_mib", "kv_cache", "tokenizer", "max_result_values"):
         if (value := getattr(options, name)) is not None:
@@ -667,8 +736,14 @@ def main(executable, args):
     worker = Worker(command, options)
     try:
         worker.start()
+        if run and options.prompt is not None:
+            run_prompt(worker, options)
+            return
         with Server(worker, options) as server:
-            print(f"Listening on http://127.0.0.1:{server.server_address[1]}", flush=True)
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            print(f"Listening on {url}", flush=True)
+            if run and not options.no_open:
+                start_browser(url)
             server.serve_forever()
     finally:
         worker.close()
@@ -679,8 +754,8 @@ if __name__ == "__main__":
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
     try:
-        main(sys.argv[1], sys.argv[2:])
+        main(*sys.argv[1:4], sys.argv[4:])
     except KeyboardInterrupt:
         pass
-    except (OSError, RuntimeError, RequestError) as error:
+    except (OSError, RuntimeError, ValueError, RequestError) as error:
         sys.exit(f"nathr: {error}")
