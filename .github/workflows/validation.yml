@@ -61,6 +61,17 @@ jobs:
       - name: Record release timings on the controlled runner
         if: inputs.tier == 'release'
         run: |
+          (
+            cd "$NATHR_CACHE" || exit
+            sha256sum --check --strict <<'SHA256'
+          991ed1cd6a2d40d6d0be3d8d0954b6178a91aa0caacc93fa472ded6eadeddff4  phase2-bin
+          ff9d045b98977aee583e309b4a35561055386dd7a4766d42eeb6cd18e969624e  phase2-probes
+          b3f492fd7cffa54a41e29c36a0bb034adfd98f64e3b76faa88c0db055611a9eb  phase3-baseline
+          SHA256
+          )
+          python3 reference/phase2_bench.py --binary "$NATHR_CACHE/phase2-bin" \
+            --probes "$NATHR_CACHE/phase2-probes" --controlled "$NATHR_CACHE/controlled" \
+            --cpu "$NATHR_ONE_CORE" --output build/validation/phase2-timing.json
           python3 reference/phase5_bench.py --binary build/release/nathr --native "$NATHR_CACHE/hf" \
             --controlled "$NATHR_CACHE/controlled" --output build/validation/sustained.json \
             --cpus "$NATHR_CORES" --warmups 2 --repetitions 7
@@ -73,13 +84,23 @@ jobs:
           from pathlib import Path
           work = Path('build/validation')
           report = json.loads((work / 'report.json').read_text())
+          slice_models = json.loads((work / 'phase2-timing.json').read_text())['models']
           timing = json.loads((work / 'matched.json').read_text())
           expected = ('blocked_vs_phase3_avx2', 'blocked_vs_repeated_prefill')
           models = timing['models']
-          if not report['avx2_tested'] or set(models) != {'f32', 'Q4_0', 'Q8_0'} or not all(
+          failures = []
+          if not report['avx2_tested']:
+              failures.append('AVX2 validation')
+          if set(slice_models) != {'Q4_0', 'Q8_0'} or not all(
+              item['performance_passed'] for item in slice_models.values()
+          ):
+              failures.append('Phase 2 scalar / AVX2 timing')
+          if set(models) != {'f32', 'Q4_0', 'Q8_0'} or not all(
               item[key]['performance_passed'] for item in models.values() for key in expected
           ):
-              raise SystemExit('Required ISA or matched timing gate failed')
+              failures.append('Phase 4 matched timing')
+          if failures:
+              raise SystemExit('Required release gates failed: ' + ', '.join(failures))
           PY
       - uses: actions/upload-artifact@v4
         if: always()

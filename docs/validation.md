@@ -13,7 +13,9 @@ python reference/phase5_verify.py --binary build/release/nathr --tests build/rel
   --ggml-bridge "$GGML_BRIDGE" --work fixtures/local/validation
 ```
 
-Prepare the manual runner with a local wheel cache at `uv-cache/`, native `hf/`, published `models/`, `controlled/`, `extended/`, and the untied fixture. Set `NATHR_VALIDATION_CACHE` to that parent directory. Place the pinned llama.cpp archive extraction at `llama-source/` with its compiled `llama-probe` and `ggml-blocks.so` beside it. For release-tier timing, retain the verified `phase3-baseline` executable there and provide `NATHR_VALIDATION_CORES`, `NATHR_VALIDATION_SMT_CORES`, and `NATHR_VALIDATION_ONE_CORE` as explicit Linux CPU lists for the controlled runner.
+Prepare the manual runner with a local wheel cache at `uv-cache/`, native `hf/`, published `models/`, `controlled/`, `extended/`, and the untied fixture. Set `NATHR_VALIDATION_CACHE` to that parent directory. Place the pinned llama.cpp archive extraction at `llama-source/` with its compiled `llama-probe` and `ggml-blocks.so` beside it.
+
+For release-tier timing, cache the original Phase 2 benchmark executable and component probe as `phase2-bin` and `phase2-probes`, and retain the original Phase 3 executable as `phase3-baseline`. The workflow verifies all three hashes before benchmarking and requires both the Phase 2 scalar/AVX2 gate and the Phase 4 matched gate. Set `NATHR_VALIDATION_CORES` and `NATHR_VALIDATION_SMT_CORES` to the Linux CPU lists for the controlled runner, and set `NATHR_VALIDATION_ONE_CORE` to a single pinned logical CPU.
 
 The release tier also fills a real Q4_0 session to 8,192 tokens with FP16 KV. To reproduce it locally, run the same model with an 8,191-token prefill followed by one append. This prefill took about 79 minutes on the local Phase 5 machine.
 
