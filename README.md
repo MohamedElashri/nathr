@@ -1,29 +1,31 @@
 # Nathr
 
-Nathr runs small text Transformers locally. Chat, continue a prompt, or inspect model outputs in the browser. The same runtime is available from the CLI and as a C++ library. [How the engine works](docs/inference-engine.md)
-
+Nathr runs small text Transformers locally. Chat, continue a prompt, or inspect model outputs in the browser. The same runtime is available from the CLI and as a C++ library.
 ## Quick start
 
-The installer is included in v0.6.0 and later. For v0.5.0, use the archive instructions for that release. [v0.5.0 installation guide](https://github.com/MohamedElashri/nathr/blob/v0.5.0/README.md#install-the-release)
+The prebuilt release targets Ubuntu 24.04 on x86-64. Have Bash, Python 3.10+, `ca-certificates`, `libicu74`, `libstdc++6`, `coreutils`, `tar`, and `flock` from `util-linux` available. Use `curl` or `wget` to fetch the installer. If you install the v0.6.0 release, have `curl` available for model downloads.
 
-The prebuilt release targets Ubuntu 24.04 on x86-64. Install the runtime dependencies if needed.
+Run the installer as your regular user. It verifies the release and downloads the default chat model (about 270 MB). Have `$HOME/.local/bin` on PATH so you can run `nathr` in the same terminal. If needed, run `export PATH="$HOME/.local/bin:$PATH"` first. [GitHub Releases](https://github.com/MohamedElashri/nathr/releases/latest)
 
 ```sh
-sudo apt install curl ca-certificates python3 libicu74 libstdc++6
+curl -fsSL https://raw.githubusercontent.com/MohamedElashri/nathr/main/install.sh | bash
 ```
 
-Download the installer and run Nathr. The installer verifies the archive and installs it for your user. [GitHub Releases](https://github.com/MohamedElashri/nathr/releases/latest)
+Or fetch the same script with `wget`.
 
 ```sh
-curl -fsSLO https://github.com/MohamedElashri/nathr/releases/latest/download/install.sh
-bash install.sh
-export PATH="$HOME/.local/bin:$PATH"
+wget -qO- https://raw.githubusercontent.com/MohamedElashri/nathr/main/install.sh | bash
+```
+
+Then start Nathr from the same terminal.
+
+```sh
 nathr run
 ```
 
-On first run, Nathr downloads and verifies SmolLM2-Instruct (about 270 MB). It opens the app when a desktop browser is available. You can also open the local URL printed in the terminal. Press Ctrl+C to stop the app.
+`nathr run` opens the app when a desktop browser is available. You can also open the local URL printed in the terminal. Press Ctrl+C to stop the app.
 
-To update, download and rerun the installer. Checkpoints are reused from the same cache. To install offline, download the archive and its adjacent checksum from the release and pass the archive to `bash install.sh --archive FILE`.
+To update, rerun the install command. Nathr reuses cached checkpoints. Append `-s -- --no-model` after `bash` to defer downloading the model until `nathr run`. To install offline, download the archive and its checksum and pass the archive to `bash install.sh --archive FILE`.
 
 ## Run a model
 
@@ -38,7 +40,7 @@ nathr run ./model.gguf
 
 Named checkpoints download on first use and share a cache at `${XDG_CACHE_HOME:-$HOME/.cache}/nathr`. Use `NATHR_MODELS` or `--models-dir` to choose another cache. Use `nathr pull NAME` to prefetch a checkpoint and print its local path.
 
-You can also pass a local GGUF file or a Safetensors directory containing `config.json` and `model.safetensors`. Built-in text input for Safetensors also uses `tokenizer.json`. [Checkpoint catalog](models/manifest.json) · [Supported configurations](docs/inference-engine.md#checkpoint-support-and-limits)
+You can also pass a local GGUF file or a Safetensors directory containing `config.json` and `model.safetensors`. Built-in text input for Safetensors also uses `tokenizer.json`.
 
 ## CLI reference
 
@@ -170,7 +172,7 @@ Set `"stream":true` on a generation request for server-sent events. Embeddings a
 
 ### Prerequisites
 
-Build on x86-64 Linux with CMake 3.25+, Ninja, GCC 12+ or Clang 16+, and ICU 70+ development libraries (`libicu-dev` on Debian or Ubuntu). Source setup uses Git, Bash, Python 3.10+, `curl`, and `flock`.
+Build on x86-64 Linux with CMake 3.25+, Ninja, GCC 12+ or Clang 16+, and ICU 70+ development libraries (`libicu-dev` on Debian or Ubuntu). Source setup uses Git, Bash, Python 3.10+, `curl` or `wget`, and `flock`.
 
 ```sh
 git clone https://github.com/MohamedElashri/nathr.git
@@ -182,8 +184,7 @@ nathr run --models-dir models/cache
 
 To build with an existing checkpoint, run `cmake --preset release`, `cmake --build --preset release`, and `ctest --preset release` from the source tree.
 
-To install into a local prefix, run `cmake --install build/release --prefix "$PWD/build/install"` and use `./build/install/bin/nathr`. CMake consumers can use `find_package(nathr CONFIG REQUIRED)` and link `nathr::nathr`. [C++ consumer example](tests/consumer)
-
+To install into a local prefix, run `cmake --install build/release --prefix "$PWD/build/install"` and use `./build/install/bin/nathr`. CMake consumers can use `find_package(nathr CONFIG REQUIRED)` and link `nathr::nathr`.
 ### Check model compatibility
 
 From the source tree, run the checker after downloading the named checkpoints. It checks file hashes, token IDs, tensor values, and generation where supported.
@@ -195,4 +196,4 @@ python3 tests/compatibility.py gguf instruct
 python3 tests/compatibility.py gguf --measure --threads 2 --repetitions 3
 ```
 
-Use `all` to check every setup checkpoint. [Reference values and measurement details](docs/inference-engine.md#run-the-checks-with-nathr)
+Use `all` to check every setup checkpoint.

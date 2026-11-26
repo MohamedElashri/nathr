@@ -30,18 +30,24 @@ def checksum_matches(path, expected):
 
 
 def download(path, checksum, url):
-    if not shutil.which("curl"):
-        raise RuntimeError("curl is required to download a checkpoint")
+    curl = shutil.which("curl")
+    wget = shutil.which("wget") if not curl else None
+    if not (curl or wget):
+        raise RuntimeError("curl or wget is required to download a checkpoint")
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".nathr-download-", delete=False) as stream:
         temporary = Path(stream.name)
     try:
         print(f"Downloading {path.name}", file=sys.stderr, flush=True)
-        progress = ["--progress-bar"] if sys.stderr.isatty() else ["--silent", "--show-error"]
-        result = subprocess.run(["curl", "--fail", "--location", "--retry", "3", *progress,
-                                 "--output", str(temporary), url])
+        if curl:
+            progress = ["--progress-bar"] if sys.stderr.isatty() else ["--silent", "--show-error"]
+            command = [curl, "--fail", "--location", "--retry", "3", *progress, "--output", str(temporary), url]
+        else:
+            progress = ["--show-progress"] if sys.stderr.isatty() else []
+            command = [wget, "--quiet", "--tries=3", *progress, "-O", str(temporary), url]
+        result = subprocess.run(command)
         if result.returncode:
-            raise RuntimeError(f"could not download {path.name} (curl exit {result.returncode})")
+            raise RuntimeError(f"could not download {path.name} (exit {result.returncode})")
         if not checksum_matches(temporary, checksum):
             raise RuntimeError(f"SHA-256 mismatch for {path.name}")
         temporary.replace(path)
