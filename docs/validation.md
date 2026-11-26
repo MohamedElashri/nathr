@@ -13,7 +13,7 @@ python reference/phase5_verify.py --binary build/release/nathr --tests build/rel
   --ggml-bridge "$GGML_BRIDGE" --work fixtures/local/validation
 ```
 
-Prepare the manual runner with a local wheel cache at `uv-cache/`, native `hf/`, published `models/`, `controlled/`, `extended/`, and the untied fixture. Set `NATHR_VALIDATION_CACHE` to that parent directory. Place the pinned llama.cpp archive extraction at `llama-source/` with its compiled `llama-probe` and `ggml-blocks.so` beside it.
+Use GitHub Actions Runner 2.327.1 or newer for the model workflow's Node 24 actions. Prepare the manual runner with a local wheel cache at `uv-cache/`, native `hf/`, published `models/`, `controlled/`, `extended/`, and the untied fixture. Set `NATHR_VALIDATION_CACHE` to that parent directory. Place the pinned llama.cpp archive extraction at `llama-source/` with its compiled `llama-probe` and `ggml-blocks.so` beside it. [Runner requirement](https://github.com/actions/upload-artifact/tree/v6)
 
 For release-tier timing, cache the original Phase 2 benchmark executable and component probe as `phase2-bin` and `phase2-probes`, and retain the original Phase 3 executable as `phase3-baseline`. The workflow verifies all three hashes before benchmarking and requires both the Phase 2 scalar/AVX2 gate and the Phase 4 matched gate. Set `NATHR_VALIDATION_CORES` and `NATHR_VALIDATION_SMT_CORES` to the Linux CPU lists for the controlled runner, and set `NATHR_VALIDATION_ONE_CORE` to a single pinned logical CPU.
 

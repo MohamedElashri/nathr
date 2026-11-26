@@ -4,8 +4,7 @@
   "unverified": [
     "Phase 2 stable matched timing",
     "Phase 4 stable matched timing",
-    "controlled release performance matrix and hosted model validation",
-    "GitHub-hosted C++ checks"
+    "controlled release performance matrix and hosted model validation"
   ],
   "correctness": {
     "binary_sha256": "396a6f34d143b600e5f621ad9a35a88c09fce8f0ddfa1064d94421871ee7b3fb",
@@ -3574,9 +3573,17 @@
       "release_gate_workflow_commit": "27bc6e8"
     },
     "actions": {
-      "cpp_run": "https://github.com/MohamedElashri/nathr/actions/runs/45735887951",
-      "cpp_outcome": "GitHub blocked runner startup because of an account payment or spending-limit issue",
-      "self_hosted_runner_count": 0
+      "self_hosted_runner_count": 0,
+      "initial_cpp_run": {
+        "url": "https://github.com/MohamedElashri/nathr/actions/runs/45735887951",
+        "outcome": "GitHub blocked runner startup because of an account payment or spending-limit issue"
+      },
+      "cpp_run": {
+        "url": "https://github.com/MohamedElashri/nathr/actions/runs/45736766992",
+        "head_sha": "25c9aaa811b8004e7fa9d5abc6698fbc6e0be953",
+        "conclusion": "success",
+        "successful_jobs": 7
+      }
     },
     "timing_scope": "serialized, pinned local retry on the same shared host",
     "phase2_matched_retry": {

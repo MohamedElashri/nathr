@@ -12,7 +12,7 @@ jobs:
         compiler: [g++, clang++]
         preset: [dev, release]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: cmake --preset ${{ matrix.preset }} -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
       - run: cmake --build --preset ${{ matrix.preset }} --parallel 2
       - run: ctest --preset ${{ matrix.preset }}
@@ -23,7 +23,7 @@ jobs:
       matrix:
         preset: [asan-ubsan, tsan]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Set up ThreadSanitizer shadow memory on the ephemeral runner
         if: matrix.preset == 'tsan'
         run: sudo sysctl vm.mmap_rnd_bits=28
@@ -34,7 +34,7 @@ jobs:
   fuzz-smoke:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: >-
           cmake -S . -B build/fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTING=OFF -DNATHR_BUILD_FUZZERS=ON
