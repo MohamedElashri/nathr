@@ -11,7 +11,6 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -26,7 +25,8 @@
 namespace {
 using namespace nathr;
 using namespace nathr::detail;
-const std::filesystem::path fixture = std::filesystem::path(NATHR_FIXTURES) / "phase1";
+const std::filesystem::path fixtures = NATHR_FIXTURES;
+const auto fixture = fixtures / "model";
 constexpr std::array<Token, 8> ids{1, 7, 2, 18, 0, 3, 21, 13};
 
 void expect(bool truth, std::string_view description) {
@@ -66,7 +66,7 @@ void kernels() {
     expect(std::bit_cast<std::uint32_t>(bf16_to_float(1)) == 0x10000u, "BF16 subnormal");
     expect(std::isinf(bf16_to_float(0x7f80)) && std::isnan(bf16_to_float(0x7fc0)), "BF16 specials");
 
-    const auto ref = read_json(fixture.parent_path() / "phase0/fp64.json", mib);
+    const auto ref = read_json(fixtures / "math.json", mib);
     const std::array x{1.0f, -2.0f, 3.0f};
     const std::array y{-3.0f, 2.0f, 4.0f};
     std::array<float, 1> dot{};
@@ -131,6 +131,31 @@ void kernels() {
     }
     Scalar::attention(config, 0, 0, nullptr, keys, values, query, attention, scores);
     expect(attention == std::array{1.0f, 2.0f, 0.0f, 1.0f, 2.0f, 0.0f}, "future positions are masked");
+
+    // Compare FP16 reads with FP32 cache entries rounded through the same half bits.
+    config.layers = 1;
+    config.head_dim = 66;
+    Cache rounded(config, 3), packed(config, 3, KvPrecision::f16);
+    constexpr std::uint16_t half_bits[] = {0x8000, 0x0001, 0x83ff, 0x0400, 0xb2a1, 0x3c00, 0x4355};
+    for (const bool value : {false, true}) {
+        for (std::size_t pos = 0; pos < 3; ++pos) {
+            auto full = rounded.row<float>(value, 0, 0, pos);
+            auto half = packed.row<std::uint16_t>(value, 0, 0, pos);
+            for (std::size_t d = 0; d < half.size(); ++d) {
+                half[d] = half_bits[(d + 3 * pos + value) % std::size(half_bits)];
+                full[d] = half_to_float(half[d]);
+            }
+        }
+    }
+    std::array<float, 132> packed_query{}, rounded_out{}, packed_out{};
+    std::array<float, 3> rounded_scores{}, packed_scores{};
+    for (std::size_t d = 0; d < packed_query.size(); ++d)
+        packed_query[d] = static_cast<float>(static_cast<int>(d % 19) - 9) / 16.f;
+    Scalar::attention(config, 0, 2, &rounded, {}, {}, packed_query, rounded_out, rounded_scores);
+    Scalar::attention(config, 0, 2, &packed, {}, {}, packed_query, packed_out, packed_scores);
+    expect(packed_out == rounded_out && packed_scores == rounded_scores,
+           "FP16 cached GQA matches exact reads");
+
     const std::array frequency{1.0f, 0.125f};
     for (std::size_t pos : {0, 1, 127, 8191}) {
         std::array q{1.0f, 0.0f, 0.0f, 1.0f};
@@ -446,7 +471,7 @@ void tokenizer_and_sampling() {
 }
 
 void gguf_layout() {
-    const auto golden = fixture.parent_path() / "phase2/tiny.f32.gguf";
+    const auto golden = fixtures / "tiny.gguf";
     const Gguf metadata(golden);
     expect(metadata.alignment() == 32 && metadata.records().size() == 20 && metadata.config().tied_embeddings,
            "GGUF inventory");
@@ -541,7 +566,7 @@ void packed_kernels() {
     expect(!select_kernel(static_cast<DType>(31), ExecutionPolicy::automatic, avx2_no_extras).dot,
            "unknown encoding");
     const auto features = cpu_features();
-    const auto golden = read_json(fixture.parent_path() / "phase2/blocks.json", mib);
+    const auto golden = read_json(fixtures / "quant/basic.json", mib);
     for (const auto type : {DType::q4_0, DType::q8_0}) {
         const auto& description = *encoding(type);
         const auto& entry = golden.at(description.name);
@@ -617,8 +642,8 @@ void packed_kernels() {
     }
 }
 
-void all_frozen_packed_encodings() {
-    const auto atlas = read_json(fixture.parent_path() / "phase3/blocks.json", mib);
+void packed_encodings() {
+    const auto atlas = read_json(fixtures / "quant/packed.json", mib);
     const auto features = cpu_features();
     for (const auto& format : encodings) {
         const auto scalar = scalar_kernel(format.type);
@@ -677,81 +702,6 @@ void all_frozen_packed_encodings() {
     }
 }
 
-void gguf_probes(const std::filesystem::path& path) {
-    Gguf file(path);
-    const auto config = file.config();
-    const auto embedding = file.take("token_embd.weight", {config.vocabulary, config.hidden});
-    const auto tied = file.records().find("output.weight");
-    const auto head = tied == file.records().end()
-                          ? embedding
-                          : file.take("output.weight", {config.vocabulary, config.hidden});
-    const auto down = file.take("blk.0.ffn_down.weight", {config.hidden, config.intermediate});
-    if (!executable_encoding(embedding.desc.dtype) || !executable_encoding(head.desc.dtype))
-        throw std::runtime_error("GGUF component probe expects executable embedding and output weights");
-    const auto kind = down.desc.dtype;
-    if (kind != DType::q4_0 && kind != DType::q8_0)
-        throw std::runtime_error("GGUF component probe expects a controlled Q4_0 or Q8_0 model");
-    const auto unpack = kind == DType::q4_0 ? unpack_block<DType::q4_0> : unpack_block<DType::q8_0>;
-    const auto width = encoding(kind)->bytes;
-    const auto blocks = std::min<std::size_t>(8192, down.bytes.size() / width);
-    std::array<float, 32> decoded{};
-    const std::vector<float> hidden(config.hidden, 0.015625f), intermediate(config.intermediate, -0.03125f);
-    std::vector<float> rows(config.hidden), logits(config.vocabulary);
-    double checksum = 0;
-    const auto measure = [&](const auto& run) {
-        std::array<double, 7> timings{};
-        for (int rep = -2; rep < 7; ++rep) {
-            const auto start = std::chrono::steady_clock::now();
-            run();
-            const auto end = std::chrono::steady_clock::now();
-            if (rep >= 0)
-                timings[rep] = std::chrono::duration<double, std::milli>(end - start).count();
-        }
-        return timings;
-    };
-    Json samples = {{"encoding", encoding(kind)->name},
-                    {"dequantized_blocks_per_sample", blocks},
-                    {"embeddings_per_sample", 2048},
-                    {"dequantization_ms", measure([&] {
-                         for (std::size_t i = 0; i < blocks; ++i) {
-                             unpack(down.bytes.data() + i * width, decoded.data());
-                             checksum += decoded[i % decoded.size()];
-                         }
-                     })},
-                    {"embedding_ms", measure([&] {
-                         for (std::size_t i = 0; i < 2048; ++i) {
-                             Scalar::embedding(embedding, (i * 7919) % config.vocabulary, rows);
-                             checksum += rows[i % rows.size()];
-                         }
-                     })}};
-    const auto features = cpu_features();
-    for (const auto policy : {ExecutionPolicy::scalar, ExecutionPolicy::avx2}) {
-        if (policy == ExecutionPolicy::avx2 && !features.avx2)
-            continue;
-        const auto ff = select_kernel(kind, policy, features);
-        const auto projection = select_kernel(head.desc.dtype, policy, features);
-        samples[policy == ExecutionPolicy::scalar ? "scalar" : "avx2"] = {
-            {"down_kernel", ff.name},
-            {"output_kernel", projection.name},
-            {"ffn_down_gemv_ms", measure([&] {
-                 linear_with(ff.dot, down, intermediate, rows);
-                 checksum += rows.back();
-             })},
-            {"output_projection_ms", measure([&] {
-                 linear_with(projection.dot, head, hidden, logits);
-                 checksum += logits.back();
-             })}};
-        const auto model = Model::load(path, {policy, 1});
-        const std::array<Token, 4> ids{1, 2, 3, 42};
-        const auto count = allocation_test(model, ids, 100);
-        expect(count == 0, "GGUF warmed compute allocated");
-        samples[policy == ExecutionPolicy::scalar ? "scalar" : "avx2"]["cpp_allocations"] = count;
-    }
-    expect(std::isfinite(checksum) && checksum != 0, "component output checksum");
-    samples["checksum"] = checksum;
-    std::cout << samples.dump(2) << std::endl;
-}
-
 void context_boundary(KvPrecision precision) {
     const auto model = Model::load(fixture / "f32");
     auto session = Session::create(model, 8192, 0, {precision, 16});
@@ -776,19 +726,6 @@ int main(int argc, char** argv) try {
     if (argc == 2 && std::string_view(argv[1]) == "--long") {
         context_boundary(KvPrecision::f32);
         context_boundary(KvPrecision::f16);
-    } else if (argc == 3 && std::string_view(argv[1]) == "--gguf-probes") {
-        gguf_probes(argv[2]);
-    } else if (argc == 3 && std::string_view(argv[1]) == "--real-allocations") {
-        const auto model = Model::load(argv[2], {ExecutionPolicy::automatic, 4});
-        std::array<Token, 128> prompt{};
-        for (std::size_t i = 0; i < prompt.size(); ++i)
-            prompt[i] = static_cast<Token>(17 + (i * 7919 + 12345) % (49152 - 17));
-        const auto count = allocation_test(model, prompt, 48702, {KvPrecision::f16, 16});
-        std::cout << "{\"cpp_allocations\":" << count << ",\"prefill_tokens\":128,\"append_tokens\":4}\n";
-        expect(count == 0, "real checkpoint post-warmup allocation count");
-        const auto f32_bytes = Session::create(model, 8192).memory().cache_bytes;
-        const auto f16_bytes = Session::create(model, 8192, 0, {KvPrecision::f16}).memory().cache_bytes;
-        expect(f32_bytes == 377487360 && f16_bytes == 188743680, "real checkpoint full-context cache");
     } else if (argc == 1) {
         kernels();
         parser();
@@ -797,7 +734,7 @@ int main(int argc, char** argv) try {
         tokenizer_and_sampling();
         gguf_layout();
         packed_kernels();
-        all_frozen_packed_encodings();
+        packed_encodings();
     } else {
         return 2;
     }

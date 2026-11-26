@@ -57,7 +57,7 @@ void tokenizer_paths(std::span<const std::uint8_t> input) {
         std::abort();
 
     static const auto tokenizer =
-        Tokenizer::load(std::filesystem::path(NATHR_FIXTURES) / "phase1/tokenizer.json");
+        Tokenizer::load(std::filesystem::path(NATHR_FIXTURES) / "model/tokenizer.json");
     try {
         const auto ids = tokenizer.encode(text);
         if (std::ranges::any_of(ids, [&](Token id) { return id >= tokenizer.vocabulary(); }))

@@ -14,7 +14,7 @@ function(assert_command status pattern)
     set(command_output "${output}" PARENT_SCOPE)
 endfunction()
 
-set(model "${NATHR_FIXTURES}/phase1/f32")
+set(model "${NATHR_FIXTURES}/model/f32")
 assert_command(0 "nathr [0-9]+\\.[0-9]+\\.[0-9]+" --version)
 assert_command(0 "--kv-cache" --help)
 assert_command(0 "--logits-f32" forward --help)

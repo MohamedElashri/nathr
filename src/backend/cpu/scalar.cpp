@@ -3,9 +3,11 @@
 #include "quantization/decoders.hpp"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <type_traits>
 
 namespace nathr::detail {
@@ -265,10 +267,25 @@ void Scalar::softmax(std::span<float> scores) {
 }
 
 namespace {
-template <class T>
+struct DecodedHalves {
+    std::array<float, 1u << 16> values;
+
+    DecodedHalves() noexcept {
+        for (std::size_t i = 0; i < values.size(); ++i)
+            values[i] = half_to_float(static_cast<std::uint16_t>(i));
+    }
+};
+
+const auto& decoded_half_values() {
+    // Shared by sessions. Initialize only when the first FP16 cache is read.
+    static const DecodedHalves table;
+    return table.values;
+}
+
+template <class T, class Decode>
 void attend(const ModelConfig& config, std::size_t layer, std::size_t position, Cache* cache,
             std::span<const float> keys, std::span<const float> values, std::span<const float> query,
-            std::span<float> output, std::span<float> scores) {
+            std::span<float> output, std::span<float> scores, Decode decode) {
     const auto width = config.head_dim;
     const auto kv_width = config.kv_heads * width;
     const auto group = config.query_heads / config.kv_heads;
@@ -284,12 +301,6 @@ void attend(const ModelConfig& config, std::size_t layer, std::size_t position, 
                     return (value ? values : keys).subspan(i * kv_width + kv * width, width);
             }
             return cache->row<T>(value, layer, kv, i);
-        };
-        const auto decode = [](T x) -> float {
-            if constexpr (std::is_same_v<T, float>)
-                return x;
-            else
-                return half_to_float(x);
         };
         for (std::size_t i = 0; i <= position; ++i) {
             const auto k = get(false, i);
@@ -317,10 +328,13 @@ void attend(const ModelConfig& config, std::size_t layer, std::size_t position, 
 void Scalar::attention(const ModelConfig& config, std::size_t layer, std::size_t position, Cache* cache,
                        std::span<const float> keys, std::span<const float> values,
                        std::span<const float> query, std::span<float> output, std::span<float> scores) {
-    if (cache && cache->precision == KvPrecision::f16)
-        attend<std::uint16_t>(config, layer, position, cache, keys, values, query, output, scores);
-    else
-        attend<float>(config, layer, position, cache, keys, values, query, output, scores);
+    if (cache && cache->precision == KvPrecision::f16) {
+        const auto& decoded = decoded_half_values();
+        attend<std::uint16_t>(config, layer, position, cache, keys, values, query, output, scores,
+                              [&decoded](std::uint16_t bits) { return decoded[bits]; });
+    } else {
+        attend<float>(config, layer, position, cache, keys, values, query, output, scores, std::identity{});
+    }
 }
 
 void Scalar::swiglu(std::span<float> gate, std::span<const float> up) {

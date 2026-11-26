@@ -41,4 +41,4 @@ jobs:
       - run: >-
           cmake --build build/fuzz --parallel 2 --target
           nathr_fuzz_safetensors nathr_fuzz_gguf nathr_fuzz_tokenizer nathr_fuzz_quant
-      - run: python3 reference/phase5_fuzz.py --build build/fuzz --work build/fuzz-smoke --seconds 10 --jobs 2
+      - run: python3 tests/run_fuzz.py build/fuzz

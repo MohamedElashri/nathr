@@ -1,5 +1,6 @@
 {
   "Q4_1": {
+    "type_id": 3,
     "blocks": [
       "003c018000000000000000000000000000000000",
       "00bc0000ffffffffffffffffffffffffffffffff",
@@ -22,6 +23,7 @@
     ]
   },
   "Q5_0": {
+    "type_id": 6,
     "blocks": [
       "003c0000000000000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffffffffffff",
@@ -44,6 +46,7 @@
     ]
   },
   "Q5_1": {
+    "type_id": 7,
     "blocks": [
       "003c01800000000000000000000000000000000000000000",
       "00bc0000ffffffffffffffffffffffffffffffffffffffff",
@@ -66,6 +69,7 @@
     ]
   },
   "Q2_K": {
+    "type_id": 10,
     "blocks": [
       "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c0180",
       "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00bc0000",
@@ -88,6 +92,7 @@
     ]
   },
   "Q3_K": {
+    "type_id": 11,
     "blocks": [
       "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c",
       "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00bc",
@@ -110,6 +115,7 @@
     ]
   },
   "Q4_K": {
+    "type_id": 12,
     "blocks": [
       "003c01800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bc0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -132,6 +138,7 @@
     ]
   },
   "Q5_K": {
+    "type_id": 13,
     "blocks": [
       "003c018000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bc0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -154,6 +161,7 @@
     ]
   },
   "Q6_K": {
+    "type_id": 14,
     "blocks": [
       "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003c",
       "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff00bc",
@@ -176,6 +184,7 @@
     ]
   },
   "IQ1_S": {
+    "type_id": 19,
     "blocks": [
       "003c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -198,6 +207,7 @@
     ]
   },
   "IQ1_M": {
+    "type_id": 29,
     "blocks": [
       "0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000c00030",
       "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff0fff0fffcfffbf",
@@ -220,6 +230,7 @@
     ]
   },
   "IQ2_XXS": {
+    "type_id": 16,
     "blocks": [
       "003c00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -242,6 +253,7 @@
     ]
   },
   "IQ2_XS": {
+    "type_id": 17,
     "blocks": [
       "003c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -264,6 +276,7 @@
     ]
   },
   "IQ2_S": {
+    "type_id": 22,
     "blocks": [
       "003c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -286,6 +299,7 @@
     ]
   },
   "IQ3_XXS": {
+    "type_id": 18,
     "blocks": [
       "003c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -308,6 +322,7 @@
     ]
   },
   "IQ3_S": {
+    "type_id": 21,
     "blocks": [
       "003c000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -330,6 +345,7 @@
     ]
   },
   "IQ4_NL": {
+    "type_id": 20,
     "blocks": [
       "003c00000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffff",
@@ -352,6 +368,7 @@
     ]
   },
   "IQ4_XS": {
+    "type_id": 23,
     "blocks": [
       "003c0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
       "00bcffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",

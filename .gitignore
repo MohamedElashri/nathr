@@ -1,5 +1,4 @@
 /build/
-/.venv-reference/
 /models/cache/
 /fixtures/local/
 /traces/local/

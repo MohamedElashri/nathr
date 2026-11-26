@@ -60,6 +60,7 @@ target_link_libraries(nathr_lib PUBLIC Threads::Threads)
 nathr_compile(nathr_lib)
 
 include(CTest)
+set(NATHR_TEST_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
 add_executable(nathr apps/nathr.cpp)
 target_compile_definitions(nathr PRIVATE NATHR_VERSION="${PROJECT_VERSION}")
@@ -88,15 +89,15 @@ install(FILES third_party/json/LICENSE.MIT src/tokenizer/LICENSE.unicode src/qua
     DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses")
 
 if(BUILD_TESTING)
-    add_executable(nathr_tests tests/phase1.cpp tests/allocation_counter.cpp)
-    target_compile_definitions(nathr_tests PRIVATE NATHR_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+    add_executable(nathr_tests tests/runtime.cpp tests/allocation_counter.cpp)
+    target_compile_definitions(nathr_tests PRIVATE NATHR_FIXTURES="${NATHR_TEST_FIXTURES}")
     target_include_directories(nathr_tests PRIVATE src)
     target_include_directories(nathr_tests SYSTEM PRIVATE third_party/json)
     target_link_libraries(nathr_tests PRIVATE nathr::nathr Threads::Threads)
     nathr_compile(nathr_tests)
     add_test(NAME nathr-fast COMMAND nathr_tests)
     add_test(NAME nathr-cli COMMAND ${CMAKE_COMMAND} -DNATHR_BIN=$<TARGET_FILE:nathr>
-        -DNATHR_FIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/fixtures -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake)
+        -DNATHR_FIXTURES=${NATHR_TEST_FIXTURES} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake)
     set_tests_properties(nathr-fast PROPERTIES LABELS fast)
     set_tests_properties(nathr-cli PROPERTIES LABELS fast)
     if(NOT NATHR_SANITIZER AND NOT NATHR_BUILD_FUZZERS AND
@@ -109,19 +110,13 @@ if(BUILD_TESTING)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/install.cmake)
         set_tests_properties(nathr-install PROPERTIES LABELS packaging)
     endif()
-
-    add_executable(nathr_phase4_probes EXCLUDE_FROM_ALL reference/phase4_probes.cpp)
-    target_include_directories(nathr_phase4_probes PRIVATE src)
-    target_include_directories(nathr_phase4_probes SYSTEM PRIVATE third_party/json)
-    target_link_libraries(nathr_phase4_probes PRIVATE nathr::nathr)
-    nathr_compile(nathr_phase4_probes)
 endif()
 
 if(NATHR_BUILD_FUZZERS)
     foreach(kind IN ITEMS safetensors gguf tokenizer quant)
         add_executable(nathr_fuzz_${kind} tests/fuzz.cpp)
         target_compile_definitions(nathr_fuzz_${kind} PRIVATE
-            NATHR_FUZZ_${kind} NATHR_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures")
+            NATHR_FUZZ_${kind} NATHR_FIXTURES="${NATHR_TEST_FIXTURES}")
         target_include_directories(nathr_fuzz_${kind} PRIVATE src)
         target_include_directories(nathr_fuzz_${kind} SYSTEM PRIVATE third_party/json)
         target_link_libraries(nathr_fuzz_${kind} PRIVATE nathr::nathr)
