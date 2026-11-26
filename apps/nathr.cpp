@@ -79,6 +79,8 @@ class Arguments {
         return std::move(*value);
     }
 
+    bool has(const std::string& key) const { return values_.contains(key); }
+
     void finish() const {
         if (!values_.empty())
             invalid("unknown option: " + values_.begin()->first);
@@ -246,7 +248,18 @@ Json model_info(const Model& model) {
         {"stored_parameters", m.stored_parameters},
         {"tensors", m.tensors},
         {"dtype_histogram", {{"F32", m.f32_tensors}, {"F16", m.f16_tensors}, {"BF16", m.bf16_tensors}}}};
-    if (model.architecture() == "gpt2") {
+    if (model.architecture() == "bert") {
+        info["architecture"] = model.architecture();
+        info["layer_norm_epsilon"] = c.rms_epsilon;
+        info.erase("bos_id");
+        info.erase("eos_id");
+        info.erase("tied_embeddings");
+    } else if (model.architecture() == "t5") {
+        info["architecture"] = model.architecture();
+        info["rms_epsilon"] = c.rms_epsilon;
+        info["decoder_start_id"] = c.bos;
+        info.erase("bos_id");
+    } else if (model.architecture() == "gpt2") {
         info["architecture"] = model.architecture();
         info["layer_norm_epsilon"] = c.rms_epsilon;
     } else {
@@ -254,6 +267,20 @@ Json model_info(const Model& model) {
         info["rms_epsilon"] = c.rms_epsilon;
     }
     return info;
+}
+
+void encode(Arguments& args, const std::filesystem::path& path, BackendOptions options) {
+    const auto ids = parse_tokens(args.required("--tokens"));
+    (void)args.flag("--json");
+    args.finish();
+    const auto model = Model::load(path, options);
+    const auto activations = model.encode(ids);
+    const auto width = model.config().hidden;
+    Json rows = Json::array();
+    for (std::size_t i = 0; i < ids.size(); ++i)
+        rows.push_back(std::span(activations).subspan(i * width, width));
+    std::cout << Json({{"tokens", ids}, {"hidden_size", width}, {"hidden_states", std::move(rows)}}).dump()
+              << '\n';
 }
 
 class TraceFile {
@@ -444,6 +471,7 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
     const auto max_tokens = number(args, "--max-new-tokens", std::size_t{32});
     const auto context = number(args, "--context", std::size_t{0});
     const auto seed = number(args, "--seed", std::uint64_t{0});
+    const auto decoder_flags = args.has("--kv-cache") || args.has("--prefill-chunk");
     const auto settings = session_options(args);
     const SamplingOptions sampling{args.flag("--greedy"), number(args, "--temperature", 1.0),
                                    number(args, "--top-k", std::size_t{0}), number(args, "--top-p", 1.0)};
@@ -452,6 +480,32 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
     const auto sidecar = args.option("--tokenizer").value_or("");
     args.finish();
     const auto model = Model::load(path, options);
+    if (model.architecture() == "t5") {
+        if (!tokens)
+            invalid("T5 requires source IDs via --tokens");
+        if (bos || decoder_flags || !sidecar.empty())
+            invalid("T5 accepts source IDs, sampling controls and --context");
+        const auto source = parse_tokens(*tokens);
+        const auto capacity = context ? context : std::max<std::size_t>(1, max_tokens);
+        if (max_tokens > capacity)
+            invalid("T5 generation budget exceeds decoder context");
+        auto session = T5Session::create(model, source, capacity, seed);
+        Sampler sampler(sampling, model.config().vocabulary);
+        std::vector<Token> emitted;
+        const auto result = nathr::generate(session, sampler, model.config().eos, max_tokens,
+                                            [&](Token token) { emitted.push_back(token); });
+        std::cout << Json({{"source_ids", source},
+                           {"generated_ids", emitted},
+                           {"emitted", result.emitted},
+                           {"consumed", result.consumed},
+                           {"stopped_at_eos", result.stopped_at_eos},
+                           {"pending_id", result.pending ? Json(*result.pending) : Json(nullptr)}})
+                         .dump()
+                  << '\n';
+        return;
+    }
+    if (model.architecture() == "bert")
+        invalid("BERT uses the encode command");
     std::optional<Tokenizer> tokenizer;
     if (prompt || !as_json || !sidecar.empty())
         tokenizer = Tokenizer::load_model(path, sidecar);
@@ -627,6 +681,7 @@ void bench(Arguments& args, const std::filesystem::path& path, BackendOptions op
 void usage() {
     std::cout << "nathr --help | --version\n"
                  "nathr inspect MODEL\n"
+                 "nathr encode MODEL --tokens IDS   (BERT hidden states as JSON)\n"
                  "nathr forward MODEL --tokens 1,2,3 [--cached] [--context N] [--trace FILE] [--json]\n"
                  "  --logits-f32 streams little-endian FP32 vocabulary rows to stdout\n"
                  "nathr tokenize MODEL (PROMPT | --tokens IDS | --stdin) [--tokenizer FILE]\n"
@@ -635,11 +690,12 @@ void usage() {
                  "nathr generate MODEL (PROMPT | --tokens IDS) [--bos] [--max-new-tokens N] "
                  "[--context N]\n"
                  "  [--greedy | --temperature T --top-k K --top-p P] [--seed N] [--tokenizer FILE] [--json]\n"
+                 "  T5 takes source IDs via --tokens and outputs generated IDs as JSON.\n"
                  "nathr bench MODEL [--prompt-length N] [--decode-length N] [--context N] "
                  "[--warmups N] [--repetitions N] [--json]\n"
                  "Use --model PATH and --prompt TEXT for named arguments.\n"
                  "Execution options: --backend scalar|auto|avx2 --threads 1..64\n"
-                 "Cached execution: --kv-cache f32|f16 --prefill-chunk 1..32\n";
+                 "Decoder-only cached execution: --kv-cache f32|f16 --prefill-chunk 1..32\n";
 }
 
 } // namespace
@@ -655,7 +711,7 @@ int main(int argc, char** argv) try {
         return 0;
     }
     if (command != "inspect" && command != "forward" && command != "tokenize" && command != "generate" &&
-        command != "bench")
+        command != "bench" && command != "encode")
         invalid("unknown command: " + std::string(command));
     if (argc == 3 && std::string_view(argv[2]) == "--help") {
         usage();
@@ -676,6 +732,8 @@ int main(int argc, char** argv) try {
         std::cout << info.dump(2) << '\n';
     } else if (command == "forward") {
         forward(args, path, options);
+    } else if (command == "encode") {
+        encode(args, path, options);
     } else if (command == "generate") {
         generate_text(args, path, options);
     } else if (command == "bench") {

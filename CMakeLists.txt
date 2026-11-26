@@ -48,6 +48,8 @@ add_library(nathr_lib
     src/models/llama/config.cpp
     src/models/llama/model.cpp
     src/models/gpt2/model.cpp
+    src/models/bert/model.cpp
+    src/models/t5/model.cpp
     src/runtime/session.cpp
     src/runtime/generation.cpp
     src/tokenizer/tokenizer.cpp

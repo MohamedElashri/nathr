@@ -107,29 +107,54 @@ std::filesystem::path weights_path(const std::filesystem::path& directory) {
         throw Error(ErrorCode::io, directory.string() + ": " + error.message());
     return directory / "model.safetensors";
 }
+
+std::string_view architecture_name(Checkpoint checkpoint) {
+    switch (checkpoint) {
+    case Checkpoint::gpt2_safetensors:
+        return "gpt2";
+    case Checkpoint::bert_safetensors:
+        return "bert";
+    case Checkpoint::t5_safetensors:
+        return "t5";
+    default:
+        return "llama";
+    }
+}
 } // namespace
 
 Model::Impl::Impl(const std::filesystem::path& path, Checkpoint checkpoint, ModelConfig native_config,
-                  BackendOptions options, CpuFeatures features)
+                  BackendOptions options, CpuFeatures features, const Json& json)
     : config(native_config), tensors(checkpoint == Checkpoint::llama_gguf
                                          ? WeightFile(std::in_place_type<Gguf>, path)
                                          : WeightFile(std::in_place_type<SafeTensors>, weights_path(path))),
-      backend(options, features),
-      architecture(checkpoint == Checkpoint::gpt2_safetensors ? "gpt2" : "llama") {
+      backend(options, features), architecture(architecture_name(checkpoint)) {
     switch (checkpoint) {
     case Checkpoint::llama_gguf: {
         auto& file = std::get<Gguf>(tensors);
         config = load_llama_config(file);
-        decoder = load_llama(file, path, config, backend);
+        execution = load_llama(file, path, config, backend);
         break;
     }
     case Checkpoint::llama_safetensors:
-        decoder = load_llama(std::get<SafeTensors>(tensors), path, config, backend);
+        execution = load_llama(std::get<SafeTensors>(tensors), path, config, backend);
         break;
     case Checkpoint::gpt2_safetensors:
-        decoder = load_gpt2(std::get<SafeTensors>(tensors), path, config, backend);
+        execution = load_gpt2(std::get<SafeTensors>(tensors), path, config, backend);
+        break;
+    case Checkpoint::bert_safetensors:
+        execution = std::make_unique<Bert>(std::get<SafeTensors>(tensors), path, config, json, backend);
+        break;
+    case Checkpoint::t5_safetensors:
+        execution = std::make_unique<T5>(std::get<SafeTensors>(tensors), path, config, json, backend);
         break;
     }
+}
+
+const Decoder& Model::Impl::decoder() const {
+    const auto* loaded = std::get_if<std::unique_ptr<Decoder>>(&execution);
+    if (!loaded)
+        throw Error(ErrorCode::unsupported, "operation requires a decoder-only model");
+    return **loaded;
 }
 
 Model Model::load(const std::filesystem::path& path, BackendOptions options) {
@@ -144,11 +169,19 @@ Model Model::load(const std::filesystem::path& path, BackendOptions options) {
         return Model(std::make_shared<Impl>(path, Checkpoint::llama_gguf, ModelConfig{}, options, features));
     const auto config_path = path / "config.json";
     const auto json = read_json(config_path, mib);
+    const auto load = [&](Checkpoint checkpoint, ModelConfig config) {
+        return Model(std::make_shared<Impl>(path, checkpoint, config, options, features, json));
+    };
     const auto type = json.find("model_type");
-    const bool gpt2 = type != json.end() && *type == "gpt2";
-    const auto config = gpt2 ? gpt2_config(json, config_path) : load_llama_config(json, config_path);
-    const auto checkpoint = gpt2 ? Checkpoint::gpt2_safetensors : Checkpoint::llama_safetensors;
-    return Model(std::make_shared<Impl>(path, checkpoint, config, options, features));
+    if (type != json.end()) {
+        if (*type == "gpt2")
+            return load(Checkpoint::gpt2_safetensors, gpt2_config(json, config_path));
+        if (*type == "bert")
+            return load(Checkpoint::bert_safetensors, bert_config(json, config_path));
+        if (*type == "t5")
+            return load(Checkpoint::t5_safetensors, t5_config(json, config_path));
+    }
+    return load(Checkpoint::llama_safetensors, load_llama_config(json, config_path));
 }
 
 const ModelConfig& Model::config() const noexcept {
@@ -177,16 +210,25 @@ std::string_view Model::kernel(std::uint32_t id) const noexcept {
 
 void Model::forward(std::span<const Token> tokens, LogitsMode mode, std::span<float> last_logits,
                     const LogitsSink& sink, const TraceSink& trace) const {
+    const auto& decoder = impl_->decoder();
     validate_tokens(tokens, config(), std::min(config().context, max_uncached_tokens));
     validate_mode(mode, sink);
     if ((mode == LogitsMode::last_token && last_logits.size() != config().vocabulary) ||
         (mode != LogitsMode::last_token && !last_logits.empty())) {
         throw Error(ErrorCode::invalid_argument, "last-token mode requires a vocabulary-sized output span");
     }
-    auto scratch = impl_->decoder->workspace(tokens.size(), tokens.size());
-    impl_->decoder->execute(*scratch, {tokens, 0, nullptr, mode, sink, trace});
+    auto scratch = decoder.workspace(tokens.size(), tokens.size());
+    decoder.execute(*scratch, {tokens, 0, nullptr, mode, sink, trace});
     if (mode == LogitsMode::last_token)
         std::ranges::copy(scratch->logits, last_logits.begin());
+}
+
+std::vector<float> Model::encode(std::span<const Token> tokens) const {
+    const auto* encoder = std::get_if<std::unique_ptr<Bert>>(&impl_->execution);
+    if (!encoder)
+        throw Error(ErrorCode::unsupported, "encode requires a BERT model");
+    validate_tokens(tokens, config(), config().context);
+    return (*encoder)->encode(tokens);
 }
 
 } // namespace nathr

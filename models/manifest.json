@@ -254,6 +254,42 @@
           "sha256": "8414cab924d8b9b33013f0d221c5862f365ee9be39c5c2bfae8a5a9e970478a6"
         }
       ]
+    },
+    {
+      "repository": "google-bert/bert-base-uncased",
+      "revision": "86b5e0934494bd15c9632b12f734a8a67f723594",
+      "files": [
+        {
+          "filename": "config.json",
+          "sha256": "7160e1553ad2ca51d8c1cb066be533db31826e12d173824c1bb0cb1a4f187d20"
+        },
+        {
+          "filename": "model.safetensors",
+          "sha256": "68d45e234eb4a928074dfd868cead0219ab85354cc53d20e772753c6bb9169d3"
+        },
+        {
+          "filename": "tokenizer.json",
+          "sha256": "ce64fce797c24f68df90b40a3f74f579b336a493db14bd583fd520ea0d8c9a98"
+        }
+      ]
+    },
+    {
+      "repository": "google-t5/t5-small",
+      "revision": "df1b051c49625cf57a3d0d8d3863ed4d13564fe4",
+      "files": [
+        {
+          "filename": "config.json",
+          "sha256": "530e25060e3a8d5f7b0fcf53bfea9f3601165161f3b1914676e98d97cf07bcf1"
+        },
+        {
+          "filename": "model.safetensors",
+          "sha256": "bd944e5f1b3ad9b70dd9d00010a517059e19265671076b8b0a4a58d9491842bc"
+        },
+        {
+          "filename": "tokenizer.json",
+          "sha256": "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066"
+        }
+      ]
     }
   ]
 }

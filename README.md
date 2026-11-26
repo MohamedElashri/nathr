@@ -1,8 +1,8 @@
 # Nathr
 
-Nathr is an educational C++20 inference engine for small decoder-only language models. It runs GPT-2 and compatible Llama-style checkpoints, including SmolLM2-135M, offline on x86-64 Linux. [Example checkpoints and SHA-256 hashes](models/manifest.json)
+Nathr is an educational C++20 Transformer inference engine for x86-64 Linux. It runs GPT-2 and Llama-style text continuation, BERT encoding, and T5 text-to-text generation offline. [Example checkpoints and SHA-256 hashes](models/manifest.json)
 
-The CLI can generate text, inspect checkpoints, tokenize prompts, and measure prefill and decode performance. The same engine is available as an embeddable C++ library. [Public API](include/nathr)
+The CLI exposes inference, checkpoint inspection, tokenization, and decoder benchmarking. The same engine is available as an embeddable C++ library. [Public API](include/nathr)
 
 ## Quick start
 
@@ -43,9 +43,29 @@ From the repository root, run setup for GPT-2 small and pass the checkpoint dire
 ./build/release/nathr generate models/cache/gpt2 "Once upon a time" --greedy --max-new-tokens 16
 ```
 
+### Encode with BERT
+
+The IDs encode `The sky is blue.` with BERT's boundary tokens. The output contains seven vectors of width 768.
+
+```sh
+./setup.sh bert
+./build/release/nathr encode models/cache/bert-base-uncased \
+    --tokens 101,1996,3712,2003,2630,1012,102 > build/bert-hidden.json
+```
+
+### Generate with T5
+
+The input IDs encode `translate English to German: The sky is blue.`. The generated IDs decode to `Der Himmel ist blau.` with the checkpoint's tokenizer. [Use your own text](#tokenize-for-bert-and-t5)
+
+```sh
+./setup.sh t5
+./build/release/nathr generate models/cache/t5-small \
+    --tokens 13959,1566,12,2968,10,37,5796,19,1692,5,1 --greedy --max-new-tokens 12
+```
+
 ## How inference works
 
-The inference engine guide covers the model equations and cache layout with worked examples. [Inference engine guide](docs/inference-engine.md)
+GPT-2 and Llama-style models use a causal decoder to continue a prompt. [Inference engine guide](docs/inference-engine.md)
 
 ```mermaid
 flowchart LR
@@ -62,6 +82,8 @@ flowchart LR
 3. The decoder runs causal attention and a feed-forward layer in each block. Llama-style models use RMSNorm, rotary position embeddings (RoPE), and SwiGLU. GPT-2 uses LayerNorm, learned position embeddings, and GELU. Both produce one score, or logit, per vocabulary token. [Llama decoder](src/models/llama/model.cpp) · [GPT-2 decoder](src/models/gpt2/model.cpp) · [Shared attention](src/backend/cpu/scalar.cpp)
 4. **Prefill** processes the prompt in chunks and saves each layer's keys and values. During **decode**, the sampler takes the highest logit or draws a token using temperature, top-k, and top-p. Nathr emits the token and appends it when another generation step is needed. Attention reuses the saved keys and values for earlier tokens. Generation ends at the end-of-sequence token or the token limit. [Sessions](src/runtime/session.cpp) · [Sampling and generation](src/runtime/generation.cpp)
 
+**BERT** lets each token attend to the entire input and returns a hidden vector per token. **T5** encodes its source once, then generates with a causal decoder that also attends to the encoded source. [BERT encoder](src/models/bert/model.cpp) · [T5 encoder and decoder](src/models/t5/model.cpp)
+
 ## CPU execution and memory
 
 Nathr selects kernels by tensor encoding. The automatic backend uses AVX2 kernels when supported and falls back to scalar kernels where needed. During prefill, a weight row can serve several tokens in a small tile. Decoding a single token uses row-wise dot products. [CPU kernels](src/backend/cpu/kernels.cpp)
@@ -74,12 +96,14 @@ Nathr reads dimensions, attention head counts, context length, and boundary toke
 
 - **Llama-style.** Single-file GGUF v3 or Safetensors with RMSNorm, SwiGLU, unscaled full-width RoPE, and bias-free projections. [Llama configuration](src/models/llama/config.cpp)
 - **GPT-2.** Dense, single-file Safetensors with the GPT-2 attention and GELU configuration. [GPT-2 decoder](src/models/gpt2/model.cpp)
+- **BERT.** Dense, single-file Safetensors with absolute position embeddings and GELU. Encodes one unpadded sequence with segment ID zero and returns the last hidden states. [BERT encoder](src/models/bert/model.cpp)
+- **T5.** Dense, single-file Safetensors for original ReLU T5. Uses an unpadded source and a greedy or sampled decoder with FP32 caches. Each sequence is capped at 512 positions or the checkpoint limit, whichever is smaller. [T5 model](src/models/t5/model.cpp)
 
-Text input supports byte-level BPE with either the ByteLevel pretokenizer alone or individual-digit splitting followed by ByteLevel. For GGUF, Nathr reads the vocabulary, merge ranks, and control tokens from metadata. You can pass `--tokenizer /path/to/tokenizer.json` to supply a compatible matching tokenizer. Models with other tokenizers can use `forward --tokens` or `generate --tokens --json` with IDs from an external tokenizer. [Tokenizer](src/tokenizer/tokenizer.cpp)
+The built-in tokenizer supports the byte-level BPE variants used by SmolLM2 and GPT-2. For GGUF, it reads the vocabulary, merges, and control tokens from metadata. Models with other tokenizers take IDs directly. [Built-in tokenizer](src/tokenizer/tokenizer.cpp) · [BERT and T5 tokenization](#tokenize-for-bert-and-t5)
 
 ## CLI reference
 
-Run these commands from the repository root. Use a GGUF file or a Safetensors directory as `MODEL`. The directory needs `config.json` and `model.safetensors`, plus `tokenizer.json` for text input and output. You can also write `--model PATH` and `--prompt TEXT` in place of the positional arguments.
+Run these commands from the repository root. Use a GGUF file or a directory containing `config.json` and `model.safetensors` as `MODEL`. Built-in text tokenization for Safetensors also uses `tokenizer.json`. You can write `--model PATH` and `--prompt TEXT` in place of the positional arguments.
 
 ```sh
 nathr=./build/release/nathr
@@ -90,14 +114,15 @@ nathr=./build/release/nathr
 | Command | Options |
 | --- | --- |
 | `inspect MODEL` | Print checkpoint metadata and selected kernels as JSON. |
+| `encode MODEL --tokens IDS` | Return one BERT hidden-state row per input token as JSON. |
 | `tokenize MODEL PROMPT` | Use `--stages` to see pretokenization or `--stdin` to read one JSON string per line. Use `--tokens IDS` in place of the prompt to decode IDs and `--skip-special` to omit special tokens. |
-| `forward MODEL --tokens IDS` | Report the highest-scoring next token. Use `--cached` to exercise the KV cache, `--json` to include the final logits, or `--trace FILE` to save activations. `--logits-f32` streams one little-endian FP32 row per input token and is exclusive with `--json` and `--trace`. |
-| `generate MODEL PROMPT` | Use `--tokens IDS` to supply IDs, `--bos` to prepend the beginning-of-sequence token, and `--max-new-tokens N` to limit output (default 32). Choose `--greedy` or tune sampling with `--temperature T`, `--top-k K`, `--top-p P`, and `--seed N`. Use `--json` for token IDs and generation metadata. |
-| `bench MODEL` | Report prefill and decode timings as JSON. Set `--prompt-length N`, `--decode-length N`, `--warmups N`, and `--repetitions N` (defaults 128, 32, 2, and 7). |
+| `forward MODEL --tokens IDS` | Report the highest-scoring next token from a decoder-only model. Use `--cached` to exercise the KV cache, `--json` to include the final logits, or `--trace FILE` to save activations. `--logits-f32` streams one little-endian FP32 row per token and is exclusive with `--json` and `--trace`. |
+| `generate MODEL PROMPT` | Use `--tokens IDS` to supply IDs. For T5 these are source IDs and the output is always JSON. For decoder-only models use `--bos` to prepend a start token or `--json` for token IDs and metadata. Choose `--greedy` or tune sampling with `--temperature T`, `--top-k K`, `--top-p P`, and `--seed N`. `--max-new-tokens N` limits output (default 32). |
+| `bench MODEL` | Report decoder-only prefill and decode timings as JSON. Set `--prompt-length N`, `--decode-length N`, `--warmups N`, and `--repetitions N` (defaults 128, 32, 2, and 7). |
 
 Pass token IDs as comma-separated integers such as `1,7,2`. With a GGUF checkpoint, `tokenize` and `generate` accept `--tokenizer FILE` to supply a matching tokenizer.
 
-`inspect`, `forward`, `generate`, and `bench` accept `--backend scalar|auto|avx2` and `--threads N` (1–64). The defaults are scalar execution and one thread. For `generate`, `bench`, and `forward --cached`, use `--context N` to set the session capacity, `--kv-cache f32|f16` for cache precision, and `--prefill-chunk N` (1–32) to set how many prompt tokens to process at once.
+Inference commands and `inspect` accept `--backend scalar|auto|avx2` and `--threads N` (1–64). The defaults are scalar execution and one thread. For cached decoder-only inference, `--context N` sets capacity, `--kv-cache f32|f16` selects cache precision, and `--prefill-chunk N` (1–32) sets the prompt chunk size. For T5, `--context N` sets decoder capacity, including the decoder start token.
 
 ### Examples
 
@@ -119,6 +144,36 @@ After `./setup.sh gpt2`, try sampling from GPT-2 with a fixed seed.
     --temperature 0.8 --top-k 40 --top-p 0.95 --seed 7 --max-new-tokens 8
 ```
 
+### Tokenize for BERT and T5
+
+After running setup for both checkpoints, use their `tokenizer.json` files with the optional Python `tokenizers` package. The tokenizer adds the checkpoint's special tokens.
+
+```sh
+python3 -m venv build/tokenizer-env
+build/tokenizer-env/bin/pip install tokenizers
+build/tokenizer-env/bin/python - <<'PY'
+import json
+import subprocess
+from tokenizers import Tokenizer
+
+def run(command, checkpoint, text, *options):
+    model = f"models/cache/{checkpoint}"
+    tokenizer = Tokenizer.from_file(f"{model}/tokenizer.json")
+    ids = ",".join(map(str, tokenizer.encode(text).ids))
+    output = subprocess.check_output(
+        ["./build/release/nathr", command, model, "--tokens", ids, *options]
+    )
+    return tokenizer, json.loads(output)
+
+_, bert = run("encode", "bert-base-uncased", "The sky is blue.")
+print(len(bert["hidden_states"]), bert["hidden_size"])
+
+tokenizer, t5 = run("generate", "t5-small", "translate English to German: The sky is blue.",
+                    "--greedy", "--max-new-tokens", "12")
+print(tokenizer.decode(t5["generated_ids"]))
+PY
+```
+
 ## Installation
 
 ### Prerequisites
@@ -127,7 +182,7 @@ Use x86-64 Linux with CMake 3.25+, Ninja, and GCC 12+ or Clang 16+. Cloning and 
 
 ### Setup script options
 
-Run `./setup.sh` or `./setup.sh gguf` for the quantized SmolLM2 checkpoint, `./setup.sh safetensors` for the original SmolLM2 weights, or `./setup.sh all` for both SmolLM2 formats. Use `./setup.sh gpt2` for GPT-2 small. Setup stores checkpoints under `models/cache`, reuses verified files, and prints a generation command for each checkpoint.
+Run `./setup.sh` or `./setup.sh gguf` for quantized SmolLM2, `./setup.sh safetensors` for the original weights, or `./setup.sh all` for both SmolLM2 formats. Use `./setup.sh gpt2`, `./setup.sh bert`, or `./setup.sh t5` for the other checkpoints. Setup stores checkpoints under `models/cache`, reuses verified files, and prints an inference command.
 
 ### 1. Build and test manually
 
@@ -142,7 +197,7 @@ ctest --preset release
 
 ### 2. Download a model
 
-Choose a SmolLM2-135M download below or use the GPT-2 setup command in Quick start. Each manual download block sets `model` to the path the CLI expects. Continue when every `sha256sum` check reports `OK`. [Supported downloads and SHA-256 hashes](models/manifest.json)
+Choose a SmolLM2-135M download below or use a model-specific setup command in Quick start. Each manual download block sets `model` to the path the CLI expects. Continue when every `sha256sum` check reports `OK`. [Supported downloads and SHA-256 hashes](models/manifest.json)
 
 **GGUF (about 92 MB).** This single-file Q4_0 checkpoint includes the tokenizer and is the smaller download. [QuantFactory checkpoint](https://huggingface.co/QuantFactory/SmolLM2-135M-GGUF/blob/d948db3614be18259a175aafd7689a70f1cb4e2f/SmolLM2-135M.Q4_0.gguf)
 

@@ -2,7 +2,7 @@
 
 This guide builds a small CPU inference engine for pretrained decoder-only Transformers. Start with fixed token IDs and a scalar forward pass. Then add a tokenizer, a key-value cache, and a generation loop. Keeping these pieces separate lets you swap checkpoints, test each operation, and add CPU optimizations without changing the model equations.
 
-Nathr is the worked implementation. It runs a subset of Llama-style models and GPT-2, and its tokenizer supports two byte-level BPE pipelines. SmolLM2-135M supplies concrete dimensions for the Llama walkthrough. GPT-2 shows how a second architecture can share tensor readers, the session API, and CPU kernels. [Nathr model compatibility](../README.md#model-compatibility)
+Nathr is the worked implementation. SmolLM2-135M supplies concrete dimensions for the Llama walkthrough. GPT-2 shares its decoder runtime, and BERT and T5 show how the same tensor readers and CPU kernels work in an encoder and a sequence-to-sequence model. [Nathr model compatibility](../README.md#model-compatibility)
 
 ```mermaid
 flowchart LR
@@ -246,3 +246,9 @@ Choose a checkpoint that differs in vocabulary size, head geometry, or context. 
 For an architecture with different layer equations, add the configuration and weight binding rules alongside its forward pass. Define any additional state the session must carry. Reuse the tensor readers, sampling loop, and kernels whose interfaces still fit. Validate the new forward pass on a tiny fixture, then compare its uncached and cached outputs before testing a long continuation.
 
 Nathr's GPT-2 decoder follows this pattern. It binds learned position embeddings and affine LayerNorm weights, transposes the stored projections once when it loads the checkpoint, and splits a combined projection into queries, keys, and values. The session requests workspace from the decoder and supplies the same KV cache to both architectures. [Decoder interface](../src/models/decoder.hpp) · [GPT-2 implementation](../src/models/gpt2/model.cpp) · [Run GPT-2 small](../README.md#run-gpt-2-small)
+
+### Add an encoder and cross-attention
+
+BERT learns a position embedding for each input position. Each layer projects the entire sequence to Q, K, and V, then lets every query see every input token. The last layer returns one hidden-state row per input token. To verify bidirectionality, change the final token and compare the first token's new hidden state against a reference. [BERT encoder](../src/models/bert/model.cpp) · [BERT reference checks](../tests/runtime.cpp)
+
+T5's encoder also sees the full input. Its self-attention adds a learned bias based on the bucketed distance between each query and key. During decoding, each layer reads two sets of keys and values. The causal self-attention cache grows with each decoder token. The cross-attention cache is projected once per decoder layer from the final encoder output. The decoder begins with the configured start token and uses the same sampling loop as the decoder-only models. [T5 model](../src/models/t5/model.cpp) · [T5 paper](https://jmlr.org/papers/volume21/20-074/20-074.pdf)

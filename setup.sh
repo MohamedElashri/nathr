@@ -3,13 +3,15 @@ set -euo pipefail
 
 usage() {
     cat <<'USAGE'
-Usage: ./setup.sh [gguf|safetensors|all|gpt2]
+Usage: ./setup.sh [gguf|safetensors|all|gpt2|bert|t5]
 
-Build and test Nathr, then verify generation with the selected checkpoint.
+Build and test Nathr, then run inference with the selected checkpoint.
   gguf         Download SmolLM2-135M Q4_0 GGUF (default).
   safetensors  Download the original SmolLM2-135M Safetensors checkpoint.
   all          Download and test both SmolLM2-135M formats.
   gpt2         Download the GPT-2 small Safetensors checkpoint.
+  bert         Download the BERT base uncased Safetensors checkpoint.
+  t5           Download the T5 small Safetensors checkpoint.
 USAGE
 }
 
@@ -19,7 +21,7 @@ if (( $# > 1 )); then
 fi
 selection=${1-gguf}
 case "$selection" in
-    gguf|safetensors|all|gpt2) ;;
+    gguf|safetensors|all|gpt2|bert|t5) ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -106,29 +108,41 @@ if [[ $selection == gguf || $selection == all ]]; then
     download_checkpoint QuantFactory/SmolLM2-135M-GGUF models/cache "$gguf_name"
     models+=("models/cache/$gguf_name")
 fi
-if [[ $selection == safetensors || $selection == all ]]; then
-    safetensors_path=models/cache/SmolLM2-135M
-    download_checkpoint HuggingFaceTB/SmolLM2-135M "$safetensors_path" \
-        config.json model.safetensors tokenizer.json
-    models+=("$safetensors_path")
-fi
-if [[ $selection == gpt2 ]]; then
-    gpt2_path=models/cache/gpt2
-    download_checkpoint openai-community/gpt2 "$gpt2_path" config.json model.safetensors tokenizer.json
-    models+=("$gpt2_path")
+repository=
+case "$selection" in
+    safetensors|all) repository=HuggingFaceTB/SmolLM2-135M ;;
+    gpt2) repository=openai-community/gpt2 ;;
+    bert) repository=google-bert/bert-base-uncased ;;
+    t5) repository=google-t5/t5-small ;;
+esac
+if [[ -n $repository ]]; then
+    destination="models/cache/${repository##*/}"
+    download_checkpoint "$repository" "$destination" config.json model.safetensors tokenizer.json
+    models+=("$destination")
 fi
 
 cmake --build --preset release --parallel 2
 ctest --preset release
 
 bin=./build/release/nathr
+example_command() {
+    local model=$1
+    case "${model##*/}" in
+        bert-base-uncased) example=("$bin" encode "$model" --tokens '101,1996,3712,2003,2630,1012,102') ;;
+        t5-small) example=("$bin" generate "$model" --tokens '13959,1566,12,2968,10,37,5796,19,1692,5,1'
+                           --greedy --max-new-tokens 12) ;;
+        *) example=("$bin" generate "$model" 'Once upon a time' --greedy --max-new-tokens 16) ;;
+    esac
+}
 for model in "${models[@]}"; do
-    printf 'Checking generation with %s\n' "$model"
-    "$bin" generate "$model" 'Once upon a time' \
-        --greedy --max-new-tokens 2 --context 64 --backend auto --json >/dev/null
+    printf 'Checking inference with %s\n' "$model"
+    example_command "$model"
+    "${example[@]}" --backend auto >/dev/null
 done
 
 printf '\nReady. Run from the repository root:\n'
 for model in "${models[@]}"; do
-    printf '  %s generate %s "Once upon a time" --greedy\n' "$bin" "$model"
+    example_command "$model"
+    printf ' %q' "${example[@]}"
+    printf '\n'
 done

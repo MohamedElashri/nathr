@@ -279,14 +279,12 @@ const auto& decoded_half_values() {
 }
 
 template <class T, class Decode>
-void attend(const ModelConfig& config, std::size_t layer, std::size_t position, Cache* cache,
-            std::span<const float> keys, std::span<const float> values, std::span<const float> query,
-            std::span<float> output, std::span<float> scores, Decode decode) {
+void attend(const ModelConfig& config, std::size_t layer, Cache* cache, std::span<const float> keys,
+            std::span<const float> values, std::span<const float> query, std::span<float> output,
+            std::span<float> scores, double scale, std::span<const float> bias, Decode decode) {
     const auto width = config.head_dim;
     const auto kv_width = config.kv_heads * width;
     const auto group = config.query_heads / config.kv_heads;
-    const auto scale = 1.0 / std::sqrt(static_cast<double>(width));
-    scores = scores.first(position + 1);
     for (std::size_t head = 0; head < config.query_heads; ++head) {
         const auto kv = head / group;
         const auto q = query.subspan(head * width, width);
@@ -298,18 +296,20 @@ void attend(const ModelConfig& config, std::size_t layer, std::size_t position, 
             }
             return cache->row<T>(value, layer, kv, i);
         };
-        for (std::size_t i = 0; i <= position; ++i) {
+        for (std::size_t i = 0; i < scores.size(); ++i) {
             const auto k = get(false, i);
             double sum = 0;
             for (std::size_t d = 0; d < width; ++d)
                 sum += static_cast<double>(q[d]) * decode(k[d]);
             scores[i] = static_cast<float>(sum * scale);
         }
+        if (!bias.empty())
+            Scalar::add(scores, bias.subspan(head * scores.size(), scores.size()));
         Scalar::softmax(scores);
         for (std::size_t offset = 0; offset < width; offset += 64) {
             std::array<double, 64> sums{};
             const auto lanes = std::min(sums.size(), width - offset);
-            for (std::size_t i = 0; i <= position; ++i) {
+            for (std::size_t i = 0; i < scores.size(); ++i) {
                 const auto v = get(true, i);
                 for (std::size_t d = 0; d < lanes; ++d)
                     sums[d] += static_cast<double>(scores[i]) * decode(v[offset + d]);
@@ -324,12 +324,21 @@ void attend(const ModelConfig& config, std::size_t layer, std::size_t position, 
 void Scalar::attention(const ModelConfig& config, std::size_t layer, std::size_t position, Cache* cache,
                        std::span<const float> keys, std::span<const float> values,
                        std::span<const float> query, std::span<float> output, std::span<float> scores) {
+    attention_range(config, layer, cache, keys, values, query, output, scores.first(position + 1),
+                    1.0 / std::sqrt(static_cast<double>(config.head_dim)));
+}
+
+void Scalar::attention_range(const ModelConfig& config, std::size_t layer, Cache* cache,
+                             std::span<const float> keys, std::span<const float> values,
+                             std::span<const float> query, std::span<float> output, std::span<float> scores,
+                             double scale, std::span<const float> bias) {
     if (cache && cache->precision == KvPrecision::f16) {
         const auto& decoded = decoded_half_values();
-        attend<std::uint16_t>(config, layer, position, cache, keys, values, query, output, scores,
+        attend<std::uint16_t>(config, layer, cache, keys, values, query, output, scores, scale, bias,
                               [&decoded](std::uint16_t bits) { return decoded[bits]; });
     } else {
-        attend<float>(config, layer, position, cache, keys, values, query, output, scores, std::identity{});
+        attend<float>(config, layer, cache, keys, values, query, output, scores, scale, bias,
+                      std::identity{});
     }
 }
 

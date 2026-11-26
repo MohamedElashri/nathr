@@ -57,13 +57,13 @@ Token Sampler::select(std::span<const float> logits, std::mt19937_64& generator)
     return allowed[count - 1].id;
 }
 
-GenerationResult generate(Session& session, Sampler& sampler, Token eos, std::size_t max_new_tokens,
-                          const TokenSink& emit) {
+namespace {
+GenerationResult generate_tokens(auto& session, std::size_t length, Sampler& sampler, Token eos,
+                                 std::size_t max_new_tokens, const TokenSink& emit) {
     GenerationResult result;
     if (!max_new_tokens)
         return result;
-    if (eos >= session.logits().size() || !emit ||
-        max_new_tokens - 1 > session.capacity() - session.history().size()) {
+    if (eos >= session.logits().size() || !emit || max_new_tokens - 1 > session.capacity() - length) {
         throw Error(ErrorCode::invalid_argument, "invalid EOS, token sink or generation budget");
     }
     while (result.emitted < max_new_tokens) {
@@ -79,6 +79,17 @@ GenerationResult generate(Session& session, Sampler& sampler, Token eos, std::si
         ++result.consumed;
     }
     return result;
+}
+} // namespace
+
+GenerationResult generate(Session& session, Sampler& sampler, Token eos, std::size_t max_new_tokens,
+                          const TokenSink& emit) {
+    return generate_tokens(session, session.history().size(), sampler, eos, max_new_tokens, emit);
+}
+
+GenerationResult generate(T5Session& session, Sampler& sampler, Token eos, std::size_t max_new_tokens,
+                          const TokenSink& emit) {
+    return generate_tokens(session, session.length(), sampler, eos, max_new_tokens, emit);
 }
 
 } // namespace nathr

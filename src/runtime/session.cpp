@@ -8,9 +8,9 @@ namespace nathr {
 
 struct Session::Impl {
     Impl(const Model& source, std::size_t limit, std::uint64_t start_seed, SessionOptions options)
-        : model(source), cache(model.config(), limit, options.kv_precision),
-          chunk(std::min(limit, options.prefill_chunk)),
-          scratch(model.impl_->decoder->workspace(limit, chunk)), seed(start_seed), rng(seed) {
+        : model(source), decoder(model.impl_->decoder()), cache(model.config(), limit, options.kv_precision),
+          chunk(std::min(limit, options.prefill_chunk)), scratch(decoder.workspace(limit, chunk)),
+          seed(start_seed), rng(seed) {
         tokens.reserve(limit);
     }
 
@@ -24,8 +24,7 @@ struct Session::Impl {
             const auto count = std::min(chunk, ids.size() - i);
             const auto output =
                 (mode == LogitsMode::last_token && i + count != ids.size()) ? LogitsMode::none : mode;
-            model.impl_->decoder->execute(*scratch,
-                                          {ids.subspan(i, count), start + i, &cache, output, sink, trace});
+            decoder.execute(*scratch, {ids.subspan(i, count), start + i, &cache, output, sink, trace});
             i += count;
         }
         // The input may be a view of the already-consumed prefix.
@@ -36,6 +35,7 @@ struct Session::Impl {
     }
 
     Model model;
+    const detail::Decoder& decoder;
     detail::Cache cache;
     const std::size_t chunk;
     std::unique_ptr<detail::Workspace> scratch;

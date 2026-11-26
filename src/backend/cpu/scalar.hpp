@@ -38,6 +38,11 @@ struct Scalar {
     static void attention(const ModelConfig& config, std::size_t layer, std::size_t position, Cache* cache,
                           std::span<const float> keys, std::span<const float> values,
                           std::span<const float> query, std::span<float> output, std::span<float> scores);
+    // Scores cover exactly the visible keys. Optional bias has one row per query head.
+    static void attention_range(const ModelConfig& config, std::size_t layer, Cache* cache,
+                                std::span<const float> keys, std::span<const float> values,
+                                std::span<const float> query, std::span<float> output,
+                                std::span<float> scores, double scale, std::span<const float> bias = {});
     static void softmax(std::span<float> scores);
     static void swiglu(std::span<float> gate, std::span<const float> up);
     static void gelu(std::span<float> values);

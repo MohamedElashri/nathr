@@ -461,6 +461,54 @@ void gpt2_and_sessions() {
     expect(allocation_test(model, ids, 4) == 0, "warmed GPT-2 prefill and append allocate no heap");
 }
 
+void encoder_models() {
+    const auto bert_path = fixtures / "bert";
+    const auto bert = Model::load(bert_path);
+    const auto hidden = read_json(bert_path / "hidden.json", mib);
+    const auto check_hidden = [&](const std::vector<Token>& tokens, const Json& reference) {
+        const auto actual = bert.encode(tokens);
+        expect(actual.size() == tokens.size() * bert.config().hidden, "BERT output shape");
+        for (std::size_t i = 0; i < tokens.size(); ++i)
+            compare(std::span(actual).subspan(i * bert.config().hidden, bert.config().hidden),
+                    reference.at(i).get<std::vector<float>>(), 3e-6);
+        return actual;
+    };
+    const auto base = check_hidden(hidden.at("ids").get<std::vector<Token>>(), hidden.at("hidden_states"));
+    const auto altered =
+        check_hidden(hidden.at("altered_ids").get<std::vector<Token>>(), hidden.at("altered_hidden_states"));
+    expect(std::abs(base.front() - altered.front()) > 1e-3f, "BERT first token uses the final token");
+    rejects([&] { (void)bert.encode({}); }, ErrorCode::invalid_argument);
+    rejects([&] { (void)Session::create(bert); }, ErrorCode::unsupported);
+
+    const auto t5_path = fixtures / "t5";
+    const auto t5 = Model::load(t5_path, {ExecutionPolicy::automatic, 2});
+    const auto ref = read_json(t5_path / "logits.json", mib);
+    const auto source = ref.at("source").get<std::vector<Token>>();
+    const auto target = ref.at("target").get<std::vector<Token>>();
+    const auto logits = ref.at("logits").get<std::vector<std::vector<float>>>();
+    expect(t5.config().bos == target.front(), "T5 decoder start");
+    auto session = T5Session::create(t5, source, target.size());
+    for (std::size_t i = 0; i < target.size(); ++i) {
+        expect(session.length() == i + 1, "T5 cached decoder length");
+        compare(session.logits(), logits.at(i), 2e-5);
+        if (i + 1 < target.size())
+            session.append(std::span(target).subspan(i + 1, 1));
+    }
+    rejects([&] { session.append(std::span(target).first(1)); }, ErrorCode::invalid_argument);
+    compare(session.logits(), logits.back(), 2e-5);
+    rejects([&] { (void)T5Session::create(bert, source); }, ErrorCode::unsupported);
+    rejects([&] { (void)t5.encode(source); }, ErrorCode::unsupported);
+    rejects([&] { t5.forward(source, LogitsMode::none); }, ErrorCode::unsupported);
+
+    auto generation = T5Session::create(t5, source, 5);
+    Sampler greedy({}, t5.config().vocabulary);
+    std::vector<Token> emitted;
+    const auto result =
+        generate(generation, greedy, t5.config().eos, 5, [&](Token token) { emitted.push_back(token); });
+    expect(emitted == ref.at("greedy").get<std::vector<Token>>() && result.emitted == emitted.size(),
+           "T5 greedy output matches reference");
+}
+
 void tokenizer_and_sampling() {
     const auto tokenizer = Tokenizer::load(fixture / "tokenizer.json");
     expect(tokenizer.encode("abc<x>>ab") == std::vector<Token>({256, 258, 4}),
@@ -886,6 +934,7 @@ int main(int argc, char** argv) try {
         parser();
         model_and_sessions();
         gpt2_and_sessions();
+        encoder_models();
         threaded_cache_and_chunks();
         tokenizer_and_sampling();
         gguf_tokenizer_metadata();

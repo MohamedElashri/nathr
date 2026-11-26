@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace nathr {
 
@@ -27,9 +28,10 @@ class Error : public std::runtime_error {
 using Token = std::uint32_t;
 
 struct ModelConfig {
+    // For T5, layers describes the decoder and context bounds each sequence independently.
     std::size_t layers, hidden, intermediate, query_heads, kv_heads, head_dim, vocabulary, context;
-    float rope_theta, rms_epsilon; // rms_epsilon also carries the LayerNorm epsilon for GPT-2.
-    Token bos, eos;
+    float rope_theta, rms_epsilon; // rms_epsilon also carries the LayerNorm epsilon for GPT-2 and BERT.
+    Token bos, eos;                // For T5, bos is the decoder start ID.
     bool tied_embeddings;
 };
 
@@ -74,12 +76,15 @@ class Model {
     // Last-token mode writes last_logits and all-token mode streams to sink.
     void forward(std::span<const Token> tokens, LogitsMode mode, std::span<float> last_logits = {},
                  const LogitsSink& sink = {}, const TraceSink& trace = {}) const;
+    // BERT only. Returns one hidden-size row per input token, in input order.
+    [[nodiscard]] std::vector<float> encode(std::span<const Token> tokens) const;
 
   private:
     struct Impl;
     explicit Model(std::shared_ptr<const Impl> impl) : impl_(std::move(impl)) {}
     std::shared_ptr<const Impl> impl_;
     friend class Session;
+    friend class T5Session;
 };
 
 enum class SessionState { empty, ready, invalid };
@@ -120,6 +125,28 @@ class Session {
   private:
     struct Impl;
     explicit Session(std::unique_ptr<Impl> impl);
+    std::unique_ptr<Impl> impl_;
+};
+
+class T5Session {
+  public:
+    // Encodes one unpadded source sequence and evaluates the decoder's start token.
+    static T5Session create(const Model& model, std::span<const Token> source, std::size_t capacity = 0,
+                            std::uint64_t seed = 0);
+    ~T5Session();
+    T5Session(T5Session&&) noexcept;
+    T5Session& operator=(T5Session&&) noexcept;
+
+    void append(std::span<const Token> tokens);
+    // A view remains valid until the next mutating operation or destruction.
+    [[nodiscard]] std::span<const float> logits() const;
+    Token sample(Sampler& sampler);
+    [[nodiscard]] std::size_t length() const noexcept;
+    [[nodiscard]] std::size_t capacity() const noexcept;
+
+  private:
+    struct Impl;
+    explicit T5Session(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;
 };
 

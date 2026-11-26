@@ -40,5 +40,7 @@ struct GenerationResult {
 using TokenSink = std::function<void(Token)>;
 GenerationResult generate(Session& session, Sampler& sampler, Token eos, std::size_t max_new_tokens,
                           const TokenSink& emit);
+GenerationResult generate(T5Session& session, Sampler& sampler, Token eos, std::size_t max_new_tokens,
+                          const TokenSink& emit);
 
 } // namespace nathr
