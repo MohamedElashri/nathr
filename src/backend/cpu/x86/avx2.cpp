@@ -1,18 +1,12 @@
 #include "backend/cpu/x86/avx2.hpp"
 #include "backend/cpu/batch.hpp"
 #include "backend/cpu/scalar.hpp"
+#include "quantization/decoders.hpp"
 
-#include <cstring>
 #include <immintrin.h>
 
 namespace nathr::detail::x86 {
 namespace {
-
-template <class Value> Value read(const std::byte* p) {
-    Value value;
-    std::memcpy(&value, p, sizeof(value));
-    return value;
-}
 
 double horizontal_sum(__m256d vec) {
     const auto pairs = _mm_add_pd(_mm256_castpd256_pd128(vec), _mm256_extractf128_pd(vec, 1));
@@ -47,11 +41,11 @@ template <DType type> float quantized_dot(const std::byte* weights, const float*
     auto total0 = _mm256_setzero_pd();
     auto total1 = _mm256_setzero_pd();
     for (std::size_t start = 0; start < count; start += 32, weights += stride) {
-        const auto scale = _mm256_set1_pd(half_to_float(read<std::uint16_t>(weights)));
-        auto a = read<__m128i>(weights + 2);
+        const auto scale = _mm256_set1_pd(half_to_float(read_unaligned<std::uint16_t>(weights)));
+        auto a = read_unaligned<__m128i>(weights + 2);
         __m128i b;
         if constexpr (type == DType::q8_0) {
-            b = read<__m128i>(weights + 18);
+            b = read_unaligned<__m128i>(weights + 18);
         } else {
             const auto mask = _mm_set1_epi8(15);
             const auto zero_point = _mm_set1_epi8(8);
@@ -73,15 +67,15 @@ float f32_dot(const std::byte* weights, const float* input, std::size_t count) {
     auto second = _mm256_setzero_pd();
     std::size_t i = 0;
     for (; i + 16 <= count; i += 16) {
-        total = accumulate8(total, read<__m256>(weights + i * 4), input + i);
-        second = accumulate8(second, read<__m256>(weights + (i + 8) * 4), input + i + 8);
+        total = accumulate8(total, read_unaligned<__m256>(weights + i * 4), input + i);
+        second = accumulate8(second, read_unaligned<__m256>(weights + (i + 8) * 4), input + i + 8);
     }
     total = _mm256_add_pd(total, second);
     for (; i + 8 <= count; i += 8)
-        total = accumulate8(total, read<__m256>(weights + i * 4), input + i);
+        total = accumulate8(total, read_unaligned<__m256>(weights + i * 4), input + i);
     double sum = horizontal_sum(total);
     for (; i < count; ++i)
-        sum += static_cast<double>(read<float>(weights + i * 4)) * input[i];
+        sum += static_cast<double>(read_unaligned<float>(weights + i * 4)) * input[i];
     return static_cast<float>(sum);
 }
 
@@ -90,10 +84,10 @@ __attribute__((target("avx2,f16c"))) float f16_dot(const std::byte* weights, con
     auto total = _mm256_setzero_pd();
     std::size_t i = 0;
     for (; i + 8 <= count; i += 8)
-        total = accumulate8(total, _mm256_cvtph_ps(read<__m128i>(weights + i * 2)), input + i);
+        total = accumulate8(total, _mm256_cvtph_ps(read_unaligned<__m128i>(weights + i * 2)), input + i);
     double sum = horizontal_sum(total);
     for (; i < count; ++i)
-        sum += static_cast<double>(half_to_float(read<std::uint16_t>(weights + i * 2))) * input[i];
+        sum += static_cast<double>(half_to_float(read_unaligned<std::uint16_t>(weights + i * 2))) * input[i];
     return static_cast<float>(sum);
 }
 
@@ -101,12 +95,12 @@ float bf16_dot(const std::byte* weights, const float* input, std::size_t count) 
     auto total = _mm256_setzero_pd();
     std::size_t i = 0;
     for (; i + 8 <= count; i += 8) {
-        const auto ints = _mm256_cvtepu16_epi32(read<__m128i>(weights + i * 2));
+        const auto ints = _mm256_cvtepu16_epi32(read_unaligned<__m128i>(weights + i * 2));
         total = accumulate8(total, _mm256_castsi256_ps(_mm256_slli_epi32(ints, 16)), input + i);
     }
     double sum = horizontal_sum(total);
     for (; i < count; ++i)
-        sum += static_cast<double>(bf16_to_float(read<std::uint16_t>(weights + i * 2))) * input[i];
+        sum += static_cast<double>(bf16_to_float(read_unaligned<std::uint16_t>(weights + i * 2))) * input[i];
     return static_cast<float>(sum);
 }
 
@@ -128,10 +122,10 @@ void bf16_batch(const std::byte* w, const float* x, std::size_t width, std::size
     batch<DType::bf16>(w, x, width, lanes, out);
 }
 void q8_0_batch(const std::byte* w, const float* x, std::size_t width, std::size_t lanes, float* out) {
-    batch<DType::q8_0, unpack_block<DType::q8_0>>(w, x, width, lanes, out);
+    batch<DType::q8_0, decode_q8_0>(w, x, width, lanes, out);
 }
 void q4_0_batch(const std::byte* w, const float* x, std::size_t width, std::size_t lanes, float* out) {
-    batch<DType::q4_0, unpack_block<DType::q4_0>>(w, x, width, lanes, out);
+    batch<DType::q4_0, decode_q4_0>(w, x, width, lanes, out);
 }
 
 } // namespace nathr::detail::x86

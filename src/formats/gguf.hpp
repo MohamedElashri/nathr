@@ -24,13 +24,13 @@ class Gguf {
     struct Record {
         TensorView view;
         std::size_t offset;
-        bool bound = false;
     };
 
     explicit Gguf(const std::filesystem::path& path);
     [[nodiscard]] TensorView take(std::string_view name, std::initializer_list<std::size_t> shape);
-    [[nodiscard]] bool bound_all() const;
-    [[nodiscard]] std::string_view first_unbound() const;
+    [[nodiscard]] std::string_view first_unbound() const noexcept {
+        return tensors_.empty() ? std::string_view{} : tensors_.begin()->first;
+    }
     [[nodiscard]] const auto& records() const noexcept { return tensors_; }
     [[nodiscard]] const Json& tokenizer() const noexcept { return tokenizer_; }
     [[nodiscard]] std::string tokenizer_fingerprint() const;

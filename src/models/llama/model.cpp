@@ -5,6 +5,7 @@
 #include <cmath>
 #include <system_error>
 #include <type_traits>
+#include <utility>
 
 namespace nathr::detail {
 
@@ -14,22 +15,22 @@ Scratch::Scratch(const ModelConfig& c, std::size_t positions, std::size_t block)
     const auto intermediate_rows = product({block, c.intermediate}, "feed-forward workspace");
     const auto packing =
         block == 1 ? 0 : product({batch_tile, std::max(c.hidden, c.intermediate)}, "matrix tile workspace");
-    const auto widths =
-        std::array{hidden_rows, hidden_rows,       kv_rows,           kv_rows, hidden_rows, hidden_rows,
-                   hidden_rows, intermediate_rows, intermediate_rows, packing, positions,   c.vocabulary};
+    const std::pair<std::span<float>*, std::size_t> buffers[] = {
+        {&hidden, hidden_rows},     {&query, hidden_rows},      {&keys, kv_rows},
+        {&values, kv_rows},         {&norm, hidden_rows},       {&attention, hidden_rows},
+        {&projection, hidden_rows}, {&gate, intermediate_rows}, {&up, intermediate_rows},
+        {&packed, packing},         {&scores, positions},       {&logits, c.vocabulary},
+    };
     std::size_t count = 0;
-    for (const auto width : widths)
-        count = sum(count, width, "workspace");
-    if (count > scratch_limit / sizeof(float))
+    for (const auto& buffer : buffers)
+        count = sum(count, buffer.second, "workspace");
+    if (count > max_workspace_bytes / sizeof(float))
         throw Error(ErrorCode::resource_limit, "workspace exceeds 32 MiB");
     storage.resize(count);
     auto remaining = std::span(storage);
-    const auto buffers = std::array{&hidden,     &query, &keys, &values, &norm,   &attention,
-                                    &projection, &gate,  &up,   &packed, &scores, &logits};
-    static_assert(buffers.size() == widths.size());
-    for (std::size_t i = 0; i < widths.size(); ++i) {
-        *buffers[i] = remaining.first(widths[i]);
-        remaining = remaining.subspan(widths[i]);
+    for (const auto& [buffer, width] : buffers) {
+        *buffer = remaining.first(width);
+        remaining = remaining.subspan(width);
     }
 }
 
@@ -82,28 +83,15 @@ Model::Impl::WeightFile Model::Impl::open(const std::filesystem::path& path, boo
     return WeightFile(std::in_place_type<Gguf>, path);
 }
 
-Model::Impl::Impl(const std::filesystem::path& path, bool hf_directory, BackendOptions options)
+Model::Impl::Impl(const std::filesystem::path& path, bool hf_directory, BackendOptions options,
+                  CpuFeatures features)
     : config(hf_directory ? load_llama_config(path / "config.json") : ModelConfig{}),
       tensors(open(path, hf_directory)), thread_count(options.threads), pool(thread_count) {
     if (!hf_directory)
         config = load_llama_config(std::get<Gguf>(tensors));
-    std::visit([&](auto& file) { bind(file, path); }, tensors);
-    const auto features = cpu_features();
+    std::visit([&](auto& file) { bind(file, path, options.policy, features); }, tensors);
     const bool use_avx2 = options.policy != ExecutionPolicy::scalar && features.avx2;
     active_backend = use_avx2 ? "avx2" : "scalar";
-    const auto kernel_for = [&](TensorView tensor) {
-        const auto type = tensor.desc.dtype;
-        auto& kernel = kernels[static_cast<std::uint32_t>(type)];
-        if (!kernel.dot)
-            kernel = select_kernel(type, options.policy, features);
-    };
-    kernel_for(embedding);
-    kernel_for(output);
-    kernel_for(norm);
-    for (const auto& l : layers) {
-        for (auto tensor : {l.input_norm, l.q, l.k, l.v, l.o, l.post_attention_norm, l.gate, l.up, l.down})
-            kernel_for(tensor);
-    }
     frequency.resize(config.head_dim / 2);
     for (std::size_t i = 0; i < frequency.size(); ++i) {
         const double power = static_cast<double>(i) / static_cast<double>(frequency.size());
@@ -111,15 +99,21 @@ Model::Impl::Impl(const std::filesystem::path& path, bool hf_directory, BackendO
     }
 }
 
-template <class File> void Model::Impl::bind(File& file, const std::filesystem::path& path) {
+template <class File>
+void Model::Impl::bind(File& file, const std::filesystem::path& path, ExecutionPolicy policy,
+                       CpuFeatures features) {
     constexpr bool gguf = std::is_same_v<File, Gguf>;
     const auto h = config.hidden;
     const auto kv = config.kv_heads * config.head_dim;
     const auto ff = config.intermediate;
     const auto take = [&](std::string_view name, std::initializer_list<std::size_t> shape) {
-        auto view = file.take(name, shape);
-        const auto format = encoding(view.desc.dtype);
-        if (!executable_encoding(view.desc.dtype) || (shape.size() == 1 && format->elements != 1)) {
+        const auto view = file.take(name, shape);
+        const auto type = view.desc.dtype;
+        const auto format = encoding(type);
+        auto& kernel = kernels[static_cast<std::size_t>(type)];
+        if (!kernel.dot)
+            kernel = select_kernel(type, policy, features);
+        if (!kernel.dot || (shape.size() == 1 && format->elements != 1)) {
             throw Error(ErrorCode::unsupported, path.string() + ": no execution kernel for " +
                                                     std::string(name) + " (" + std::string(format->name) +
                                                     ")");
@@ -156,9 +150,8 @@ template <class File> void Model::Impl::bind(File& file, const std::filesystem::
             layer.q.rotary_head_width = layer.k.rotary_head_width = config.head_dim;
         layers.push_back(layer);
     }
-    if (!file.bound_all())
-        throw Error(ErrorCode::unsupported,
-                    path.string() + ": unexpected tensor " + std::string(file.first_unbound()));
+    if (const auto name = file.first_unbound(); !name.empty())
+        throw Error(ErrorCode::unsupported, path.string() + ": unexpected tensor " + std::string(name));
     if constexpr (gguf)
         file.discard_metadata();
 }
@@ -272,18 +265,14 @@ void Model::Impl::execute(std::span<const Token> tokens, std::size_t start, Cach
 }
 
 Model Model::load(const std::filesystem::path& path, BackendOptions options) {
-    if (!options.threads || options.threads > max_cpu_threads)
-        throw Error(ErrorCode::invalid_argument, "CPU thread count must be between 1 and 64");
+    validate_thread_count(options.threads);
     if (options.policy != ExecutionPolicy::scalar && options.policy != ExecutionPolicy::automatic &&
         options.policy != ExecutionPolicy::avx2)
         throw Error(ErrorCode::unsupported, "unknown execution policy");
-    if (options.policy == ExecutionPolicy::avx2 && !cpu_features().avx2)
+    const auto features = cpu_features();
+    if (options.policy == ExecutionPolicy::avx2 && !features.avx2)
         throw Error(ErrorCode::unsupported, "AVX2 was requested but CPU or OS AVX2 state is unavailable");
-    std::error_code error;
-    const bool hf_directory = std::filesystem::is_directory(path, error);
-    if (error)
-        throw Error(ErrorCode::io, path.string() + ": " + error.message());
-    return Model(std::make_shared<Impl>(path, hf_directory, options));
+    return Model(std::make_shared<Impl>(path, is_model_directory(path), options, features));
 }
 
 const ModelConfig& Model::config() const noexcept {
@@ -308,7 +297,7 @@ std::string_view Model::kernel(std::uint32_t id) const noexcept {
 
 void Model::forward(std::span<const Token> tokens, LogitsMode mode, std::span<float> last_logits,
                     const LogitsSink& sink, const TraceSink& trace) const {
-    validate_tokens(tokens, config(), std::min(config().context, prompt_chunk));
+    validate_tokens(tokens, config(), std::min(config().context, max_uncached_tokens));
     validate_mode(mode, sink);
     if ((mode == LogitsMode::last_token && last_logits.size() != config().vocabulary) ||
         (mode != LogitsMode::last_token && !last_logits.empty())) {

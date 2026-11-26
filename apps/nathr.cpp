@@ -105,8 +105,6 @@ template <class Number> Number number(Arguments& args, const std::string& option
 std::vector<Token> parse_tokens(std::string_view text) {
     std::vector<Token> tokens;
     while (true) {
-        if (tokens.size() == 8192)
-            invalid("too many token IDs");
         const auto comma = text.find(',');
         tokens.push_back(parse_number<Token>(text.substr(0, comma), "--tokens"));
         if (comma == text.npos)
@@ -128,8 +126,7 @@ BackendOptions backend_options(Arguments& args) {
     else
         throw Error(ErrorCode::unsupported, "unsupported backend: " + backend);
     const auto threads = number(args, "--threads", 1u);
-    if (!threads || threads > detail::max_cpu_threads)
-        invalid("CPU thread count must be between 1 and 64");
+    detail::validate_thread_count(threads);
     return {policy, threads};
 }
 
@@ -176,7 +173,7 @@ Json gguf_info(const std::filesystem::path& path, BackendOptions options) {
     for (const auto& [name, item] : file.records()) {
         const auto& view = item.view;
         const auto& format = *detail::encoding(view.desc.dtype);
-        const auto dimensions = std::span(view.desc.shape).first(view.desc.rank);
+        const auto dimensions = view.desc.dimensions();
         auto shape = std::vector<std::size_t>(dimensions.rbegin(), dimensions.rend());
         tensors[name] = {{"shape", shape},
                          {"encoding", format.name},
@@ -328,41 +325,40 @@ void forward(Arguments& args, const std::filesystem::path& path, BackendOptions 
     args.finish();
 
     const auto model = Model::load(path, options);
+    const auto mode = (stream || trace_path) ? LogitsMode::all_tokens : LogitsMode::last_token;
+    std::vector<float> logits(stream ? 0 : model.config().vocabulary);
+    TraceFile trace_file;
+    TraceSink trace;
+    LogitsSink sink;
     if (stream) {
         static_assert(std::endian::native == std::endian::little && sizeof(float) == 4);
-        const LogitsSink sink = [](std::size_t, std::span<const float> values) {
+        sink = [](std::size_t, std::span<const float> values) {
             std::cout.write(reinterpret_cast<const char*>(values.data()),
                             static_cast<std::streamsize>(values.size_bytes()));
             if (!std::cout)
                 throw Error(ErrorCode::io, "cannot write FP32 logits to stdout");
         };
-        if (cached) {
-            auto session = Session::create(model, context, 0, settings);
-            session.prefill(ids, LogitsMode::all_tokens, sink);
-        } else {
-            model.forward(ids, LogitsMode::all_tokens, {}, sink);
-        }
+    } else if (trace_path) {
+        trace = [&](const TraceEvent& event) { trace_file.record(event); };
+        sink = [&](std::size_t pos, std::span<const float> output) {
+            if (pos + 1 == ids.size())
+                std::ranges::copy(output, logits.begin());
+        };
+    }
+    if (cached) {
+        auto session = Session::create(model, context, 0, settings);
+        session.prefill(ids, mode, sink, trace);
+        if (mode == LogitsMode::last_token)
+            std::ranges::copy(session.logits(), logits.begin());
+    } else {
+        const auto last = mode == LogitsMode::last_token ? std::span<float>(logits) : std::span<float>{};
+        model.forward(ids, mode, last, sink, trace);
+    }
+    if (stream) {
         std::cout.flush();
         if (!std::cout)
             throw Error(ErrorCode::io, "cannot flush FP32 logits to stdout");
         return;
-    }
-    const auto mode = trace_path ? LogitsMode::all_tokens : LogitsMode::last_token;
-    std::vector<float> logits(model.config().vocabulary);
-    TraceFile trace_file;
-    const auto trace =
-        trace_path ? TraceSink([&](const TraceEvent& event) { trace_file.record(event); }) : TraceSink{};
-    const auto sink = trace_path ? LogitsSink([&](std::size_t pos, std::span<const float> output) {
-        if (pos + 1 == ids.size())
-            std::ranges::copy(output, logits.begin());
-    })
-                                 : LogitsSink{};
-    if (cached) {
-        auto session = Session::create(model, context, 0, settings);
-        session.prefill(ids, mode, sink, trace);
-        std::ranges::copy(session.logits(), logits.begin());
-    } else {
-        model.forward(ids, mode, trace_path ? std::span<float>{} : std::span<float>{logits}, sink, trace);
     }
     if (trace_path)
         trace_file.write(*trace_path, ids);
@@ -425,11 +421,11 @@ void tokenize(Arguments& args, const std::filesystem::path& path) {
         std::cout << text_tokens(tokenizer, *prompt, stages).dump() << '\n';
     } else {
         const auto ids = parse_tokens(*tokens);
-        std::cout << Json({{"ids", ids},
-                           {"decoded", tokenizer.decode(ids, skip_special)},
-                           {"raw_hex", hex_bytes(tokenizer.decode_bytes(ids, skip_special))}})
-                         .dump()
-                  << '\n';
+        const auto bytes = tokenizer.decode_bytes(ids, skip_special);
+        Utf8Stream decoder;
+        auto decoded = decoder.push(bytes);
+        decoded += decoder.finish();
+        std::cout << Json({{"ids", ids}, {"decoded", decoded}, {"raw_hex", hex_bytes(bytes)}}).dump() << '\n';
     }
 }
 
@@ -626,8 +622,9 @@ void usage() {
                  "nathr inspect MODEL\n"
                  "nathr forward MODEL --tokens 1,2,3 [--cached] [--context N] [--trace FILE] [--json]\n"
                  "  --logits-f32 streams little-endian FP32 vocabulary rows to stdout\n"
-                 "nathr tokenize MODEL (PROMPT | --tokens IDS | --stdin) [--stages] [--tokenizer "
-                 "FILE]\n"
+                 "nathr tokenize MODEL (PROMPT | --tokens IDS | --stdin) [--tokenizer FILE]\n"
+                 "  --stdin reads one JSON string per line. --stages shows pretokenization.\n"
+                 "  --skip-special omits special tokens when decoding --tokens.\n"
                  "nathr generate MODEL (PROMPT | --tokens IDS) [--bos] [--max-new-tokens N] "
                  "[--context N]\n"
                  "  [--greedy | --temperature T --top-k K --top-p P] [--seed N] [--tokenizer FILE] [--json]\n"

@@ -4,9 +4,11 @@
 
 namespace nathr::detail {
 
+void decode_q4_0(const std::byte*, float*);
 void decode_q4_1(const std::byte*, float*);
 void decode_q5_0(const std::byte*, float*);
 void decode_q5_1(const std::byte*, float*);
+void decode_q8_0(const std::byte*, float*);
 void decode_q2_k(const std::byte*, float*);
 void decode_q3_k(const std::byte*, float*);
 void decode_q4_k(const std::byte*, float*);

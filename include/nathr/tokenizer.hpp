@@ -10,12 +10,12 @@ namespace nathr {
 class Tokenizer {
   public:
     static Tokenizer load(const std::filesystem::path& tokenizer_json);
-    // GGUF text uses the embedded tables or an explicitly supplied canonical sidecar.
+    // A GGUF sidecar must match the embedded token IDs and merge order.
     static Tokenizer load_model(const std::filesystem::path& model,
                                 const std::filesystem::path& sidecar = {});
     [[nodiscard]] std::size_t vocabulary() const noexcept;
     [[nodiscard]] std::vector<Token> encode(std::string_view text) const;
-    // ByteLevel strings before added-token extraction, for differential diagnostics.
+    // Returns the pretokenized pieces with added tokens treated as ordinary text.
     [[nodiscard]] std::vector<std::string> pretokenize(std::string_view text) const;
     [[nodiscard]] std::string_view token_bytes(Token token, bool skip_special = false) const;
     [[nodiscard]] std::string decode_bytes(std::span<const Token> tokens, bool skip_special = false) const;

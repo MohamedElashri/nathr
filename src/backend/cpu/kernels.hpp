@@ -30,15 +30,8 @@ constexpr CpuFeatures usable_features(FeatureInputs input) {
 
 KernelChoice scalar_kernel(DType type);
 KernelChoice select_kernel(DType type, ExecutionPolicy policy, CpuFeatures features);
-inline bool executable_encoding(DType type) {
-    return scalar_kernel(type).dot != nullptr;
-}
-void linear_with(RowDot kernel, TensorView weight, std::span<const float> input, std::span<float> output);
 void project(const KernelChoice& kernel, const ThreadPool& pool, TensorView weight,
              std::span<const float> input, std::span<float> output, std::size_t tokens,
              std::span<float> packed);
-
-// Both serialized formats use an IEEE F16 scale followed by packed payload.
-template <DType type> void unpack_block(const std::byte* input, float* output);
 
 } // namespace nathr::detail

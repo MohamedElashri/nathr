@@ -36,6 +36,8 @@ Replace the quoted prompt to try your own. Run `./build/release/nathr --help` to
 
 ## How inference works
 
+The inference engine guide covers the model equations and cache layout with worked examples. [Inference engine guide](docs/inference-engine.md)
+
 ```mermaid
 flowchart LR
     Prompt --> Tokenizer
@@ -48,14 +50,14 @@ flowchart LR
 
 1. The model loader checks tensor sizes and shapes and binds weights by name. Safetensors weights are read into a shared model buffer. GGUF files are memory-mapped, and quantized weights stay in their packed format. [Safetensors loader](src/formats/safetensors.cpp) · [GGUF loader](src/formats/gguf.cpp)
 2. The byte-level BPE tokenizer looks up byte tokens and merges neighboring tokens in the order specified by the model's merge table. The resulting IDs index the embedding table. [Tokenizer](src/tokenizer/tokenizer.cpp)
-3. Each decoder block normalizes its input with RMSNorm and projects it to queries, keys, and values. Rotary position embeddings (RoPE) encode position in the queries and keys. Causal attention compares each query with keys at or before its position, then uses softmax to turn the scores into weights for the values. SmolLM2 shares three key/value heads across nine query heads. A SwiGLU feed-forward layer follows attention. The final output projection produces one score, or logit, per vocabulary token. [Decoder](src/models/llama/model.cpp) · [Attention](src/backend/cpu/scalar.cpp)
+3. Each decoder block uses RMSNorm, causal attention with rotary position embeddings (RoPE), and a SwiGLU feed-forward layer. Grouped-query attention lets several query heads share one key/value head. The final projection produces one score, or logit, per vocabulary token. [Decoder](src/models/llama/model.cpp) · [Attention](src/backend/cpu/scalar.cpp)
 4. **Prefill** processes the prompt in chunks and saves each layer's keys and values. During **decode**, the sampler takes the highest logit or draws a token using temperature, top-k, and top-p. Nathr emits the token and appends it when another generation step is needed. Attention reuses the saved keys and values for earlier tokens. Generation ends at the end-of-sequence token or the token limit. [Sessions](src/runtime/session.cpp) · [Sampling and generation](src/runtime/generation.cpp)
 
 ## CPU execution and memory
 
 Nathr selects kernels by tensor encoding. The automatic backend uses AVX2 kernels when supported and falls back to scalar kernels where needed. During prefill, a weight row can serve several tokens in a small tile. Decoding a single token uses row-wise dot products. [CPU kernels](src/backend/cpu/kernels.cpp)
 
-Sessions share model weights and own a preallocated key-value (KV) cache, working memory, and random state. The cache size is proportional to the configured context capacity. At SmolLM2-135M's 8,192-token limit, it occupies 360 MiB in FP32 or 180 MiB in FP16. Attention reads FP16 entries as FP32 values. [Session allocation](src/runtime/session.cpp)
+Sessions share model weights and own their key-value (KV) cache, working memory, and random state. KV cache size grows with the configured context capacity. FP16 cache storage uses half the memory of FP32. [Session allocation](src/runtime/session.cpp)
 
 ## Model compatibility
 
@@ -127,7 +129,7 @@ If a download or checksum fails, rerun that block. To use an existing checkpoint
     --greedy --max-new-tokens 32 --context 512 --backend auto
 ```
 
-Nathr prints the continuation after the prompt. With the Safetensors checkpoint it starts with `, there was a little girl named Lily.` The quantized checkpoint can produce different text. Replace the quoted prompt to try your own. `--greedy` picks the highest-scoring token at each step and `--max-new-tokens` limits the continuation. Raise `--context` for longer prompts or continuations, up to the model limit of 8,192 tokens. `--backend auto` selects the available CPU kernels.
+`--greedy` picks the highest-scoring token at each step, and `--max-new-tokens` limits the continuation. Set `--context` within the checkpoint's context limit and the session's memory budget. `--backend auto` selects the available CPU kernels.
 
 ### 4. Inspect and benchmark
 
@@ -137,7 +139,6 @@ Nathr prints the continuation after the prompt. With the Safetensors checkpoint 
 ./build/release/nathr forward "$model" --tokens 6403,1980,253,655
 ./build/release/nathr bench "$model" --prompt-length 128 --decode-length 32 \
     --context 512 --backend auto --threads 4 --warmups 1 --repetitions 3
-./build/release/nathr --help
 ```
 
 `inspect` writes checkpoint metadata. `tokenize` should return IDs `[6403,1980,253,655]` for this prompt. `forward` takes those IDs and reports the highest-scoring next token ID. `bench` reports prefill and decode throughput on fixed inputs. The benchmark uses four CPU threads in this example.

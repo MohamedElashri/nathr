@@ -1,5 +1,7 @@
 #include <nathr/generation.hpp>
 
+#include "core/limits.hpp"
+
 #include <algorithm>
 #include <cmath>
 
@@ -7,7 +9,7 @@ namespace nathr {
 
 Sampler::Sampler(SamplingOptions options, std::size_t vocabulary)
     : options_(options), vocabulary_(vocabulary) {
-    if (!vocabulary || vocabulary > 65536 || options.top_k > vocabulary ||
+    if (!vocabulary || vocabulary > detail::max_vocabulary || options.top_k > vocabulary ||
         !std::isfinite(options.temperature) || options.temperature <= 0 || !std::isfinite(options.top_p) ||
         options.top_p <= 0 || options.top_p > 1) {
         throw Error(ErrorCode::invalid_argument, "invalid sampling parameters");

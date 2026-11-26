@@ -30,13 +30,7 @@ class Reader {
 
     std::uint64_t uint(std::size_t width) { return little_integer(take(width)); }
 
-    std::string text() {
-        const auto count = uint(8);
-        if (count > 65536)
-            fail("GGUF string exceeds 64 KiB");
-        const auto bytes = take(count);
-        return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
-    }
+    std::string text() { return std::string(text_view()); }
 
     Json value(std::uint32_t type, bool keep) {
         if (type == 9) {
@@ -46,11 +40,12 @@ class Reader {
                 fail("unsupported GGUF array element type");
             if (count > 65536)
                 fail("GGUF array exceeds 65,536 elements");
-            auto array = Json::array();
+            Json array;
             if (keep) {
                 if (count > 262144 - kept_elements_)
                     fail("GGUF retained metadata exceeds aggregate element limit", ErrorCode::resource_limit);
                 kept_elements_ += count;
+                array = Json::array();
                 array.get_ref<Json::array_t&>().reserve(count);
             }
             for (std::uint64_t i = 0; i < count; ++i) {
@@ -58,7 +53,7 @@ class Reader {
                 if (keep)
                     array.push_back(std::move(item));
             }
-            return keep ? std::move(array) : Json{};
+            return array;
         }
         return scalar(type, keep);
     }
@@ -93,11 +88,10 @@ class Reader {
                 fail("invalid GGUF boolean");
             return byte != 0;
         }
-        case 8:
-            if (keep)
-                return text();
-            skip_text();
-            return {};
+        case 8: {
+            const auto text = text_view();
+            return keep ? Json(text) : Json{};
+        }
         case 10:
             return uint(8);
         case 11:
@@ -109,11 +103,12 @@ class Reader {
         }
     }
 
-    void skip_text() {
+    std::string_view text_view() {
         const auto count = uint(8);
         if (count > 65536)
             fail("GGUF string exceeds 64 KiB");
-        (void)take(count);
+        const auto bytes = take(count);
+        return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
     }
 
     std::span<const std::byte> header_;
@@ -143,7 +138,7 @@ MappedFile::MappedFile(const std::filesystem::path& path) {
         throw Error(ErrorCode::unsupported, path.string() + ": expected a regular GGUF file");
     if (info.st_size < 24)
         throw Error(ErrorCode::malformed, path.string() + ": truncated GGUF prefix");
-    if (info.st_size > static_cast<off_t>(1024 * mib))
+    if (info.st_size > static_cast<off_t>(max_checkpoint_bytes))
         throw Error(ErrorCode::resource_limit, path.string() + ": GGUF file exceeds 1 GiB");
     const auto size = static_cast<std::size_t>(info.st_size);
     void* base = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -269,26 +264,14 @@ Gguf::Gguf(const std::filesystem::path& path) : path_(path), file_(path) {
 
 TensorView Gguf::take(std::string_view name, std::initializer_list<std::size_t> shape) {
     const auto it = tensors_.find(name);
-    if (it == tensors_.end() || it->second.bound)
+    if (it == tensors_.end())
         throw Error(ErrorCode::malformed, path_.string() + ": missing GGUF tensor " + std::string(name));
     const auto view = it->second.view;
-    if (!std::ranges::equal(shape, std::span(view.desc.shape).first(view.desc.rank)))
+    if (!std::ranges::equal(shape, view.desc.dimensions()))
         throw Error(ErrorCode::malformed,
                     path_.string() + ": wrong shape for GGUF tensor " + std::string(name));
-    it->second.bound = true;
+    tensors_.erase(it);
     return view;
-}
-
-bool Gguf::bound_all() const {
-    return first_unbound().empty();
-}
-
-std::string_view Gguf::first_unbound() const {
-    for (const auto& [name, entry] : tensors_) {
-        if (!entry.bound)
-            return name;
-    }
-    return {};
 }
 
 std::string Gguf::tokenizer_fingerprint() const {
@@ -303,7 +286,6 @@ void Gguf::discard_metadata() {
     architecture_ = {};
     tokenizer_ = {};
     split_ = {};
-    tensors_.clear();
 }
 
 } // namespace nathr::detail

@@ -6,9 +6,13 @@
 
 namespace nathr::detail {
 
-ThreadPool::ThreadPool(unsigned threads) : lanes_(threads) {
-    if (!threads || threads > max_cpu_threads)
+void validate_thread_count(unsigned threads) {
+    if (!threads || threads > 64)
         throw Error(ErrorCode::invalid_argument, "CPU thread count must be between 1 and 64");
+}
+
+ThreadPool::ThreadPool(unsigned threads) : lanes_(threads) {
+    validate_thread_count(threads);
     workers_.reserve(threads - 1);
     try {
         for (std::size_t lane = 1; lane < lanes_; ++lane)

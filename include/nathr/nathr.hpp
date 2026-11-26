@@ -63,7 +63,7 @@ using TraceSink = std::function<void(const TraceEvent&)>;
 
 class Model {
   public:
-    static Model load(const std::filesystem::path& directory, BackendOptions options = {});
+    static Model load(const std::filesystem::path& path, BackendOptions options = {});
     [[nodiscard]] const ModelConfig& config() const noexcept;
     [[nodiscard]] ModelMemory memory() const noexcept;
     [[nodiscard]] std::string_view backend() const noexcept;

@@ -11,7 +11,7 @@ namespace {
 void validate_geometry(const ModelConfig& c, const std::string& path) {
     if (!c.layers || c.layers > 56 || !c.hidden || !c.intermediate || !c.query_heads || !c.kv_heads ||
         c.query_heads % c.kv_heads || c.hidden % c.query_heads || !c.context || !c.vocabulary ||
-        c.vocabulary > 65536) {
+        c.vocabulary > max_vocabulary) {
         throw Error(ErrorCode::unsupported, path + ": unsupported Llama dimensions or head geometry");
     }
 }

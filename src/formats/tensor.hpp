@@ -30,7 +30,8 @@ enum class DType : std::uint32_t {
     iq2_s = 22,
     iq4_xs = 23,
     iq1_m = 29,
-    bf16 = 30
+    bf16 = 30,
+    id_limit,
 };
 
 struct Encoding {
@@ -40,7 +41,7 @@ struct Encoding {
     std::size_t bytes;
 };
 
-// Serialized geometry from the GGUF manifest and pinned GGML type specification.
+// GGUF encoding names and serialized block sizes.
 inline constexpr Encoding encodings[] = {
     {DType::f32, "F32", 1, 4},
     {DType::f16, "F16", 1, 2},
@@ -79,6 +80,10 @@ struct TensorDesc {
     std::array<std::size_t, 4> shape{};
     std::size_t rank{};
     std::size_t elements{};
+
+    [[nodiscard]] std::span<const std::size_t> dimensions() const noexcept {
+        return std::span(shape).first(rank);
+    }
 };
 
 struct TensorView {

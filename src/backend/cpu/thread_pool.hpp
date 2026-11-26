@@ -9,7 +9,7 @@
 
 namespace nathr::detail {
 
-inline constexpr unsigned max_cpu_threads = 64;
+void validate_thread_count(unsigned threads);
 
 // The caller participates. Parallel submissions on a shared model are serialized;
 // callbacks and work below the parallel threshold stay on their calling thread.

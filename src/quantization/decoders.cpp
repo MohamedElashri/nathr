@@ -37,18 +37,18 @@ unsigned nibble(const std::byte* p, std::size_t index) {
     return bits(byte(p, index / 2), 4 * (index % 2), 15);
 }
 
-// The legacy nibbles occupy two planes of 16, not adjacent values.
-unsigned legacy_nibble(const std::byte* p, std::size_t index) {
+// The low nibbles form the first 16 codes and the high nibbles form the next 16.
+unsigned planar_nibble(const std::byte* p, std::size_t index) {
     return bits(byte(p, index % 16), 4 * (index / 16), 15);
 }
 
-template <bool affine> void legacy_q5(const std::byte* p, float* out) {
+template <bool affine> void decode_q5(const std::byte* p, float* out) {
     constexpr auto high_offset = affine ? 4 : 2;
     const auto d = half(p, 0);
     const auto minimum = affine ? half(p, 2) : 0.0f;
     const auto high = dword(p, high_offset);
     for (unsigned i = 0; i < 32; ++i) {
-        const int code = legacy_nibble(p + high_offset + 4, i) | (bits(high, i, 1) << 4);
+        const int code = planar_nibble(p + high_offset + 4, i) | (bits(high, i, 1) << 4);
         if constexpr (affine)
             out[i] = d * code + minimum;
         else
@@ -111,22 +111,34 @@ void ternary_grid(unsigned index, float scale, bool negative_delta, float* out) 
 
 void nonlinear_nibbles(const std::byte* p, float scale, float* out) {
     for (unsigned i = 0; i < 32; ++i)
-        out[i] = scale * codebooks::kvalues_iq4nl[legacy_nibble(p, i)];
+        out[i] = scale * codebooks::kvalues_iq4nl[planar_nibble(p, i)];
 }
 
 } // namespace
 
+void decode_q4_0(const std::byte* p, float* out) {
+    const auto d = half(p, 0);
+    for (unsigned i = 0; i < 32; ++i)
+        out[i] = d * (static_cast<int>(planar_nibble(p + 2, i)) - 8);
+}
+
 void decode_q4_1(const std::byte* p, float* out) {
     const auto d = half(p, 0), m = half(p, 2);
     for (unsigned i = 0; i < 32; ++i)
-        out[i] = d * legacy_nibble(p + 4, i) + m;
+        out[i] = d * planar_nibble(p + 4, i) + m;
 }
 
 void decode_q5_0(const std::byte* p, float* out) {
-    legacy_q5<false>(p, out);
+    decode_q5<false>(p, out);
 }
 void decode_q5_1(const std::byte* p, float* out) {
-    legacy_q5<true>(p, out);
+    decode_q5<true>(p, out);
+}
+
+void decode_q8_0(const std::byte* p, float* out) {
+    const auto d = half(p, 0);
+    for (unsigned i = 0; i < 32; ++i)
+        out[i] = d * signed_byte(byte(p, 2 + i));
 }
 
 void decode_q2_k(const std::byte* p, float* out) {

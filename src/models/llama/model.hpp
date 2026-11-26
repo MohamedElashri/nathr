@@ -27,17 +27,18 @@ void validate_mode(LogitsMode mode, const LogitsSink& sink);
 } // namespace nathr::detail
 
 struct nathr::Model::Impl {
-    Impl(const std::filesystem::path& path, bool hf_directory, BackendOptions options);
+    Impl(const std::filesystem::path& path, bool hf_directory, BackendOptions options, CpuFeatures features);
     using WeightFile = std::variant<detail::SafeTensors, detail::Gguf>;
     static WeightFile open(const std::filesystem::path& path, bool hf_directory);
-    template <class File> void bind(File& file, const std::filesystem::path& path);
+    template <class File>
+    void bind(File& file, const std::filesystem::path& path, ExecutionPolicy policy, CpuFeatures features);
     void execute(std::span<const Token> tokens, std::size_t start, detail::Cache* cache,
                  detail::Scratch& scratch, LogitsMode mode, const LogitsSink& sink,
                  const TraceSink& trace) const;
 
     ModelConfig config;
     WeightFile tensors;
-    std::array<detail::KernelChoice, 31> kernels{};
+    std::array<detail::KernelChoice, static_cast<std::size_t>(detail::DType::id_limit)> kernels{};
     std::string_view active_backend;
     detail::TensorView embedding, output, norm;
     std::vector<detail::LayerWeights> layers;

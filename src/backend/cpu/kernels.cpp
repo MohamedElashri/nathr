@@ -51,22 +51,6 @@ KernelChoice select_kernel(DType type, ExecutionPolicy policy, CpuFeatures featu
     return scalar_kernel(type);
 }
 
-namespace {
-void project_rows(RowDot kernel, TensorView weight, std::span<const float> input, std::span<float> output,
-                  std::size_t begin, std::size_t end) {
-    const auto& format = *encoding(weight.desc.dtype);
-    const auto stride = input.size() / format.elements * format.bytes;
-    for (std::size_t row = begin; row < end; ++row) {
-        output[canonical_row(weight, row)] =
-            kernel(weight.bytes.data() + row * stride, input.data(), input.size());
-    }
-}
-} // namespace
-
-void linear_with(RowDot kernel, TensorView weight, std::span<const float> input, std::span<float> output) {
-    project_rows(kernel, weight, input, output, 0, output.size());
-}
-
 void project(const KernelChoice& kernel, const ThreadPool& pool, TensorView weight,
              std::span<const float> input, std::span<float> output, std::size_t tokens,
              std::span<float> packed) {
@@ -77,9 +61,13 @@ void project(const KernelChoice& kernel, const ThreadPool& pool, TensorView weig
     for (std::size_t start = 0; start < tokens; start += batch_tile) {
         const auto count = std::min(batch_tile, tokens - start);
         if (count == 1) {
+            const auto activations = input.subspan(start * width, width);
+            const auto result = output.subspan(start * rows, rows);
             pool.rows(rows, width, [&](std::size_t begin, std::size_t end) {
-                project_rows(kernel.dot, weight, input.subspan(start * width, width),
-                             output.subspan(start * rows, rows), begin, end);
+                for (std::size_t row = begin; row < end; ++row) {
+                    result[canonical_row(weight, row)] =
+                        kernel.dot(weight.bytes.data() + row * stride, activations.data(), width);
+                }
             });
             continue;
         }

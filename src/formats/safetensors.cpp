@@ -1,6 +1,7 @@
 #include "formats/safetensors.hpp"
 
 #include <algorithm>
+#include <array>
 #include <fstream>
 
 namespace nathr::detail {
@@ -21,7 +22,7 @@ SafeTensors::SafeTensors(const std::filesystem::path& path) : path_(path) {
     const auto size = stream.tellg();
     if (size < 0)
         throw Error(ErrorCode::io, path.string() + ": cannot open file");
-    if (static_cast<std::uint64_t>(size) > 1024 * mib)
+    if (static_cast<std::uint64_t>(size) > max_checkpoint_bytes)
         throw Error(ErrorCode::resource_limit, path.string() + ": file exceeds 1 GiB");
     std::array<std::byte, 8> prefix{};
     stream.seekg(0);
@@ -71,7 +72,7 @@ SafeTensors::SafeTensors(const std::filesystem::path& path) : path_(path) {
                 desc.shape[axis] = natural(shape[axis], context);
             }
             // A tensor with a zero extent occupies zero bytes even if an earlier dimension is large.
-            const auto dims = std::span(desc.shape).first(desc.rank);
+            const auto dims = desc.dimensions();
             if (std::ranges::find(dims, 0) != dims.end()) {
                 desc.elements = 0;
             } else {
@@ -86,20 +87,9 @@ SafeTensors::SafeTensors(const std::filesystem::path& path) : path_(path) {
             }
             extents.push_back({begin, end, name, desc});
             memory_.stored_parameters = sum(memory_.stored_parameters, desc.elements, context);
-            ++memory_.tensors;
-            switch (desc.dtype) {
-            case DType::f32:
-                ++memory_.f32_tensors;
-                break;
-            case DType::f16:
-                ++memory_.f16_tensors;
-                break;
-            case DType::bf16:
-                ++memory_.bf16_tensors;
-                break;
-            default:
-                throw Error(ErrorCode::unsupported, context + ": unsupported Safetensors encoding");
-            }
+            memory_.f32_tensors += desc.dtype == DType::f32;
+            memory_.f16_tensors += desc.dtype == DType::f16;
+            memory_.bf16_tensors += desc.dtype == DType::bf16;
         } catch (const Json::exception& error) {
             throw Error(ErrorCode::malformed, context + ": " + error.what());
         }
@@ -129,6 +119,7 @@ SafeTensors::SafeTensors(const std::filesystem::path& path) : path_(path) {
                          TensorView{entry.desc, data.subspan(entry.begin, entry.end - entry.begin)});
     }
     memory_.file_bytes = bytes_.size();
+    memory_.tensors = tensors_.size();
     memory_.encoded_weight_bytes = data_size;
 }
 
@@ -142,7 +133,7 @@ TensorView SafeTensors::take(std::string_view name, std::initializer_list<std::s
         throw Error(ErrorCode::malformed, path_.string() + ": missing tensor " + std::string(name));
     }
     const auto tensor = item->second;
-    if (!std::ranges::equal(shape, std::span(tensor.desc.shape).first(tensor.desc.rank))) {
+    if (!std::ranges::equal(shape, tensor.desc.dimensions())) {
         throw Error(ErrorCode::malformed, path_.string() + ": wrong shape for " + std::string(name));
     }
     tensors_.erase(item);

@@ -10,15 +10,18 @@ namespace nathr::detail {
 // Give each translation unit its own baseline or AVX2 instantiations.
 namespace {
 
+template <class Value> Value read_unaligned(const std::byte* bytes) {
+    Value value;
+    std::memcpy(&value, bytes, sizeof(value));
+    return value;
+}
+
 template <DType dtype> float value_at(const std::byte* bytes, std::size_t index) {
     static_assert(std::endian::native == std::endian::little);
     if constexpr (dtype == DType::f32) {
-        float result;
-        std::memcpy(&result, bytes + index * sizeof(result), sizeof(result));
-        return result;
+        return read_unaligned<float>(bytes + index * sizeof(float));
     } else {
-        std::uint16_t bits;
-        std::memcpy(&bits, bytes + index * sizeof(bits), sizeof(bits));
+        const auto bits = read_unaligned<std::uint16_t>(bytes + index * sizeof(std::uint16_t));
         if constexpr (dtype == DType::bf16)
             return bf16_to_float(bits);
         else

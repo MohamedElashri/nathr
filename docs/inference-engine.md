@@ -171,7 +171,7 @@ This formula assumes keys and values have the same head width and element size. 
 
 **Decode** processes each newly appended token at the current history length. Its queries attend to earlier cached entries and the new entry. The cache avoids recomputing earlier tokens' projections and layers. The new query still visits the entire prefix, so the attention work in each decode step grows with the occupied context.
 
-Validate token IDs and remaining capacity before mutating the session. Nathr exposes logits after a successful forward call. A failure during execution can leave a partially written cache, so the session remains invalid until reset. Reset clears the logical history and restores the original random seed while retaining the buffers. [Session API](../include/nathr/nathr.hpp) · [Session state transitions](../src/runtime/session.cpp)
+Validate token IDs and remaining capacity before mutating the session. Nathr exposes logits after a successful call that requests them. A failure during execution can leave a partially written cache, so the session remains invalid until reset. Reset clears the logical history and restores the original random seed while retaining the buffers. [Session API](../include/nathr/nathr.hpp) · [Session state transitions](../src/runtime/session.cpp)
 
 ## 6. Sample tokens and stream text
 
@@ -193,7 +193,7 @@ Look up each emitted ID's byte sequence and pass it to an incremental UTF-8 deco
 
 ## 7. Execute packed weights and make the CPU path faster
 
-Add packed formats behind the row-dot interface. As a first implementation, unpack one block into a small local buffer, convert its values to FP32, and accumulate their products with the corresponding activation coordinates. Keep the full matrix packed in its backing storage. For a row of `N` weights, its byte stride is `N / elements_per_block * bytes_per_block`. Validate the divisibility when loading the tensor. [Tensor encodings](../src/formats/tensor.hpp) · [Scalar block decoders](../src/backend/cpu/scalar.cpp)
+Add packed formats behind the row-dot interface. As a first implementation, unpack one block into a small local buffer, convert its values to FP32, and accumulate their products with the corresponding activation coordinates. Keep the full matrix packed in its backing storage. For a row of `N` weights, its byte stride is `N / elements_per_block * bytes_per_block`. Validate the divisibility when loading the tensor. [Tensor encodings](../src/formats/tensor.hpp) · [Block decoders](../src/quantization/decoders.cpp)
 
 | Encoding | Block of 32 weights | Bytes per block |
 | --- | --- | ---: |

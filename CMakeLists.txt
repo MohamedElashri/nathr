@@ -27,6 +27,8 @@ endif()
 function(nathr_compile target)
     target_compile_features(${target} PUBLIC cxx_std_20)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -march=x86-64 -ffp-contract=off)
+    target_include_directories(${target} PRIVATE src)
+    target_include_directories(${target} SYSTEM PRIVATE third_party/json)
 endfunction()
 
 include(GNUInstallDirs)
@@ -54,9 +56,7 @@ set_target_properties(nathr_lib PROPERTIES OUTPUT_NAME nathr EXPORT_NAME nathr
     VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 target_include_directories(nathr_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-    PRIVATE src)
-target_include_directories(nathr_lib SYSTEM PRIVATE third_party/json)
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(nathr_lib PUBLIC Threads::Threads)
 nathr_compile(nathr_lib)
 
@@ -66,8 +66,6 @@ set(NATHR_TEST_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 add_executable(nathr apps/nathr.cpp)
 target_compile_definitions(nathr PRIVATE NATHR_VERSION="${PROJECT_VERSION}")
 target_link_libraries(nathr PRIVATE nathr::nathr)
-target_include_directories(nathr PRIVATE src)
-target_include_directories(nathr SYSTEM PRIVATE third_party/json)
 nathr_compile(nathr)
 if(BUILD_SHARED_LIBS AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}" AND
    NOT IS_ABSOLUTE "${CMAKE_INSTALL_BINDIR}")
@@ -92,15 +90,12 @@ install(FILES third_party/json/LICENSE.MIT src/tokenizer/LICENSE.unicode src/qua
 if(BUILD_TESTING)
     add_executable(nathr_tests tests/runtime.cpp tests/allocation_counter.cpp)
     target_compile_definitions(nathr_tests PRIVATE NATHR_FIXTURES="${NATHR_TEST_FIXTURES}")
-    target_include_directories(nathr_tests PRIVATE src)
-    target_include_directories(nathr_tests SYSTEM PRIVATE third_party/json)
-    target_link_libraries(nathr_tests PRIVATE nathr::nathr Threads::Threads)
+    target_link_libraries(nathr_tests PRIVATE nathr::nathr)
     nathr_compile(nathr_tests)
     add_test(NAME nathr-fast COMMAND nathr_tests)
     add_test(NAME nathr-cli COMMAND ${CMAKE_COMMAND} -DNATHR_BIN=$<TARGET_FILE:nathr>
         -DNATHR_FIXTURES=${NATHR_TEST_FIXTURES} -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake)
-    set_tests_properties(nathr-fast PROPERTIES LABELS fast)
-    set_tests_properties(nathr-cli PROPERTIES LABELS fast)
+    set_tests_properties(nathr-fast nathr-cli PROPERTIES LABELS fast)
     if(NOT NATHR_SANITIZER AND NOT NATHR_BUILD_FUZZERS AND
        NOT IS_ABSOLUTE "${CMAKE_INSTALL_BINDIR}" AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}" AND
        NOT IS_ABSOLUTE "${CMAKE_INSTALL_INCLUDEDIR}" AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_DOCDIR}")
@@ -118,8 +113,6 @@ if(NATHR_BUILD_FUZZERS)
         add_executable(nathr_fuzz_${kind} tests/fuzz.cpp)
         target_compile_definitions(nathr_fuzz_${kind} PRIVATE
             NATHR_FUZZ_${kind} NATHR_FIXTURES="${NATHR_TEST_FIXTURES}")
-        target_include_directories(nathr_fuzz_${kind} PRIVATE src)
-        target_include_directories(nathr_fuzz_${kind} SYSTEM PRIVATE third_party/json)
         target_link_libraries(nathr_fuzz_${kind} PRIVATE nathr::nathr)
         target_link_options(nathr_fuzz_${kind} PRIVATE -fsanitize=fuzzer)
         nathr_compile(nathr_fuzz_${kind})

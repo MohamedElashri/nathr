@@ -60,13 +60,6 @@ Session Session::create(const Model& model, std::size_t capacity, std::uint64_t 
         throw Error(ErrorCode::invalid_argument, "prefill chunk must be between 1 and 32 tokens");
     if (options.kv_precision != KvPrecision::f32 && options.kv_precision != KvPrecision::f16)
         throw Error(ErrorCode::invalid_argument, "unknown KV cache precision");
-    const auto& c = model.config();
-    const auto element_size =
-        options.kv_precision == KvPrecision::f16 ? sizeof(std::uint16_t) : sizeof(float);
-    const auto bytes =
-        detail::product({2, c.layers, c.kv_heads, capacity, c.head_dim, element_size}, "KV cache");
-    if (bytes > 512 * detail::mib)
-        throw Error(ErrorCode::resource_limit, "KV cache exceeds 512 MiB");
     return Session(std::make_unique<Impl>(model, capacity, seed, options));
 }
 

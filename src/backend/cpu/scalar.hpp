@@ -27,7 +27,6 @@ struct Cache {
 
 struct Scalar {
     static void embedding(TensorView table, Token token, std::span<float> output);
-    static void linear(TensorView weight, std::span<const float> input, std::span<float> output);
     static void rms_norm(TensorView weight, std::span<const float> input, std::span<float> output,
                          float epsilon);
     static void rope(std::span<float> query, std::span<float> key, std::span<const float> frequency,

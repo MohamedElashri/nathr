@@ -6,7 +6,6 @@
 #include <array>
 #include <bit>
 #include <cmath>
-#include <cstring>
 #include <functional>
 #include <type_traits>
 
@@ -48,27 +47,6 @@ std::uint16_t float_to_half(float value) noexcept {
 float bf16_to_float(std::uint16_t bits) noexcept {
     return std::bit_cast<float>(std::uint32_t{bits} << 16);
 }
-
-template <DType type> void unpack_block(const std::byte* input, float* output) {
-    static_assert(type == DType::q8_0 || type == DType::q4_0);
-    std::uint16_t bits;
-    std::memcpy(&bits, input, sizeof(bits));
-    const auto scale = half_to_float(bits);
-    const auto* bytes = input + 2;
-    if constexpr (type == DType::q8_0) {
-        for (std::size_t i = 0; i < 32; ++i)
-            output[i] = scale * std::bit_cast<std::int8_t>(std::to_integer<std::uint8_t>(bytes[i]));
-    } else {
-        for (std::size_t i = 0; i < 16; ++i) {
-            const int pair = std::to_integer<unsigned>(bytes[i]);
-            output[i] = scale * ((pair & 15) - 8);
-            output[i + 16] = scale * ((pair >> 4) - 8);
-        }
-    }
-}
-
-template void unpack_block<DType::q8_0>(const std::byte*, float*);
-template void unpack_block<DType::q4_0>(const std::byte*, float*);
 
 namespace {
 
@@ -125,9 +103,9 @@ KernelChoice scalar_kernel(DType type) {
     case DType::bf16:
         return {row_dot<DType::bf16>, "scalar-bf16", nullptr, batch<DType::bf16>};
     case DType::q4_0:
-        return packed<DType::q4_0, unpack_block<DType::q4_0>>("scalar-q4_0");
+        return packed<DType::q4_0, decode_q4_0>("scalar-q4_0");
     case DType::q8_0:
-        return packed<DType::q8_0, unpack_block<DType::q8_0>>("scalar-q8_0");
+        return packed<DType::q8_0, decode_q8_0>("scalar-q8_0");
     case DType::iq4_nl:
         return packed<DType::iq4_nl, decode_iq4_nl>("scalar-iq4_nl");
     case DType::q5_1:
@@ -171,6 +149,9 @@ Cache::Cache(const ModelConfig& config, std::size_t limit, KvPrecision format)
     : precision(format), capacity(limit), kv_heads(config.kv_heads), width(config.head_dim),
       bank_elements(product({config.layers, kv_heads, capacity, width}, "KV cache")) {
     const auto count = product({2, bank_elements}, "KV cache");
+    const auto element_size = precision == KvPrecision::f16 ? sizeof(std::uint16_t) : sizeof(float);
+    if (count > max_kv_cache_bytes / element_size)
+        throw Error(ErrorCode::resource_limit, "KV cache exceeds 512 MiB");
     if (precision == KvPrecision::f16)
         storage.emplace<std::vector<std::uint16_t>>(count);
     else
@@ -195,13 +176,6 @@ void Scalar::embedding(TensorView table, Token token, std::span<float> output) {
         for (std::size_t i = 0; i < output.size(); ++i)
             output[i] = value_at<dtype>(table.bytes.data(), start + i);
     });
-}
-
-void Scalar::linear(TensorView weight, std::span<const float> input, std::span<float> output) {
-    const auto kernel = scalar_kernel(weight.desc.dtype);
-    if (!kernel.dot)
-        throw Error(ErrorCode::unsupported, "no scalar kernel for tensor encoding");
-    linear_with(kernel.dot, weight, input, output);
 }
 
 void Scalar::rms_norm(TensorView weight, std::span<const float> input, std::span<float> output,

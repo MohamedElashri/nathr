@@ -14,7 +14,6 @@ namespace nathr {
 namespace {
 
 constexpr std::size_t input_limit = detail::mib;
-constexpr std::size_t vocab_limit = 65536;
 constexpr Token missing = std::numeric_limits<Token>::max();
 constexpr std::string_view replacement = "\xef\xbf\xbd";
 
@@ -254,7 +253,7 @@ struct Tokenizer::Impl {
             throw Error(ErrorCode::unsupported, "unsupported BPE options");
         }
         const auto& vocab = model.at("vocab");
-        if (!vocab.is_object() || vocab.empty() || vocab.size() > vocab_limit) {
+        if (!vocab.is_object() || vocab.empty() || vocab.size() > detail::max_vocabulary) {
             throw Error(ErrorCode::malformed, "invalid BPE vocabulary size");
         }
         raw.resize(vocab.size());
@@ -406,15 +405,12 @@ Tokenizer Tokenizer::load(const std::filesystem::path& path) {
 
 Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::filesystem::path& sidecar) {
     using detail::Json;
-    std::error_code error;
-    if (std::filesystem::is_directory(model, error)) {
+    if (detail::is_model_directory(model)) {
         if (!sidecar.empty())
             throw Error(ErrorCode::invalid_argument,
                         "a separate tokenizer sidecar is only supported for GGUF");
         return load(model / "tokenizer.json");
     }
-    if (error)
-        throw Error(ErrorCode::io, model.string() + ": " + error.message());
     const detail::Gguf container(model);
     try {
         const auto& metadata = container.tokenizer();
@@ -422,8 +418,8 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
             throw Error(ErrorCode::unsupported, "expected a GGUF byte-level BPE tokenizer");
         const auto& tokens = metadata.at("tokenizer.ggml.tokens");
         const auto& merges = metadata.at("tokenizer.ggml.merges");
-        if (!tokens.is_array() || tokens.empty() || tokens.size() > vocab_limit || !merges.is_array() ||
-            merges.size() > tokens.size())
+        if (!tokens.is_array() || tokens.empty() || tokens.size() > detail::max_vocabulary ||
+            !merges.is_array() || merges.size() > tokens.size())
             throw Error(ErrorCode::malformed, "invalid GGUF BPE vocabulary or merge list");
         const auto types = metadata.find("tokenizer.ggml.token_type");
         if (types != metadata.end() && (!types->is_array() || types->size() != tokens.size()))

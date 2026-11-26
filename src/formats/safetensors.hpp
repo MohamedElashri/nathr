@@ -3,7 +3,6 @@
 #include "core/input.hpp"
 #include "formats/tensor.hpp"
 
-#include <array>
 #include <map>
 
 namespace nathr::detail {
@@ -15,8 +14,9 @@ class SafeTensors {
     SafeTensors& operator=(const SafeTensors&) = delete;
     [[nodiscard]] TensorView take(std::string_view name, std::initializer_list<std::size_t> shape);
     [[nodiscard]] bool contains(std::string_view name) const;
-    [[nodiscard]] bool bound_all() const noexcept { return tensors_.empty(); }
-    [[nodiscard]] std::string_view first_unbound() const { return tensors_.begin()->first; }
+    [[nodiscard]] std::string_view first_unbound() const noexcept {
+        return tensors_.empty() ? std::string_view{} : tensors_.begin()->first;
+    }
     [[nodiscard]] ModelMemory memory() const noexcept { return memory_; }
 
   private:

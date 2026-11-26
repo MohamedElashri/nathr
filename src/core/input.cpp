@@ -7,6 +7,14 @@
 
 namespace nathr::detail {
 
+bool is_model_directory(const std::filesystem::path& path) {
+    std::error_code error;
+    const bool directory = std::filesystem::is_directory(path, error);
+    if (error)
+        throw Error(ErrorCode::io, path.string() + ": " + error.message());
+    return directory;
+}
+
 std::size_t product(std::initializer_list<std::size_t> factors, std::string_view context) {
     std::size_t result = 1;
     for (const auto factor : factors) {
@@ -54,9 +62,10 @@ Json parse_json(std::span<const std::byte> bytes, const std::filesystem::path& p
             objects.emplace_back();
         } else if (event == Event::object_end) {
             objects.pop_back();
-        } else if (event == Event::key && !objects.back().insert(value.get<std::string>()).second) {
-            throw Error(ErrorCode::malformed,
-                        path.string() + ": duplicate JSON key " + value.get<std::string>());
+        } else if (event == Event::key) {
+            const auto& key = value.get_ref<const std::string&>();
+            if (!objects.back().insert(key).second)
+                throw Error(ErrorCode::malformed, path.string() + ": duplicate JSON key " + key);
         }
         return true;
     };

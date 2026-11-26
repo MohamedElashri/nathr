@@ -68,16 +68,17 @@ void kernels() {
     expect(std::isinf(bf16_to_float(0x7f80)) && std::isnan(bf16_to_float(0x7fc0)), "BF16 specials");
 
     const auto ref = read_json(fixtures / "math.json", mib);
+    const ThreadPool serial(1);
+    const auto scalar = scalar_kernel(DType::f32);
     const std::array x{1.0f, -2.0f, 3.0f};
     const std::array y{-3.0f, 2.0f, 4.0f};
     std::array<float, 1> dot{};
-    Scalar::linear(floats(y), x, dot);
+    project(scalar, serial, floats(y), x, dot, 1, {});
     close(dot[0], ref.at("dot").get<double>(), 0, "FP64 reference linear");
 
-    // The same serialized scalar kernels support unaligned weight data.
     std::array<std::byte, sizeof(y) + 1> bytes{};
     std::ranges::copy(std::as_bytes(std::span(y)), bytes.begin() + 1);
-    Scalar::linear({floats(y).desc, std::span(bytes).subspan(1)}, x, dot);
+    project(scalar, serial, {floats(y).desc, std::span(bytes).subspan(1)}, x, dot, 1, {});
     close(dot[0], ref.at("dot").get<double>(), 0, "unaligned linear");
 
     std::array<float, 513> cancellation{}, weights{};
@@ -89,7 +90,7 @@ void kernels() {
         sum += term;
         magnitude += std::abs(term);
     }
-    Scalar::linear(floats(weights), cancellation, dot);
+    project(scalar, serial, floats(weights), cancellation, dot, 1, {});
     const double n_u = (weights.size() + 1) * std::numeric_limits<float>::epsilon() / 2;
     close(dot[0], sum, n_u / (1 - n_u) * magnitude, "FP64 linear cancellation bound");
 
@@ -101,7 +102,7 @@ void kernels() {
     const auto cancelling_view = floats(cancelling_weights);
     for (const auto policy : {ExecutionPolicy::scalar, ExecutionPolicy::automatic}) {
         const auto kernel = select_kernel(DType::f32, policy, cpu_features());
-        linear_with(kernel.dot, cancelling_view, ones, dot);
+        project(kernel, serial, cancelling_view, ones, dot, 1, {});
         close(dot[0], 1.0, 0.0, "preserve small term through scalar and SIMD cancellation");
     }
 
@@ -282,10 +283,11 @@ void threaded_cache_and_chunks() {
     const TensorView matrix{{DType::f32, {rows, columns}, 2, weights.size()},
                             std::as_bytes(std::span(weights))};
     const auto scalar = scalar_kernel(DType::f32);
+    const ThreadPool serial(1);
     std::vector<float> expected(tokens * rows);
     for (std::size_t i = 0; i < tokens; ++i)
-        linear_with(scalar.dot, matrix, std::span(input).subspan(i * columns, columns),
-                    std::span(expected).subspan(i * rows, rows));
+        project(scalar, serial, matrix, std::span(input).subspan(i * columns, columns),
+                std::span(expected).subspan(i * rows, rows), 1, {});
     const auto selected = select_kernel(DType::f32, ExecutionPolicy::automatic, cpu_features());
     const auto submit = [&](std::span<float> output) {
         std::array<float, columns * batch_tile> packed{};
@@ -687,6 +689,7 @@ void packed_kernels() {
     const auto golden = read_json(fixtures / "quant/basic.json", mib);
     for (const auto type : {DType::q4_0, DType::q8_0}) {
         const auto& description = *encoding(type);
+        const auto scalar = scalar_kernel(type);
         const auto& entry = golden.at(description.name);
         std::vector<std::byte> packed(1); // exercise unaligned payload addresses
         std::vector<float> decoded;
@@ -697,10 +700,7 @@ void packed_kernels() {
             for (std::size_t i = 0; i < hex.size(); i += 2)
                 packed.push_back(static_cast<std::byte>(std::stoul(hex.substr(i, 2), nullptr, 16)));
             std::array<float, 32> block{};
-            if (type == DType::q4_0)
-                unpack_block<DType::q4_0>(packed.data() + offset, block.data());
-            else
-                unpack_block<DType::q8_0>(packed.data() + offset, block.data());
+            scalar.unpack(packed.data() + offset, block.data());
             for (std::size_t i = 0; i < block.size(); ++i) {
                 expect(std::bit_cast<std::uint32_t>(block[i]) ==
                            entry["fp32_bits"][index][i].get<std::uint32_t>(),
@@ -719,7 +719,7 @@ void packed_kernels() {
         }
         const auto gamma = (decoded.size() + 1) * std::numeric_limits<float>::epsilon() / 2;
         const auto limit = gamma / (1 - gamma) * magnitude;
-        close(scalar_kernel(type).dot(storage.data(), input.data() + 1, decoded.size()), exact, limit,
+        close(scalar.dot(storage.data(), input.data() + 1, decoded.size()), exact, limit,
               "scalar packed dot");
         if (features.avx2)
             close(select_kernel(type, ExecutionPolicy::avx2, features)
@@ -763,9 +763,10 @@ void packed_kernels() {
 void packed_encodings() {
     const auto atlas = read_json(fixtures / "quant/packed.json", mib);
     const auto features = cpu_features();
+    const ThreadPool serial(1);
     for (const auto& format : encodings) {
         const auto scalar = scalar_kernel(format.type);
-        expect(scalar.dot && executable_encoding(format.type), format.name);
+        expect(scalar.dot, format.name);
         if (format.elements == 1 || format.type == DType::q4_0 || format.type == DType::q8_0)
             continue;
         const auto& entry = atlas.at(format.name);
@@ -801,7 +802,7 @@ void packed_encodings() {
         std::array<float, 2> projected{};
         for (std::size_t i = 0; i < width; ++i)
             activations[i] = static_cast<float>(static_cast<int>(i % 23) - 11) / 12;
-        linear_with(scalar.dot, view, activations, projected);
+        project(scalar, serial, view, activations, projected, 1, {});
         const auto gamma = width * std::numeric_limits<double>::epsilon() / 2;
         for (std::size_t row = 0; row < 2; ++row) {
             const auto expected = std::span(weights).subspan(row * width, width);
