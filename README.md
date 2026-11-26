@@ -6,14 +6,33 @@ The CLI can generate text, inspect checkpoints, tokenize prompts, and measure pr
 
 ## Quick start
 
+### 1. Set up Nathr
+
 ```sh
 git clone https://github.com/MohamedElashri/nathr.git
 cd nathr
 ./setup.sh
-./build/release/nathr generate models/cache/SmolLM2-135M.Q4_0.gguf "Once upon a time" --greedy
 ```
 
-The setup script downloads and verifies the 92 MB GGUF checkpoint, builds Nathr, runs the tests, and checks generation. [Prerequisites, other checkpoint options, and manual installation](#installation)
+The script downloads and verifies the 92 MB GGUF checkpoint, builds Nathr, and runs the tests. [Prerequisites, other checkpoint options, and manual installation](#installation)
+
+### 2. Generate text
+
+Once setup prints `Ready`, run this from the `nathr` directory.
+
+```sh
+./build/release/nathr generate models/cache/SmolLM2-135M.Q4_0.gguf \
+    "Once upon a time" --greedy --max-new-tokens 16
+```
+
+Nathr prints the continuation of the prompt.
+
+```text
+, the
+people of the country were all very different. Some were farmers,
+```
+
+Replace the quoted prompt to try your own. Run `./build/release/nathr --help` to see other commands and options.
 
 ## How inference works
 
