@@ -28,8 +28,14 @@ using nathr::detail::Json;
 
 class Arguments {
   public:
-    Arguments(int argc, char** argv) {
-        for (int i = 2; i < argc; ++i) {
+    Arguments(int argc, char** argv, bool accepts_prompt) {
+        int i = 2;
+        if (i < argc && !std::string_view(argv[i]).starts_with("--")) {
+            values_.emplace("--model", argv[i++]);
+            if (accepts_prompt && i < argc && !std::string_view(argv[i]).starts_with("--"))
+                values_.emplace("--prompt", argv[i++]);
+        }
+        for (; i < argc; ++i) {
             std::string key(argv[i]);
             if (!key.starts_with("--"))
                 invalid("expected an option: " + key);
@@ -616,20 +622,20 @@ void bench(Arguments& args, const std::filesystem::path& path, BackendOptions op
 }
 
 void usage() {
-    std::cout
-        << "nathr --help | --version\n"
-           "nathr inspect --model PATH\n"
-           "nathr forward --model PATH --tokens 1,2,3 [--cached] [--context N] [--trace FILE] [--json]\n"
-           "  --logits-f32 streams little-endian FP32 vocabulary rows to stdout\n"
-           "nathr tokenize --model PATH (--prompt TEXT | --tokens IDS | --stdin) [--stages] [--tokenizer "
-           "FILE]\n"
-           "nathr generate --model PATH (--prompt TEXT | --tokens IDS) [--bos] [--max-new-tokens N] "
-           "[--context N]\n"
-           "  [--greedy | --temperature T --top-k K --top-p P] [--seed N] [--tokenizer FILE] [--json]\n"
-           "nathr bench --model PATH [--prompt-length N] [--decode-length N] [--context N] "
-           "[--warmups N] [--repetitions N] [--json]\n"
-           "Execution options: --backend scalar|auto|avx2 --threads 1..64\n"
-           "Cached execution: --kv-cache f32|f16 --prefill-chunk 1..32\n";
+    std::cout << "nathr --help | --version\n"
+                 "nathr inspect MODEL\n"
+                 "nathr forward MODEL --tokens 1,2,3 [--cached] [--context N] [--trace FILE] [--json]\n"
+                 "  --logits-f32 streams little-endian FP32 vocabulary rows to stdout\n"
+                 "nathr tokenize MODEL (PROMPT | --tokens IDS | --stdin) [--stages] [--tokenizer "
+                 "FILE]\n"
+                 "nathr generate MODEL (PROMPT | --tokens IDS) [--bos] [--max-new-tokens N] "
+                 "[--context N]\n"
+                 "  [--greedy | --temperature T --top-k K --top-p P] [--seed N] [--tokenizer FILE] [--json]\n"
+                 "nathr bench MODEL [--prompt-length N] [--decode-length N] [--context N] "
+                 "[--warmups N] [--repetitions N] [--json]\n"
+                 "Use --model PATH and --prompt TEXT for named arguments.\n"
+                 "Execution options: --backend scalar|auto|avx2 --threads 1..64\n"
+                 "Cached execution: --kv-cache f32|f16 --prefill-chunk 1..32\n";
 }
 
 } // namespace
@@ -651,7 +657,7 @@ int main(int argc, char** argv) try {
         usage();
         return 0;
     }
-    Arguments args(argc, argv);
+    Arguments args(argc, argv, command == "generate" || command == "tokenize");
     const auto path = std::filesystem::path(args.required("--model"));
     if (command == "tokenize") {
         tokenize(args, path);
