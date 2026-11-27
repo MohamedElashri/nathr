@@ -268,7 +268,7 @@ TokenizedInput input_tokens(const Json& json, BatchOutput& output, const Model& 
         messages == json.end() ? prompt->get<std::string>() : render_chat(*messages, defaults.chat);
     if (pair != json.end())
         return output.tokenizer->encode_pair(text, pair->get<std::string>());
-    return {output.tokenizer->encode(text), {}};
+    return {encode_prompt(*output.tokenizer, model, text), {}};
 }
 
 struct TensorRequest {
@@ -570,7 +570,7 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
     if (io.ready && scheduler)
         output.live_stats = &*scheduler;
     BatchInput input;
-    const auto defaults = request_defaults(path, model, true);
+    const auto defaults = request_defaults(path, model, true, io.chat_format);
     std::optional<BatchMetrics> last_metrics;
     const auto publish_metrics = [&] {
         if (!io.metrics || !scheduler)
@@ -607,7 +607,7 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
         ready["structured_outputs"] =
             model.supports_fused_batch() && output.tokenizer && output.tokenizer->byte_level();
         ready["function_calls"] =
-            ready["structured_outputs"].get<bool>() && defaults.chat && !defaults.chat->qwen3;
+            ready["structured_outputs"].get<bool>() && defaults.chat && defaults.chat->function_calls;
         ready["weight_bytes"] = model.memory().file_bytes;
         if (scheduler)
             ready["generation_context"] = scheduler->context();

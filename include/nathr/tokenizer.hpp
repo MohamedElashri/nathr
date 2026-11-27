@@ -19,6 +19,8 @@ class Tokenizer {
                                 const std::filesystem::path& sidecar = {});
     [[nodiscard]] std::size_t vocabulary() const noexcept;
     [[nodiscard]] bool byte_level() const noexcept;
+    // Model text prompts may prepend BOS. encode() returns raw token IDs.
+    [[nodiscard]] bool adds_bos() const noexcept;
     [[nodiscard]] std::vector<Token> encode(std::string_view text) const;
     [[nodiscard]] TokenizedInput encode_pair(std::string_view text, std::string_view second) const;
     // Returns the pretokenized pieces with added tokens treated as ordinary text.

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(nathr VERSION 0.7.0 LANGUAGES CXX)
+project(nathr VERSION 0.8.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
     message(FATAL_ERROR "Nathr requires x86-64 Linux")
@@ -74,6 +74,9 @@ set(NATHR_TEST_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 add_executable(nathr apps/nathr.cpp apps/batch.cpp apps/requests.cpp apps/structured.cpp)
 file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-serve.py" INPUT "${CMAKE_CURRENT_SOURCE_DIR}/apps/serve.py")
 set(NATHR_FRONTEND_MODULES apps/model_store.py apps/bench_serve.py apps/serving_metrics.py)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    apps/serve.py ${NATHR_FRONTEND_MODULES} models/manifest.json
+    apps/web/index.html apps/web/app.css apps/web/app.js)
 foreach(source IN LISTS NATHR_FRONTEND_MODULES)
     get_filename_component(module "${source}" NAME)
     file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-data/${module}"

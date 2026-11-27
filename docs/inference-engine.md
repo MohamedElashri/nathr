@@ -284,9 +284,40 @@ Nathr reads dimensions, attention head counts, context length, and boundary toke
 | Architecture | Supported configuration |
 | --- | --- |
 | Llama-style | GGUF v3 or Safetensors with RMSNorm, SwiGLU, unscaled full-width RoPE, and bias-free projections |
-| Qwen3 | Dense GGUF v3 with per-head query and key RMSNorm and unscaled, full-width RoPE. The pinned checkpoint is Qwen3-0.6B Q8_0 |
+| Qwen3 | Dense GGUF v3 with per-head query and key RMSNorm and unscaled, full-width RoPE. The pinned checkpoints are Qwen3-0.6B Q8_0 and Qwen3-1.7B Q3_K_M |
 | GPT-2 | Safetensors with learned positions, affine LayerNorm, and the GPT-2 GELU variant |
 | BERT | Safetensors with absolute position embeddings and GELU. Uses unpadded inputs and optional segment IDs. Outputs depend on the checkpoint's heads and pooling modules |
 | T5 | Safetensors for original ReLU T5. The decoder uses FP32 caches. The source and decoder are each limited to 512 positions or the checkpoint context, whichever is smaller |
 
-The built-in tokenizers cover byte-level BPE, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering supports SmolLM2 ChatML and the pinned Qwen3 template in plain-text, non-thinking mode. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)
+The built-in tokenizers cover byte-level BPE, GGUF SentencePiece BPE with byte fallback, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering recognizes SmolLM2 ChatML, Zephyr-style TinyLlama, and both pinned Qwen3 templates in non-thinking mode. Select a supported format explicitly with `--chat-format` when the checkpoint template is absent or unrecognized. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)
+
+## CPU measurements
+
+Local run on an AMD Ryzen 7 7735HS, using four pinned physical cores and AVX2 dispatch. Each native benchmark used a 64-token synthetic prompt, 16 decode tokens, a 512-token context, and a prefill chunk of 16. The command ran one warmup and three measured repetitions. First-logits latency is the median prefill time. Peak RSS is the native process high-water mark, including resident model weights.
+
+| Checkpoint | First logits | Prefill tok/s | Decode tok/s | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| SmolLM2-135M Q4_0 | 0.93 s | 68.8 | 32.6 | 100 MiB |
+| Qwen3-0.6B Q8_0 | 2.79 s | 22.9 | 12.0 | 648 MiB |
+| TinyLlama-1.1B Q4_K_M | 6.62 s | 9.7 | 1.40 | 618 MiB |
+| Qwen3-1.7B Q3_K_M | 10.41 s | 6.1 | 0.76 | 939 MiB |
+
+The Q4_0 and Q8_0 projections used AVX2 kernels. The K-quantized projections used scalar kernels. The packed checkpoint size and kernel choice both affect decode speed.
+
+```sh
+model=$(nathr pull qwen3)
+taskset -c 8,10,12,14 nathr bench "$model" --backend avx2 --threads 4 \
+  --context 512 --prefill-chunk 16 --prompt-length 64 --decode-length 16 \
+  --warmups 1 --repetitions 3
+```
+
+Choose four physical cores for your machine. The timings describe one local run with the host's ordinary clock settings. Prefill variability across repetitions ranged from 2% to 19% by coefficient of variation. The native benchmark includes the individual samples.
+
+A loopback server run used Qwen3-0.6B with context 512, a 64 MiB KV budget, and four CPU threads. Each trial warmed four requests, then ran 12 requests at concurrency four with 128 prompt tokens, up to 16 output tokens, and seed 43. All requests completed.
+
+| Prefix caching | First token p50 | First token p95 | Output tok/s |
+| --- | ---: | ---: | ---: |
+| Enabled | 12.94 s | 15.47 s | 2.27 |
+| Disabled | 18.21 s | 25.63 s | 1.66 |
+
+This workload shares the first 64 tokens across requests and measures latency through the HTTP stream, including time in the queue. Reproduce it with `nathr bench --serve --workload shared-prefix --requests 12 --concurrency 4 --warmups 4 --prompt-length 128 --decode-length 16 --seed 43`. Restart the server with `--no-prefix-cache` for the second trial.

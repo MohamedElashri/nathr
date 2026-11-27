@@ -28,6 +28,18 @@
       "description": "Qwen3-0.6B Q8_0 for chat and text continuation"
     },
     {
+      "name": "tinyllama",
+      "repository": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+      "file": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+      "description": "TinyLlama-1.1B-Chat Q4_K_M"
+    },
+    {
+      "name": "qwen3-1.7b",
+      "repository": "tensorblock/Qwen_Qwen3-1.7B-GGUF",
+      "file": "Qwen3-1.7B-Q3_K_M.gguf",
+      "description": "Qwen3-1.7B Q3_K_M for chat and text continuation"
+    },
+    {
       "name": "gpt2",
       "repository": "openai-community/gpt2",
       "description": "GPT-2 small for text continuation"
@@ -425,6 +437,26 @@
         {
           "filename": "tokenizer.json",
           "sha256": "d241a60d5e8f04cc1b2b3e9ef7a4921b27bf526d9f6050ab90f9267a1f9e5c66"
+        }
+      ]
+    },
+    {
+      "repository": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+      "revision": "52e7645ba7c309695bec7ac98f4f005b139cf465",
+      "files": [
+        {
+          "filename": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+          "sha256": "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0"
+        }
+      ]
+    },
+    {
+      "repository": "tensorblock/Qwen_Qwen3-1.7B-GGUF",
+      "revision": "77fee077ec2122a422479246f5cb81dcf6ab8c72",
+      "files": [
+        {
+          "filename": "Qwen3-1.7B-Q3_K_M.gguf",
+          "sha256": "79af9a932c6659aabc06d6560b8404063c79f616b136953370f9c67853e162e0"
         }
       ]
     }

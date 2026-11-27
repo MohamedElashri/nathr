@@ -557,6 +557,8 @@ class WorkerPool:
             if model_id == self.options.model_id:
                 if self.options.tokenizer:
                     command.extend(("--tokenizer", self.options.tokenizer))
+                if self.options.chat_format != "auto":
+                    command.extend(("--chat-format", self.options.chat_format))
                 for name, path in static_adapters.items():
                     command.extend(("--lora", f"{name}={path}"))
                 if self.options.lora_root is not None:
@@ -1528,6 +1530,8 @@ def main(executable, directory, mode, args):
     parser.add_argument("--backend", choices=("scalar", "auto", "avx2"), default="auto", help="CPU kernels")
     parser.add_argument("--threads", type=bounded(1, 64), default=1, help="CPU threads")
     parser.add_argument("--tokenizer", help="matching GGUF tokenizer sidecar")
+    parser.add_argument("--chat-format", choices=("auto", "none", "chatml", "qwen3", "zephyr"), default="auto",
+                        help="chat format for the primary checkpoint")
 
     scheduler = parser.add_argument_group("generation scheduler")
     scheduler.add_argument("--context", type=bounded(1, 65536), help="context, otherwise up to 2048 tokens")

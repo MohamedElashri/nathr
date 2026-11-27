@@ -365,7 +365,7 @@ void infer(Arguments& args, const std::filesystem::path& path, BackendOptions op
         if (pair)
             input = tokenizer.encode_pair(*prompt, *pair);
         else
-            input.ids = tokenizer.encode(*prompt);
+            input.ids = cli::encode_prompt(tokenizer, model, *prompt);
     } else {
         input.ids = parse_tokens(*tokens);
         if (types)
@@ -628,7 +628,8 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
     const auto model = Model::load(path, options);
     if (!model.supports_generation())
         invalid("BERT uses the infer or encode command");
-    auto defaults = cli::request_defaults(path, model, messages.has_value());
+    auto defaults = cli::request_defaults(path, model, messages.has_value(),
+                                          args.option("--chat-format").value_or("auto"));
     const auto bos = args.flag("--bos");
     const bool logprobs = args.flag("--logprobs") || args.has("--top-logprobs");
     const auto count = number(args, "--top-logprobs", std::size_t{0});
@@ -678,8 +679,8 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
     std::optional<Tokenizer> tokenizer;
     if (prompt || (!seq2seq && !as_json) || !sidecar.empty() || !stops.empty())
         tokenizer = cli::load_tokenizer(model, path, sidecar);
-    auto ids = prompt ? tokenizer->encode(*prompt) : parse_tokens(*tokens);
-    if (bos)
+    auto ids = prompt ? cli::encode_prompt(*tokenizer, model, *prompt, bos) : parse_tokens(*tokens);
+    if (bos && !prompt)
         ids.insert(ids.begin(), model.config().bos);
     std::optional<GenerationText> decoder;
     if (tokenizer)
@@ -722,7 +723,8 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
                                  number(args, "--max-result-values", std::size_t{0}),
                                  args.adapters(),
                                  args.option("--lora-root").value_or(""),
-                                 args.flag("--metrics")};
+                                 args.flag("--metrics"),
+                                 args.option("--chat-format").value_or("auto")};
     const auto tokenizer = args.option("--tokenizer").value_or("");
     const bool memory_plan = args.flag("--memory-plan");
     args.finish();
@@ -900,6 +902,7 @@ constexpr CommandHelp commands[] = {
      "  --kv-cache f32|f16 --prefill-chunk N\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
      "  --lora DIR                    Apply a PEFT LoRA adapter.\n"
+     "  --chat-format auto|none|chatml|qwen3|zephyr\n"
      "  --logprobs [--top-logprobs N] Include token log probabilities in JSON (0 to 20 alternatives).\n"
      "  --json                        Include token IDs and the finish reason.\n",
      true},
@@ -928,6 +931,7 @@ constexpr CommandHelp commands[] = {
      "  --max-queued-tokens N         Limit queued prompt tokens (default 16384).\n"
      "  --max-queue-bypasses N        Let up to N fitting requests pass a blocked queue head (default 0).\n"
      "  --step-tokens N               Set the total tokens per scheduler step (default 32).\n"
+     "  --chat-format auto|none|chatml|qwen3|zephyr\n"
      "  --speculative-tokens N        Verify up to 8 prompt lookup drafts in greedy decoding (default 0).\n"
      "  --kv-budget-mib N             Limit KV memory (default 512).\n"
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"

@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cmath>
 #include <limits>
+#include <map>
 #include <queue>
 #include <unordered_map>
 
@@ -16,10 +19,11 @@ namespace {
 
 constexpr std::size_t input_limit = detail::mib;
 constexpr Token missing = std::numeric_limits<Token>::max();
+constexpr std::string_view space_marker = "\xe2\x96\x81";
 constexpr std::string_view replacement = "\xef\xbf\xbd";
 
 enum class Pretokenizer { byte_level, digits_byte_level, qwen2, unsupported };
-enum class GgufTokenType : std::size_t { normal = 1, control = 3, user_defined = 4, unused = 5 };
+enum class GgufTokenType : std::size_t { normal = 1, unknown, control, user_defined, unused, byte };
 
 enum class Utf8Status { valid, invalid, incomplete };
 struct Codepoint {
@@ -381,6 +385,72 @@ struct Tokenizer::Impl {
         }
     }
 
+    struct ScoredPiece {
+        Token id;
+        float score;
+    };
+
+    struct SentencePieceBpe {
+        std::map<std::string, ScoredPiece, std::less<>> vocabulary;
+        bool prefix;
+        bool add_bos;
+    };
+
+    Impl(const detail::Json& metadata, SentencePieceBpe settings) : sentencepiece(std::move(settings)) {
+        const auto& tokens = metadata.at("tokenizer.ggml.tokens");
+        const auto& scores = metadata.at("tokenizer.ggml.scores");
+        const auto& types = metadata.at("tokenizer.ggml.token_type");
+        if (!tokens.is_array() || tokens.empty() || tokens.size() > detail::max_vocabulary ||
+            !scores.is_array() || scores.size() != tokens.size() || !types.is_array() ||
+            types.size() != tokens.size())
+            throw Error(ErrorCode::malformed, "invalid SentencePiece BPE vocabulary");
+        raw.reserve(tokens.size());
+        special.reserve(tokens.size());
+        byte_tokens.fill(missing);
+        for (std::size_t index = 0; index < tokens.size(); ++index) {
+            const auto id = static_cast<Token>(index);
+            const auto& text = tokens[index].get_ref<const std::string&>();
+            const auto score = scores[index].get<float>();
+            if (text.empty() || text.size() > 1024 || !std::isfinite(score))
+                throw Error(ErrorCode::malformed, "invalid SentencePiece vocabulary entry");
+            const auto type = static_cast<GgufTokenType>(detail::natural(types[index], "GGUF token type"));
+            special.push_back(type == GgufTokenType::control || type == GgufTokenType::unknown ||
+                              type == GgufTokenType::unused);
+            if (type == GgufTokenType::byte) {
+                unsigned byte = 0;
+                if (text.size() != 6 || !text.starts_with("<0x") || text.back() != '>')
+                    throw Error(ErrorCode::malformed, "invalid SentencePiece byte token");
+                const auto [end, error] = std::from_chars(text.data() + 3, text.data() + 5, byte, 16);
+                if (error != std::errc{} || end != text.data() + 5 || byte_tokens[byte] != missing)
+                    throw Error(ErrorCode::malformed, "invalid or duplicate SentencePiece byte value");
+                byte_tokens[byte] = id;
+                raw.emplace_back(1, static_cast<char>(byte));
+                continue;
+            }
+            if (type == GgufTokenType::control || type == GgufTokenType::user_defined) {
+                if (text.size() > 128 || added.size() >= 64)
+                    throw Error(ErrorCode::resource_limit, "SentencePiece added-token limit exceeded");
+                (void)units(text);
+                added_starts[static_cast<unsigned char>(text.front())] = true;
+                added.push_back({text, id});
+            } else if (type != GgufTokenType::normal && !special.back()) {
+                throw Error(ErrorCode::unsupported, "unsupported SentencePiece token type");
+            }
+            if (type == GgufTokenType::normal &&
+                !sentencepiece->vocabulary.emplace(text, ScoredPiece{id, score}).second)
+                throw Error(ErrorCode::malformed, "duplicate SentencePiece vocabulary piece");
+            raw.push_back(text);
+            if (type == GgufTokenType::normal)
+                for (std::size_t pos = raw.back().find(space_marker); pos != std::string::npos;
+                     pos = raw.back().find(space_marker, pos + 1))
+                    raw.back().replace(pos, space_marker.size(), " ");
+        }
+        if (std::ranges::find(byte_tokens, missing) != byte_tokens.end())
+            throw Error(ErrorCode::unsupported, "SentencePiece BPE requires 256 byte fallback tokens");
+        std::ranges::stable_sort(
+            added, [](const Added& a, const Added& b) { return a.text.size() > b.text.size(); });
+    }
+
     Token checked_id(const detail::Json& value) const {
         const auto id = detail::natural(value, "token ID");
         if (id >= raw.size())
@@ -388,48 +458,36 @@ struct Tokenizer::Impl {
         return static_cast<Token>(id);
     }
 
-    void encode_piece(std::string_view input, std::vector<Token>& output) const {
-        if (input.size() == 1) {
-            const auto token = byte_tokens[static_cast<unsigned char>(input.front())];
-            if (token != missing)
-                output.push_back(token);
-            return;
-        }
-        struct Node {
-            Token id;
-            std::size_t previous, next, generation{};
-        };
-        struct Candidate {
-            std::size_t rank, left, left_generation, right_generation;
-            Token merged;
-            bool operator<(const Candidate& other) const {
-                return rank == other.rank ? left > other.left : rank > other.rank;
-            }
-        };
-        std::vector<Node> nodes;
-        nodes.reserve(input.size());
-        // This BPE subset uses no unknown token or byte fallback.
-        for (const unsigned char byte : input) {
-            const auto token = byte_tokens[byte];
-            if (token != missing) {
-                const auto index = nodes.size();
-                nodes.push_back({token, index == 0 ? 0 : index - 1, index + 1});
-            }
-        }
+    struct Symbol {
+        Token id;
+        std::size_t start = 0, finish = 0;
+        std::size_t previous = 0, next = 0, generation = 0;
+    };
+
+    template <class Lookup> static void merge_symbols(std::vector<Symbol>& nodes, Lookup lookup) {
         if (nodes.empty())
             return;
+        struct Candidate {
+            double priority;
+            std::size_t left, left_generation, right_generation;
+            Token merged;
+            bool operator<(const Candidate& other) const {
+                return priority == other.priority ? left > other.left : priority < other.priority;
+            }
+        };
         const auto end = nodes.size();
-        nodes.front().previous = end;
+        for (std::size_t i = 0; i < end; ++i) {
+            nodes[i].previous = i ? i - 1 : end;
+            nodes[i].next = i + 1;
+        }
         std::priority_queue<Candidate> pending;
         const auto schedule = [&](std::size_t pos) {
             if (pos == end || nodes[pos].next == end)
                 return;
             const auto& left = nodes[pos];
             const auto& right = nodes[left.next];
-            const auto found = merges.find(pair_id(left.id, right.id));
-            if (found != merges.end())
-                pending.push(
-                    {found->second.rank, pos, left.generation, right.generation, found->second.merged});
+            if (auto found = lookup(left, right))
+                pending.push({found->second, pos, left.generation, right.generation, found->first});
         };
         for (std::size_t i = 0; i + 1 < end; ++i)
             schedule(i);
@@ -443,6 +501,7 @@ struct Tokenizer::Impl {
             if (right.generation != top.right_generation)
                 continue;
             left.id = top.merged;
+            left.finish = right.finish;
             left.next = right.next;
             ++left.generation;
             ++right.generation;
@@ -452,10 +511,79 @@ struct Tokenizer::Impl {
             schedule(left.previous);
             schedule(top.left);
         }
-        for (std::size_t i = 0; i < end; i = nodes[i].next)
+    }
+
+    void encode_piece(std::string_view input, std::vector<Token>& output) const {
+        if (input.size() == 1) {
+            const auto token = byte_tokens[static_cast<unsigned char>(input.front())];
+            if (token != missing)
+                output.push_back(token);
+            return;
+        }
+        std::vector<Symbol> nodes;
+        nodes.reserve(input.size());
+        for (const unsigned char byte : input)
+            if (const auto token = byte_tokens[byte]; token != missing)
+                nodes.push_back({token});
+        merge_symbols(
+            nodes, [&](const Symbol& left, const Symbol& right) -> std::optional<std::pair<Token, double>> {
+                const auto found = merges.find(pair_id(left.id, right.id));
+                if (found == merges.end())
+                    return {};
+                return std::pair{found->second.merged, -static_cast<double>(found->second.rank)};
+            });
+        for (std::size_t i = 0; i < nodes.size(); i = nodes[i].next)
             output.push_back(nodes[i].id);
     }
 
+    static std::string escape_spaces(std::string_view text, bool prefix) {
+        std::string escaped;
+        escaped.reserve(text.size() + (prefix ? space_marker.size() : 0));
+        if (prefix)
+            escaped += space_marker;
+        for (char ch : text) {
+            if (ch == ' ')
+                escaped += space_marker;
+            else
+                escaped += ch;
+        }
+        return escaped;
+    }
+
+    void encode_sentencepiece(std::string_view text, std::vector<Token>& output) const {
+        if (text.empty())
+            return;
+        const auto escaped = escape_spaces(text, sentencepiece->prefix);
+        const auto input = std::string_view(escaped);
+        const auto find = [&](std::string_view piece) -> const ScoredPiece* {
+            const auto match = sentencepiece->vocabulary.find(piece);
+            return match == sentencepiece->vocabulary.end() ? nullptr : &match->second;
+        };
+        std::vector<Symbol> nodes;
+        nodes.reserve(text.size() + 1);
+        for (std::size_t start = 0; start < input.size();) {
+            const auto length = read_codepoint(input.substr(start)).bytes;
+            const auto* piece = find(input.substr(start, length));
+            nodes.push_back({piece ? piece->id : missing, start, start + length});
+            start += length;
+        }
+        merge_symbols(
+            nodes, [&](const Symbol& left, const Symbol& right) -> std::optional<std::pair<Token, double>> {
+                if (const auto* piece = find(input.substr(left.start, right.finish - left.start)))
+                    return std::pair{piece->id, piece->score};
+                return {};
+            });
+        for (std::size_t i = 0; i < nodes.size(); i = nodes[i].next) {
+            const auto& node = nodes[i];
+            if (node.id != missing)
+                output.push_back(node.id);
+            else
+                for (const unsigned char byte : input.substr(node.start, node.finish - node.start))
+                    output.push_back(byte_tokens[byte]);
+        }
+    }
+
+    std::optional<SentencePieceBpe> sentencepiece;
     std::unique_ptr<detail::SubwordTokenizer> subword;
     std::vector<std::string> raw;
     std::vector<bool> special;
@@ -487,8 +615,17 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
     const detail::Gguf container(model);
     try {
         const auto& metadata = container.tokenizer();
+        if (metadata.value("tokenizer.ggml.model", std::string{}) == "llama") {
+            if (!sidecar.empty() || metadata.value("tokenizer.ggml.remove_extra_whitespaces", false) ||
+                metadata.value("tokenizer.ggml.treat_whitespace_as_suffix", false))
+                throw Error(ErrorCode::unsupported, "unsupported SentencePiece BPE options");
+            return Tokenizer(std::make_shared<Impl>(
+                metadata, Impl::SentencePieceBpe{{},
+                                                 metadata.value("tokenizer.ggml.add_space_prefix", true),
+                                                 metadata.value("tokenizer.ggml.add_bos_token", true)}));
+        }
         if (metadata.value("tokenizer.ggml.model", std::string{}) != "gpt2")
-            throw Error(ErrorCode::unsupported, "expected a GGUF byte-level BPE tokenizer");
+            throw Error(ErrorCode::unsupported, "expected a GGUF byte-level or SentencePiece BPE tokenizer");
         const auto& tokens = metadata.at("tokenizer.ggml.tokens");
         const auto& merges = metadata.at("tokenizer.ggml.merges");
         if (!tokens.is_array() || tokens.empty() || tokens.size() > detail::max_vocabulary ||
@@ -578,7 +715,11 @@ std::size_t Tokenizer::vocabulary() const noexcept {
 }
 
 bool Tokenizer::byte_level() const noexcept {
-    return !impl_->subword;
+    return !impl_->subword && !impl_->sentencepiece;
+}
+
+bool Tokenizer::adds_bos() const noexcept {
+    return impl_->sentencepiece && impl_->sentencepiece->add_bos;
 }
 
 std::vector<Token> Tokenizer::encode(std::string_view text) const {
@@ -588,6 +729,12 @@ std::vector<Token> Tokenizer::encode(std::string_view text) const {
     const auto count = cp.size() - 1;
     std::vector<Token> result;
     const auto emit = [&](std::string_view piece) { impl_->encode_piece(piece, result); };
+    const auto encode_fragment = [&](std::size_t begin, std::size_t end) {
+        if (impl_->sentencepiece)
+            impl_->encode_sentencepiece(text.substr(cp[begin].byte, cp[end].byte - cp[begin].byte), result);
+        else
+            split(text, cp, begin, end, impl_->pre, emit);
+    };
     std::size_t begin = 0;
     for (std::size_t i = 0; i < count;) {
         const auto rest = text.substr(cp[i].byte);
@@ -600,14 +747,14 @@ std::vector<Token> Tokenizer::encode(std::string_view text) const {
             ++i;
             continue;
         }
-        split(text, cp, begin, i, impl_->pre, emit);
+        encode_fragment(begin, i);
         result.push_back(match->id);
         const auto finish = cp[i].byte + match->text.size();
         while (cp[i].byte < finish)
             ++i;
         begin = i;
     }
-    split(text, cp, begin, count, impl_->pre, emit);
+    encode_fragment(begin, count);
     return result;
 }
 
@@ -621,6 +768,9 @@ std::vector<std::string> Tokenizer::pretokenize(std::string_view text) const {
     if (impl_->subword)
         return impl_->subword->pieces(text);
     const auto cp = units(text);
+    if (impl_->sentencepiece)
+        return text.empty() ? std::vector<std::string>{}
+                            : std::vector{Impl::escape_spaces(text, impl_->sentencepiece->prefix)};
     std::vector<std::string> result;
     split(text, cp, 0, cp.size() - 1, impl_->pre,
           [&](std::string_view part) { result.push_back(as_alphabet(part)); });
@@ -638,15 +788,24 @@ std::string_view Tokenizer::token_bytes(Token token, bool skip_special) const {
 std::string Tokenizer::decode_piece(Token token, bool first, bool skip_special) const {
     if (impl_->subword)
         return impl_->subword->decode_piece(token, first, skip_special);
-    return std::string(token_bytes(token, skip_special));
+    auto piece = token_bytes(token, skip_special);
+    if (first && impl_->sentencepiece && impl_->sentencepiece->prefix && piece.starts_with(' '))
+        piece.remove_prefix(1);
+    return std::string(piece);
 }
 
 std::string Tokenizer::decode_bytes(std::span<const Token> tokens, bool skip_special) const {
     if (impl_->subword)
         return impl_->subword->decode(tokens, skip_special);
     std::string bytes;
+    bool strip_prefix = impl_->sentencepiece && impl_->sentencepiece->prefix;
     for (const auto token : tokens) {
         auto piece = token_bytes(token, skip_special);
+        if (strip_prefix && !piece.empty()) {
+            if (piece.starts_with(' '))
+                piece.remove_prefix(1);
+            strip_prefix = false;
+        }
         if (piece.size() > input_limit - bytes.size())
             throw Error(ErrorCode::resource_limit, "decoded text exceeds 1 MiB");
         bytes.append(piece);

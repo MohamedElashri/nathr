@@ -181,7 +181,7 @@ Gguf::Gguf(const std::filesystem::path& path) : path_(path), file_(path) {
                 reader.fail("invalid GGUF alignment");
         } else if (key.starts_with("tokenizer.")) {
             const bool vocabulary = key == "tokenizer.ggml.tokens" || key == "tokenizer.ggml.token_type" ||
-                                    key == "tokenizer.ggml.merges";
+                                    key == "tokenizer.ggml.merges" || key == "tokenizer.ggml.scores";
             tokenizer_[std::move(key)] = reader.value(type, true, vocabulary ? max_vocabulary : 65536);
         } else if (key == "general.architecture") {
             architecture_[std::move(key)] = reader.value(type, true);

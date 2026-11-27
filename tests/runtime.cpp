@@ -1020,6 +1020,65 @@ void tokenizer_and_sampling() {
            "continuation appends once");
 }
 
+void sentencepiece_bpe() {
+    Temporary temp;
+    const auto model = temp.directory / "sentencepiece.gguf";
+    constexpr std::array<std::string_view, 7> pieces{"▁", "a", "b", "ab", "▁a", "▁ab", "</s>"};
+    constexpr std::array scores{0.f, 0.f, 0.f, 4.f, 6.f, 5.f, 0.f};
+    constexpr std::string_view hex = "0123456789ABCDEF";
+    std::vector<char> bytes;
+    const auto number = [&](std::uint64_t value, unsigned width) {
+        for (unsigned i = 0; i < width; ++i)
+            bytes.push_back(static_cast<char>((value >> (i * 8)) & 0xff));
+    };
+    const auto string = [&](std::string_view value) {
+        number(value.size(), 8);
+        bytes.insert(bytes.end(), value.begin(), value.end());
+    };
+    const auto array = [&](std::string_view key, unsigned element) {
+        string(key);
+        number(9, 4);
+        number(element, 4);
+        number(pieces.size() + 256, 8);
+    };
+    number(0x46554747, 4);
+    number(3, 4);
+    number(0, 8);
+    number(4, 8);
+    string("tokenizer.ggml.model");
+    number(8, 4);
+    string("llama");
+    array("tokenizer.ggml.tokens", 8);
+    for (auto piece : pieces)
+        string(piece);
+    for (unsigned byte = 0; byte < 256; ++byte) {
+        const std::array text{'<', '0', 'x', hex[byte / 16], hex[byte % 16], '>'};
+        string({text.data(), text.size()});
+    }
+    array("tokenizer.ggml.scores", 6);
+    for (float score : scores)
+        number(std::bit_cast<std::uint32_t>(score), 4);
+    for (unsigned byte = 0; byte < 256; ++byte)
+        number(0, 4);
+    array("tokenizer.ggml.token_type", 5);
+    for (std::size_t i = 0; i < pieces.size(); ++i)
+        number(i + 1 == pieces.size() ? 3 : 1, 4);
+    for (unsigned byte = 0; byte < 256; ++byte)
+        number(6, 4);
+    bytes.resize((bytes.size() + 31) / 32 * 32);
+    std::ofstream(model, std::ios::binary).write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+
+    const auto tokenizer = Tokenizer::load_model(model);
+    expect(tokenizer.adds_bos() && !tokenizer.byte_level(), "GGUF SentencePiece defaults");
+    expect(tokenizer.encode("ab") == std::vector<Token>{5}, "SentencePiece merges by vocabulary score");
+    expect(tokenizer.encode("ab</s> a") == std::vector<Token>{5, 6, 0, 4},
+           "SentencePiece dummy space starts each text fragment");
+    const auto fallback = tokenizer.encode("🙂");
+    expect(fallback == std::vector<Token>{0, 247, 166, 160, 137} && tokenizer.decode(fallback) == "🙂",
+           "SentencePiece byte fallback round trip");
+    expect(tokenizer.decode(tokenizer.encode("  ab")) == "  ab", "decode removes one dummy prefix space");
+}
+
 void gguf_tokenizer_metadata() {
     Temporary temp;
     const auto model = temp.directory / "tokenizer.gguf";
@@ -1429,6 +1488,7 @@ int main(int argc, char** argv) try {
         threaded_cache_and_chunks();
         tokenizer_and_sampling();
         gguf_tokenizer_metadata();
+        sentencepiece_bpe();
         gguf_layout();
         qwen3_and_sessions();
         packed_kernels();

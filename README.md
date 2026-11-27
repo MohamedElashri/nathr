@@ -4,7 +4,7 @@ Nathr runs small text Transformers locally. Chat, continue a prompt, and inspect
 
 ## Quick start
 
-The prebuilt release targets Ubuntu 24.04 on x86-64. Have Bash, Python 3.10+, `ca-certificates`, `libicu74`, `libstdc++6`, `coreutils`, `tar`, and `flock` from `util-linux` available. Use `curl` or `wget` to fetch the installer. If you install the v0.6.0 release, have `curl` available for model downloads.
+The prebuilt release targets Ubuntu 24.04 on x86-64. Have Bash, Python 3.10+, `ca-certificates`, `libicu74`, `libstdc++6`, `coreutils`, `tar`, and `flock` from `util-linux` available. Use `curl` or `wget` to fetch the installer. Use `curl` for model downloads if you pin the older `v0.6.0` release.
 
 Run the installer as your regular user. It verifies the release and downloads the default chat model (about 270 MB). Have `$HOME/.local/bin` on PATH so you can run `nathr` in the same terminal. If needed, run `export PATH="$HOME/.local/bin:$PATH"` first.
 
@@ -24,7 +24,7 @@ Try a prompt from the same terminal.
 nathr run smollm2 "What is the capital of France?"
 ```
 
-The current source build also supports an interactive session with `nathr run`.
+Run `nathr run` without a prompt to start an interactive session.
 
 To update, rerun the install command. Nathr reuses cached checkpoints. Append `-s -- --no-model` after `bash` to defer downloading the model until `nathr run`. To install offline, download the archive and its checksum and pass the archive to `bash install.sh --archive FILE`.
 
@@ -103,6 +103,15 @@ nathr run qwen3 "What is the capital of France?"
 nathr serve qwen3
 ```
 
+Other pinned chat models include TinyLlama-1.1B and Qwen3-1.7B.
+
+```sh
+nathr run tinyllama "What is the capital of France?"
+nathr run qwen3-1.7b "What is the capital of France?"
+```
+
+For a local checkpoint using a supported message format, pass `--chat-format chatml`, `qwen3`, or `zephyr` to select it explicitly. The default `auto` recognizes supported checkpoint templates. Use `--chat-format none` for plain text completion.
+
 Qwen3 chat uses plain text with thinking mode disabled. Pass a JSON message array for explicit conversation history.
 
 ```sh
@@ -175,6 +184,8 @@ The workloads send synthetic token IDs. The report includes time to first token,
 
 Try `--speculative-tokens 4` with `nathr batch`, `nathr run`, or `nathr serve` to enable prompt lookup for greedy decoder requests without a JSON schema. Compare with speculation disabled using repeated-text prompts. Batch statistics and native `/infer` results report draft and acceptance counts.
 
+See the [CPU measurements](docs/inference-engine.md#cpu-measurements) for latency, throughput, and peak RAM on four checkpoints.
+
 ## OpenAI-compatible API
 
 Start the local server with the default `smollm2` model.
@@ -220,7 +231,7 @@ Chat Completions accepts `logprobs=True` and `top_logprobs=0` through `20`. Scor
 | `POST /infer` | A batch-style request without an ID, for generation or a named tensor |
 | `POST /v1/completions` | Generate from one prompt or token array |
 | `POST /v1/chat/completions` | Generate from text messages |
-| `POST /v1/responses` | Generate from text or message history in the current source build |
+| `POST /v1/responses` | Generate from text or message history |
 | `POST /v1/embeddings` | Embed text or token arrays with a checkpoint that exposes `sentence_embedding` |
 | `POST /v1/rerank` | Rank documents with a text-pair checkpoint that returns one logit |
 

@@ -207,6 +207,19 @@ def structured_checks(binary, checkpoint):
         request(port, chat_path, dict(call_input, tool_choice="auto"), 400)
 
 
+def chat_format_checks(binary, checkpoint):
+    path = "/v1/chat/completions"
+    messages = [{"role": "user", "content": "b"}]
+    with server(binary, checkpoint, "--chat-format", "none") as port:
+        assert not request(port, "/model")["chat"]
+        request(port, path, dict(messages=messages, max_tokens=1), status=400)
+        assert request(port, "/v1/completions", dict(prompt="b", max_tokens=1))["choices"]
+    with server(binary, checkpoint, "--chat-format", "chatml") as port:
+        metadata = request(port, "/model")
+        assert metadata["chat"] and not metadata["function_calls"]
+        assert request(port, path, dict(messages=messages, max_tokens=1))["usage"]["prompt_tokens"] < 15
+
+
 def http_checks(binary, checkpoint, encoder):
     chat_path = "/v1/chat/completions"
     with server(binary, checkpoint, "--model-id", "test", "--context", "8192", "--max-body-bytes", "16384",
@@ -649,6 +662,7 @@ if __name__ == "__main__":
         checkpoint = Path(directory)
         chat_fixture(checkpoint, fixtures / "model/f32")
         http_checks(executable, checkpoint, fixtures / "bert")
+        chat_format_checks(executable, checkpoint)
         structured = checkpoint / "structured"
         structured_fixture(structured, fixtures / "model/f32")
         structured_checks(executable, structured)

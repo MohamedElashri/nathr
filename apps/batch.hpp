@@ -10,6 +10,7 @@ struct BatchIoOptions {
     std::vector<std::string> lora_adapters{};
     std::filesystem::path lora_root{};
     bool metrics = false;
+    std::string chat_format = "auto";
 };
 
 void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions options, BatchIoOptions io);

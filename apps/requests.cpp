@@ -72,24 +72,46 @@ std::vector<std::string> stop_strings(const Json& value) {
     return value.get<std::vector<std::string>>();
 }
 
-std::optional<ChatFormat> chat_format(const std::filesystem::path& path, const Model& model) {
+std::optional<ChatFormat> chat_format(const std::filesystem::path& path, const Model& model,
+                                      std::string_view selection) {
+    if (selection == "none")
+        return {};
+    if (selection != "auto") {
+        if (!model.supports_generation() || model.architecture() == "t5")
+            throw Error(ErrorCode::unsupported, "a chat format requires a decoder-only checkpoint");
+        if (selection == "chatml")
+            return ChatFormat{ChatStyle::chatml};
+        if (selection == "qwen3")
+            return ChatFormat{ChatStyle::qwen3};
+        if (selection == "zephyr")
+            return ChatFormat{ChatStyle::zephyr};
+        throw Error(ErrorCode::invalid_argument, "chat format must be auto, none, chatml, qwen3 or zephyr");
+    }
     if (!model.supports_generation())
         return {};
-    if (model.architecture() == "qwen3") {
-        // Official Qwen3-0.6B GGUF template. Implement its plain-text, non-thinking form.
-        constexpr std::string_view qwen3_template =
-            "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361";
-        if (detail::sha256(model.embedded_chat_template()) == qwen3_template)
-            return ChatFormat{{}, true};
-        return {};
+
+    std::string format;
+    if (detail::is_model_directory(path)) {
+        const auto config = optional_config(path / "tokenizer_config.json");
+        const auto field = config.find("chat_template");
+        if (field == config.end() || !field->is_string())
+            return {};
+        format = field->get<std::string>();
+    } else {
+        format = model.embedded_chat_template();
     }
-    if (!detail::is_model_directory(path))
+    if (format.empty())
         return {};
-    const auto config = optional_config(path / "tokenizer_config.json");
-    const auto field = config.find("chat_template");
-    if (field == config.end() || !field->is_string())
-        return {};
-    const auto& format = field->get_ref<const std::string&>();
+
+    const auto digest = detail::sha256(format);
+    // These Qwen3 templates render the same plain-text prompt with thinking disabled.
+    if (model.architecture() == "qwen3" &&
+        (digest == "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361" ||
+         digest == "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"))
+        return ChatFormat{ChatStyle::qwen3};
+    if (digest == "66291cf0045c2425a3a667cf3cbb7af2b11f09e025c02f97245323ab79119362")
+        return ChatFormat{ChatStyle::zephyr};
+
     // Recognize the SmolLM2 ChatML template and read its default system message.
     // The checkpoint's Jinja source is data and is never executed.
     constexpr std::string_view prefix =
@@ -107,7 +129,7 @@ std::optional<ChatFormat> chat_format(const std::filesystem::path& path, const M
     const auto system = format.substr(prefix.size(), format.size() - prefix.size() - suffix.size());
     if (system.find_first_of("'\\\r\n") != system.npos || system.find("<|") != system.npos)
         return {};
-    return ChatFormat{system};
+    return ChatFormat{ChatStyle::chatml, system, true};
 }
 
 std::string render_chat(const Json& messages, const std::optional<ChatFormat>& format) {
@@ -115,31 +137,38 @@ std::string render_chat(const Json& messages, const std::optional<ChatFormat>& f
         throw Error(ErrorCode::unsupported, "checkpoint has no supported chat template");
     if (!messages.is_array() || messages.empty())
         throw Error(ErrorCode::invalid_argument, "messages must be a nonempty array");
+    const bool qwen3 = format->style == ChatStyle::qwen3;
+    const bool zephyr = format->style == ChatStyle::zephyr;
+    constexpr std::string_view zephyr_delimiters[] = {"<s>", "</s>", "<|system|>", "<|user|>",
+                                                      "<|assistant|>"};
     std::string prompt;
     const auto append = [&](std::string_view role, std::string_view text) {
         constexpr std::string_view qwen_delimiters[] = {"<|endoftext|>",   "<think>",      "</think>",
                                                         "<tool_call>",     "</tool_call>", "<tool_response>",
                                                         "</tool_response>"};
-        if (text.find("<|im_start|>") != text.npos || text.find("<|im_end|>") != text.npos ||
-            (format->qwen3 &&
-             std::ranges::any_of(qwen_delimiters, [&](auto tag) { return text.find(tag) != text.npos; })))
+        const auto contains = [&](std::string_view tag) { return text.find(tag) != text.npos; };
+        if ((zephyr && std::ranges::any_of(zephyr_delimiters, contains)) ||
+            (!zephyr && (contains("<|im_start|>") || contains("<|im_end|>"))) ||
+            (qwen3 && std::ranges::any_of(qwen_delimiters, contains)))
             throw Error(ErrorCode::invalid_argument, "message text contains a reserved chat delimiter");
         const auto size = detail::sum(text.size(), role.size() + 24, "chat prompt");
         if (size > detail::mib - prompt.size())
             throw Error(ErrorCode::resource_limit, "rendered chat prompt exceeds 1 MiB");
-        prompt += "<|im_start|>";
+        prompt += zephyr ? "<|" : "<|im_start|>";
         prompt += role;
+        if (zephyr)
+            prompt += "|>";
         prompt += '\n';
         prompt += text;
-        prompt += "<|im_end|>\n";
+        prompt += zephyr ? "</s>\n" : "<|im_end|>\n";
     };
     bool user_turn = true;
     for (std::size_t i = 0; i < messages.size(); ++i) {
         const auto& message = messages[i];
         const auto role = message.at("role").get<std::string>();
         const auto text = message.at("content").get<std::string>();
-        if (format->qwen3 && (!message.value("tool_calls", Json{}).is_null() ||
-                              !message.value("reasoning_content", Json{}).is_null()))
+        if (qwen3 && (!message.value("tool_calls", Json{}).is_null() ||
+                      !message.value("reasoning_content", Json{}).is_null()))
             throw Error(ErrorCode::unsupported, "Qwen3 chat supports plain-text messages");
         if (!i && role == "system") {
             append(role, text);
@@ -154,20 +183,30 @@ std::string render_chat(const Json& messages, const std::optional<ChatFormat>& f
     }
     if (user_turn)
         throw Error(ErrorCode::invalid_argument, "the last message must have the user role");
-    const std::string_view assistant =
-        format->qwen3 ? "<|im_start|>assistant\n<think>\n\n</think>\n\n" : "<|im_start|>assistant\n";
+    const std::string_view assistant = zephyr  ? "<|assistant|>\n"
+                                       : qwen3 ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+                                               : "<|im_start|>assistant\n";
     if (assistant.size() > detail::mib - prompt.size())
         throw Error(ErrorCode::resource_limit, "rendered chat prompt exceeds 1 MiB");
     return prompt + std::string(assistant);
 }
 
-RequestDefaults request_defaults(const std::filesystem::path& path, const Model& model, bool greedy) {
+std::vector<Token> encode_prompt(const Tokenizer& tokenizer, const Model& model, std::string_view prompt,
+                                 bool add_bos) {
+    auto ids = tokenizer.encode(prompt);
+    const auto bos = model.config().bos;
+    if (tokenizer.adds_bos() ? (ids.empty() || ids.front() != bos) : add_bos)
+        ids.insert(ids.begin(), bos);
+    return ids;
+}
+
+RequestDefaults request_defaults(const std::filesystem::path& path, const Model& model, bool greedy,
+                                 std::string_view chat_override) {
     RequestDefaults result;
     result.sampling.greedy = greedy;
-    result.chat = chat_format(path, model);
-    if (result.chat && result.chat->qwen3)
-        result.stop_ids.push_back(
-            model.config().bos); // The pinned checkpoint uses <|endoftext|> as an extra EOS.
+    result.chat = chat_format(path, model, chat_override);
+    if (result.chat && result.chat->style == ChatStyle::qwen3 && model.architecture() == "qwen3")
+        result.stop_ids.push_back(model.config().bos); // Qwen3 checkpoints use <|endoftext|> as an extra EOS.
     if (!model.supports_generation() || !detail::is_model_directory(path))
         return result;
 
