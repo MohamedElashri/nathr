@@ -19,9 +19,60 @@ For an offline install, download `install.sh`, `nathr-linux-x86_64.tar.gz`, and 
 
 Installed releases check for updates at most once a day when `run` or `serve` starts in a terminal. Set `NATHR_NO_UPDATE_CHECK=1` to disable startup checks.
 
+## Models and cache
+
+`nathr models` lists the built-in names and shows which models are cached. `nathr run` and `nathr serve` default to `smollm2`. Other chat models include `qwen3`, `qwen3-1.7b`, `qwen2.5`, and `tinyllama`. To download a model ahead of time and print its local path, use `nathr pull MODEL`.
+
+The cache lives at `${XDG_CACHE_HOME:-$HOME/.cache}/nathr`. Set `NATHR_MODELS` or pass `--models-dir DIR` to use a different directory with `models`, `pull`, `run`, or `serve`.
+
+For your own model, pass a GGUF file or a Safetensors directory containing `config.json` and `model.safetensors`. To use text with a Safetensors checkpoint, keep `tokenizer.json` in the same directory. Check the format and architecture in the [checkpoint compatibility guide](inference-engine.md#checkpoint-support-and-limits).
+
+```sh
+nathr inspect ./model.gguf --summary
+nathr run ./model.gguf "Once upon a time"
+```
+
+## CLI reference
+
+Run `nathr --help` for the command list or `nathr COMMAND --help` for options.
+
+| Command | Use |
+| --- | --- |
+| `run [MODEL] [PROMPT]` | Chat, complete text, or return a named tensor in the terminal. |
+| `models`, `pull MODEL` | List pinned checkpoints or download one. |
+| `update [--check]` | Install the latest release or check availability. |
+| `inspect MODEL --summary` | See checkpoint capabilities and output names. |
+| `generate MODEL PROMPT` | Generate text with explicit sampling and stopping options. |
+| `infer MODEL PROMPT --output NAME` | Return a named tensor as JSON. |
+| `tokenize MODEL PROMPT` | Encode text or decode token IDs passed with `--tokens`. |
+| `batch MODEL` | Process JSONL requests with one loaded checkpoint. |
+| `serve [MODEL]` | Start the local API. |
+| `bench MODEL`, `bench --serve` | Measure native inference or HTTP serving. |
+| `encode MODEL PROMPT`, `forward MODEL --tokens IDS` | Inspect BERT hidden states or decoder logits and activations. |
+
+### CLI examples
+
+Inspect a prompt's token IDs and generate a short continuation. `--json` includes the generated token IDs and the reason generation stopped.
+
+```sh
+model=$(nathr pull gguf)
+nathr tokenize "$model" "Once upon a time"
+nathr generate "$model" "Once upon a time" --greedy --max-new-tokens 8 --backend auto --json
+```
+
+Send a plain-text instruction to FLAN-T5 Small or request a sentence embedding from MiniLM.
+
+```sh
+nathr run flan-t5 "What is the capital of Italy?"
+model=$(nathr pull minilm)
+nathr infer "$model" "The sky is blue." --output sentence_embedding --backend auto
+```
+
 ## CLI input and output
 
-`run` and `serve` select available CPU kernels by default. The lower-level commands default to scalar execution. Use `--backend auto` to select available kernels or `--backend avx2` to require AVX2 support.
+Use `--threads N` to choose the CPU thread count. `run` and `serve` select available CPU kernels by default. The lower-level commands default to scalar execution. Use `--backend auto` to select available kernels or `--backend avx2` to require AVX2 support.
+
+Nathr recognizes supported chat templates automatically. Use `--chat-format chatml`, `qwen3`, or `zephyr` to select a format explicitly, or `--chat-format none` for text completion.
 
 `generate` and `infer` read a plain-text prompt through EOF with `--stdin`. Pass `--tokens 1,7,2` to supply raw token IDs. Use `--tokenizer FILE` to supply a matching tokenizer sidecar to a supported GGUF checkpoint. For named tensors, `inspect MODEL --summary` lists the outputs. `infer` returns the output name, shape, and flat row-major values. BERT text pairs use `--text-pair TEXT`, and raw BERT inputs can include `--token-type-ids IDS`. T5 accepts a decoder prefix with `--decoder-tokens IDS`.
 
@@ -30,6 +81,8 @@ Use `--sample` with `--temperature`, `--top-k`, `--top-p`, or `--seed` to contro
 ### Generation limits
 
 For decoder-only models, the context covers the input, chat history, and reply together. The default is up to 8,192 positions, subject to the model context and KV budget. Replies default to up to 1,024 new tokens. Nathr honors a checkpoint's configured reply limit and reduces the default when a long prompt leaves less room. T5 uses separate source and decoder contexts.
+
+Use `--context` to set the context size and `--max-new-tokens` on `run` or `generate` to set the reply budget.
 
 `run` and `serve` allow requests of up to 4,096 output tokens by default. Use `--max-output-tokens` to adjust that cap, up to 8,192. Use `--kv-budget-mib` to change the worker's 1,024 MiB KV budget. The worker allocates pages as needed and selects FP16 for decoder caches when FP32 would exceed the budget for the target context. Use `--kv-cache f32` or `--kv-cache f16` to choose explicitly.
 
@@ -111,6 +164,8 @@ Use `--memory-budget-mib` for on-demand loading and eviction of idle workers. Fo
 
 Set `stream` to `true` for streamed generation. Chat Completions accepts `logprobs` set to `true` and `top_logprobs` from 0 to 20. For a full Qwen3 logits row from `/infer`, start the server with `--max-result-values 151936 --max-buffer-bytes 4194304`. Prometheus counters reset when a worker is evicted and loaded again.
 
+T5 and FLAN-T5 take plain text prompts on `/v1/completions`. Repeated requests with the same source tokens can reuse the source encoding. Pass `--no-prefix-cache` to disable reuse.
+
 ### Structured outputs and function calls
 
 Use `response_format` on Chat Completions or `text.format` on Responses. Both accept `json_object` and `json_schema` on supported decoder-only models with a byte-level tokenizer. The schema root must be an object. Nathr supports properties, required fields, array items, scalar types, and scalar `enum` and `const`. Limits include 32 properties per object and eight nesting levels. A reply that runs out of tokens finishes with `length` in Chat Completions or `incomplete` in Responses.
@@ -159,11 +214,22 @@ nathr bench "$model" --prompt-length 16 --decode-length 4 --warmups 1 --repetiti
 
 With `nathr serve` running, use `nathr bench --serve --workload mixed --concurrency 4 --requests 16` to measure streaming requests. Use the same `--seed` and restart the server when comparing settings such as `--no-prefix-cache`. `--speculative-tokens 4` enables prompt lookup for unconstrained greedy decoder requests. See [CPU measurements](inference-engine.md#cpu-measurements) for results and commands.
 
-T5 and FLAN-T5 take plain text prompts on `/v1/completions`. Repeated requests with the same source tokens can reuse the source encoding. Pass `--no-prefix-cache` to disable reuse.
-
 ## Build and verify
 
-With the [build prerequisites](../README.md#prerequisites) installed, build and test from the repository root.
+### Build prerequisites
+
+Use x86-64 Linux with Git, Bash, Python 3.10+, CMake 3.25+, Ninja, GCC 12+ or Clang 16+, and ICU 70+ development headers (`libicu-dev` on Debian and Ubuntu). The setup script also needs `flock` and `curl` or `wget`.
+
+`setup.sh` downloads the selected checkpoint, builds Nathr, and runs the tests.
+
+```sh
+git clone https://github.com/MohamedElashri/nathr.git
+cd nathr
+./setup.sh smollm2
+./build/release/nathr run --models-dir models/cache
+```
+
+To build and test an existing checkout directly, run these commands from the repository root.
 
 ```sh
 cmake --preset release

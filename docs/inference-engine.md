@@ -238,7 +238,7 @@ Work outward from the first place results can diverge. Use an independent implem
 
 ### Run the checks with Nathr
 
-The checked-in FP32 fixture exercises both forward paths without downloading model weights. Run these commands from the repository root. [Build requirements](../README.md#prerequisites)
+The checked-in FP32 fixture exercises both forward paths without downloading model weights. Run these commands from the repository root. [Build requirements](usage.md#build-prerequisites)
 
 ```sh
 cmake --preset release
@@ -253,9 +253,9 @@ fixture=tests/fixtures/model/f32
 
 Both Llama fixture calls return 23 logits and a greedy ID of `2`. Compare their `logits` arrays, then rerun the two forward calls with `fixture=tests/fixtures/gpt2` to exercise the GPT-2 path. The runtime tests compare full forward, chunked prefill, and repeated append. The GPT-2 fixture also checks logits against a Transformers reference. [Nathr runtime tests](../tests/runtime.cpp)
 
-`forward --trace FILE` writes intermediate activations for a short sequence. `forward --logits-f32` streams one little-endian FP32 vocabulary row per token for comparisons against an independent implementation using the same checkpoint. Use exact comparisons when the operations and their numeric behavior match. When precision or reduction order differs, use a tolerance that accounts for the expected rounding error. [CLI reference](../README.md#cli-reference)
+`forward --trace FILE` writes intermediate activations for a short sequence. `forward --logits-f32` streams one little-endian FP32 vocabulary row per token for comparisons against an independent implementation using the same checkpoint. Use exact comparisons when the operations and their numeric behavior match. When precision or reduction order differs, use a tolerance that accounts for the expected rounding error. [CLI reference](usage.md#cli-reference)
 
-Once the numeric path agrees, try the CLI examples with full SmolLM2 and GPT-2 checkpoints. Reuse the prompt IDs returned by `tokenize` for reproducible forward comparisons. The `bench` command uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [CLI examples](../README.md#cli-examples)
+Once the numeric path agrees, try the CLI examples with full SmolLM2 and GPT-2 checkpoints. Reuse the prompt IDs returned by `tokenize` for reproducible forward comparisons. The `bench` command uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [CLI examples](usage.md#cli-examples)
 
 The compatibility checker verifies SHA-256 hashes, token IDs, sampled tensor values, and seeded generation across standalone and batched execution where supported. Transformers 4.57.6 supplies the dense tensor and two-turn chat reference values. SmolLM2 GGUF tensor values and seeded samples come from Nathr. Qwen2.5, Qwen3, and TinyLlama GGUF token IDs, sampled logits, and chat prompt IDs come from llama.cpp 1.1.0. The optional mixed-length GGUF benchmark reports short-request time to first token, p95 inter-token latency, output throughput, and KV memory for one and three active requests. [Run the compatibility checker](usage.md#check-model-compatibility) · [Reference values](../tests/checkpoints.json)
 
@@ -277,7 +277,7 @@ A worker can share the immutable cross-attention cache when complete source toke
 
 ### Expose checkpoint outputs
 
-Use a tensor name and shape as the common inference contract. A checkpoint describes which outputs exist and how many input tokens they take. A BERT checkpoint can expose all hidden states or bind weights for its pooler and a classification head. Sentence Transformers checkpoints describe extra pooling and normalization in their module configuration. T5 logits are indexed by decoder position and can be compared using an explicit decoder prefix. Generation wraps logits with a sampling loop and request state. [Model inference API](../include/nathr/nathr.hpp) · [Output examples](../README.md#cli-examples)
+Use a tensor name and shape as the common inference contract. A checkpoint describes which outputs exist and how many input tokens they take. A BERT checkpoint can expose all hidden states or bind weights for its pooler and a classification head. Sentence Transformers checkpoints describe extra pooling and normalization in their module configuration. T5 logits are indexed by decoder position and can be compared using an explicit decoder prefix. Generation wraps logits with a sampling loop and request state. [Model inference API](../include/nathr/nathr.hpp) · [Output examples](usage.md#cli-examples)
 
 ## Checkpoint support and limits
 

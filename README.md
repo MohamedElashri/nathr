@@ -1,12 +1,16 @@
 # Nathr
 
-Nathr is a small CPU inference engine for text Transformers. It runs chat, text generation, embeddings, and reranking locally through a terminal CLI, an OpenAI-compatible HTTP API, or a C++ library.
+**Run small language models on your CPU.**
+
+Chat in the terminal, run a one-off prompt, or connect an OpenAI-compatible client to your local Nathr server. Nathr also runs models for embeddings and reranking.
+
+[Latest release](https://github.com/MohamedElashri/nathr/releases/latest) · [User guide](docs/usage.md) · [How the engine works](docs/inference-engine.md)
 
 ## Quick start
 
-The prebuilt release targets Ubuntu 24.04 on x86-64. You need Bash, Python 3.10+, `ca-certificates`, `libicu74`, `libstdc++6`, `coreutils`, `tar`, `flock` from `util-linux`, and `curl` or `wget`.
+The prebuilt release targets Ubuntu 24.04 on x86-64. It requires Bash, Python 3.10+, `ca-certificates`, `libicu74`, `libstdc++6`, `coreutils`, `tar`, `flock` from `util-linux`, and `curl` or `wget`.
 
-Run these commands as your regular user. The installer verifies the release and downloads the default chat model, SmolLM2-135M-Instruct (about 270 MB).
+Run these commands as your regular user. The installer verifies the release and downloads SmolLM2-135M-Instruct (about 270 MB).
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/MohamedElashri/nathr/main/install.sh | bash
@@ -14,42 +18,31 @@ export PATH="$HOME/.local/bin:$PATH"
 nathr run
 ```
 
-Type a prompt and press Enter. Nathr keeps the conversation until you type `/reset`. Type `/exit` or press Ctrl+D to quit. Add the `export` line to your shell startup file to keep `nathr` on PATH in new terminals.
+Type a message and press Enter. Use `/reset` to clear the conversation, or `/exit` or Ctrl+D to quit. Add the `export` line to your shell startup file to keep `nathr` on PATH.
 
-Use `nathr update` to upgrade or `nathr update --check` to check manually. Older versions can rerun the installer. See the [installation and update options](docs/usage.md#installation-options).
+Use `nathr update` to upgrade or `nathr update --check` to check for a release. If your version predates the update command, run the installer again. See the [installation options](docs/usage.md#installation-options).
 
 ## Run a model
 
 ```sh
 nathr models
-nathr pull qwen3
-nathr run qwen3 "What is the capital of France?"
+nathr run qwen3 "Explain what a checksum is in one sentence." --stats
+nathr run minilm "The sky is blue."
 ```
 
-`nathr models` lists checkpoint names and cache status. With `run` or `serve`, a named model downloads on first use. `nathr pull` downloads it ahead of time and prints its local path. Other chat models include `smollm2`, `tinyllama`, `qwen2.5`, and `qwen3-1.7b`. The model defaults to `smollm2`. Omit the prompt to start an interactive session.
+Nathr downloads named models on first use. Run `nathr pull MODEL` to download one ahead of time, or pass a local checkpoint path to `nathr run`. See the [model and cache guide](docs/usage.md#models-and-cache).
 
-The cache lives at `${XDG_CACHE_HOME:-$HOME/.cache}/nathr`. Set `NATHR_MODELS` or pass `--models-dir DIR` to use a different directory.
-
-For a local checkpoint, pass the GGUF file or the directory containing `config.json` and `model.safetensors`. For text input, the Safetensors directory also needs the checkpoint’s `tokenizer.json`.
-
-```sh
-nathr inspect ./model.gguf --summary
-nathr run ./model.gguf "Once upon a time"
-```
-
-Generation defaults to a context of up to 8,192 tokens and a reply budget of 1,024 new tokens. The checkpoint and remaining context determine the effective reply budget. Use `--context` and `--max-new-tokens` to set the limits explicitly. See the [generation limits](docs/usage.md#generation-limits).
-
-Use `--threads N` to choose the CPU thread count. Nathr recognizes supported chat templates automatically. Use `--chat-format chatml`, `qwen3`, or `zephyr` to choose a matching format explicitly, or `--chat-format none` for text completion.
+`--stats` shows latency and tokens per second. The MiniLM example returns a sentence embedding.
 
 ## OpenAI-compatible API
 
-Start the server and leave it running in its terminal.
+Start the server in one terminal.
 
 ```sh
 nathr serve smollm2
 ```
 
-Send a chat request from a second terminal.
+Send a prompt from another terminal.
 
 ```sh
 curl -fsS http://127.0.0.1:8000/v1/chat/completions \
@@ -57,68 +50,13 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -d '{"model":"smollm2","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":16}'
 ```
 
-Read the reply in `choices[0].message.content`. For an OpenAI-compatible client, set the base URL to `http://127.0.0.1:8000/v1` and the model to `smollm2`. The server listens on localhost and accepts requests without credentials. If your client requires a key, use `local`. GET `/v1/models` lists the available model IDs. Press Ctrl+C in the server terminal to stop it.
+Read the reply in `choices[0].message.content`. In an OpenAI-compatible client, set the base URL to `http://127.0.0.1:8000/v1` and the model to `smollm2`. If the client requires an API key, enter `local`. See the [Python SDK example](docs/usage.md#use-the-openai-python-sdk).
 
-See the [serving guide](docs/usage.md#serve-multiple-models) for embeddings, reranking and memory limits, or the [Python SDK example](docs/usage.md#use-the-openai-python-sdk).
+Press Ctrl+C in the server terminal to stop it.
 
-## CLI reference
+## Documentation
 
-Run `nathr --help` for the command list and `nathr COMMAND --help` for that command's options.
-
-| Command | Use |
-| --- | --- |
-| `run [MODEL] [PROMPT]` | Chat, complete text, or return a named tensor in the terminal. |
-| `models`, `pull MODEL` | List pinned checkpoints or download one. |
-| `update [--check]` | Install the latest release or check availability. |
-| `inspect MODEL --summary` | See checkpoint capabilities and output names. |
-| `generate MODEL PROMPT` | Generate text with explicit sampling and stopping options. |
-| `infer MODEL PROMPT --output NAME` | Return a named tensor as JSON. |
-| `tokenize MODEL PROMPT` | Encode text or decode token IDs passed with `--tokens`. |
-| `batch MODEL` | Process JSONL requests with one loaded checkpoint. |
-| `serve [MODEL]` | Start the local API. |
-| `bench MODEL`, `bench --serve` | Measure native inference or HTTP serving. |
-| `encode MODEL PROMPT`, `forward MODEL --tokens IDS` | Inspect BERT hidden states or decoder logits and activations. |
-
-### CLI examples
-
-Use `nathr run MODEL "Your prompt" --stats` to report latency, tokens per second, and peak KV memory. See [inference statistics](docs/usage.md#inference-statistics).
-
-Use a quantized checkpoint to inspect token IDs and generate a short continuation. `--json` includes the generated token IDs and finish reason.
-
-```sh
-model=$(nathr pull gguf)
-nathr tokenize "$model" "Once upon a time"
-nathr generate "$model" "Once upon a time" --greedy --max-new-tokens 8 --backend auto --json
-```
-
-Send a plain-text instruction to FLAN-T5 Small.
-
-```sh
-nathr run flan-t5 "What is the capital of Italy?"
-```
-
-Request a sentence embedding from MiniLM.
-
-```sh
-model=$(nathr pull minilm)
-nathr infer "$model" "The sky is blue." --output sentence_embedding --backend auto
-```
-
-See the [usage guide](docs/usage.md) for batch input, LoRA, chat history, log probabilities, and server options.
-
-## Build from source
-
-### Prerequisites
-
-Use x86-64 Linux with Git, Bash, Python 3.10+, CMake 3.25+, Ninja, GCC 12+ or Clang 16+, and ICU 70+ development headers (`libicu-dev` on Debian and Ubuntu). The setup script also needs `flock` and `curl` or `wget`.
-
-```sh
-git clone https://github.com/MohamedElashri/nathr.git
-cd nathr
-./setup.sh smollm2
-./build/release/nathr run --models-dir models/cache
-```
-
-`setup.sh` downloads the selected checkpoint, builds Nathr, and runs the tests. See [Build and verify](docs/usage.md#build-and-verify) for using an existing checkpoint or installing the C++ library.
-
-The [inference engine guide](docs/inference-engine.md) explains the implementation, supported checkpoint formats, and [CPU measurements](docs/inference-engine.md#cpu-measurements).
+- [CLI reference and examples](docs/usage.md#cli-reference)
+- [Serving multiple models](docs/usage.md#serve-multiple-models)
+- [Inference statistics and tuning](docs/usage.md#inference-statistics)
+- [Build from source and use the C++ library](docs/usage.md#build-and-verify)
