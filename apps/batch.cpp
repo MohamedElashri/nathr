@@ -120,7 +120,7 @@ class LoraRegistry {
         check_root(directory);
         for (const auto filename : {"adapter_config.json", "adapter_model.safetensors"})
             check_root(std::filesystem::canonical(directory / filename));
-        load(std::move(name), directory, path);
+        load(std::move(name), directory, directory);
     }
 
     void unload(const std::string& name, const BatchScheduler& scheduler) {
@@ -407,7 +407,9 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             } else {
                 lora.unload(unload_lora->get<std::string>(), *scheduler);
             }
-            write_output({{"event", "result"}, {"id", *id}, {"lora_adapters", lora.names()},
+            write_output({{"event", "result"},
+                          {"id", *id},
+                          {"lora_adapters", lora.names()},
                           {"lora_runtime_paths", lora.runtime_paths()}});
             return;
         }
@@ -443,9 +445,9 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
         }
         constexpr std::string_view common[] = {"id", "prompt", "tokens", "lora"};
         constexpr std::string_view tensors[] = {"output", "text_pair", "token_type_ids", "decoder_tokens"};
-        constexpr std::string_view generation[] = {"max_new_tokens", "seed", "greedy", "temperature",
-                                                   "top_k", "top_p", "messages", "stop", "stop_ids",
-                                                   "decode", "top_logprobs", "json_schema"};
+        constexpr std::string_view generation[] = {"max_new_tokens", "seed",   "greedy",       "temperature",
+                                                   "top_k",          "top_p",  "messages",     "stop",
+                                                   "stop_ids",       "decode", "top_logprobs", "json_schema"};
         const auto extra = tensor != json.end() ? std::span<const std::string_view>(tensors)
                                                 : std::span<const std::string_view>(generation);
         for (const auto& [key, value] : json.items()) {
@@ -533,10 +535,13 @@ void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions opt
     std::size_t workspaces = 2;
     auto kv = options.kv_budget_bytes;
     std::size_t result_count = 1;
+    auto vocabulary = detail::max_vocabulary;
     if (directory) {
         const auto config_path = path / "config.json";
         const auto config = detail::read_json(config_path, detail::mib);
         const auto type = config.find("model_type");
+        if (const auto value = config.find("vocab_size"); value != config.end())
+            vocabulary = detail::natural(*value, "vocab_size");
         if (type != config.end() && *type == "bert") {
             kv = 0;
             result_count = 16;
@@ -552,20 +557,20 @@ void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions opt
     if (kv) {
         // Cover retained logits and sampler candidates for each active request.
         const auto sampling =
-            detail::product({options.max_active, detail::max_vocabulary, 32}, "worker sampling buffers");
+            detail::product({options.max_active, vocabulary, 32}, "worker sampling buffers");
         workspace = detail::sum(workspace, sampling, "worker workspace total");
     }
-    workspace =
-        detail::sum(workspace, detail::product({result_count, io.max_result_values, sizeof(float)}, "tensor results"),
-                    "worker workspace total");
+    workspace = detail::sum(
+        workspace, detail::product({result_count, io.max_result_values, sizeof(float)}, "tensor results"),
+        "worker workspace total");
     const auto lora = io.lora_adapters.empty() && io.lora_root.empty() ? 0 : lora_budget_bytes;
-    const auto total = detail::sum(
-        detail::sum(weights, workspace, "worker memory"), detail::sum(kv, lora, "worker memory"),
-        "worker memory");
+    const auto total = detail::sum(detail::sum(weights, workspace, "worker memory"),
+                                   detail::sum(kv, lora, "worker memory"), "worker memory");
     write_output({{"weights_bytes", weights},
                   {"workspace_bytes", workspace},
                   {"kv_bytes", kv},
                   {"lora_bytes", lora},
+                  {"vocabulary_limit", vocabulary},
                   {"total_bytes", total}});
 }
 
@@ -580,18 +585,38 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
         output.live_stats = &*scheduler;
     BatchInput input;
     const auto defaults = request_defaults(path, model, true);
+    std::optional<BatchMetrics> last_metrics;
+    const auto publish_metrics = [&] {
+        if (!io.metrics || !scheduler)
+            return;
+        const auto values = scheduler->metrics();
+        if (last_metrics == values)
+            return;
+        last_metrics = values;
+        write_output({{"event", "metrics"},
+                      {"values",
+                       {{"requests_active", values.active_requests},
+                        {"requests_queued", values.queued_requests},
+                        {"queued_tokens", values.queued_tokens},
+                        {"kv_used_bytes", values.kv_used_bytes},
+                        {"kv_resident_bytes", values.kv_resident_bytes},
+                        {"kv_budget_bytes", values.kv_budget_bytes},
+                        {"prefix_cache_lookups_total", values.prefix_lookups},
+                        {"prefix_cache_hits_total", values.prefix_hits},
+                        {"prefix_cache_tokens_total", values.cached_prompt_tokens}}}});
+    };
+    publish_metrics();
     if (io.ready) {
         try {
             output.tokenizer = load_tokenizer(model, path, sidecar);
         } catch (const Error&) {
             // Checkpoints with external tokenizers can still accept raw IDs.
         }
-        Json ready = {
-            {"event", "ready"},
-            {"text", output.tokenizer.has_value()},
-            {"chat", model.supports_generation() && defaults.chat.has_value() && output.tokenizer},
-            {"max_new_tokens", defaults.max_new_tokens},
-            {"lora_adapters", lora.names()}};
+        Json ready = {{"event", "ready"},
+                      {"text", output.tokenizer.has_value()},
+                      {"chat", model.supports_generation() && defaults.chat.has_value() && output.tokenizer},
+                      {"max_new_tokens", defaults.max_new_tokens},
+                      {"lora_adapters", lora.names()}};
         add_capabilities(ready, model);
         ready["structured_outputs"] =
             model.supports_fused_batch() && output.tokenizer && output.tokenizer->byte_level();
@@ -612,8 +637,10 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
     };
     const auto empty = [&] { return !scheduler || scheduler->empty(); };
     while (!input.done() || !empty()) {
-        if (auto line = input.next(empty()))
+        if (auto line = input.next(empty())) {
             process(*line);
+            publish_metrics();
+        }
         if (!tensors.empty()) {
             if (io.ready) {
                 // Wait at most one millisecond to coalesce concurrent encoder requests.
@@ -627,7 +654,9 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
             flush_tensors(model, tensors);
         }
         if (!empty()) {
-            for (const auto& event : scheduler->step())
+            const auto events = scheduler->step();
+            publish_metrics();
+            for (const auto& event : events)
                 output.publish(event);
         }
     }

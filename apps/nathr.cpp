@@ -717,9 +717,12 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
         {number(args, "--kv-budget-mib", batch_options.kv_budget_bytes / detail::mib), detail::mib},
         "batch KV budget");
     batch_options.session = session_options(args);
-    const cli::BatchIoOptions io{args.flag("--stats"), args.flag("--ready"),
-                                 number(args, "--max-result-values", std::size_t{0}), args.adapters(),
-                                 args.option("--lora-root").value_or("")};
+    const cli::BatchIoOptions io{args.flag("--stats"),
+                                 args.flag("--ready"),
+                                 number(args, "--max-result-values", std::size_t{0}),
+                                 args.adapters(),
+                                 args.option("--lora-root").value_or(""),
+                                 args.flag("--metrics")};
     const auto tokenizer = args.option("--tokenizer").value_or("");
     const bool memory_plan = args.flag("--memory-plan");
     args.finish();

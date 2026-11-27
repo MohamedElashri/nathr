@@ -9,6 +9,7 @@ struct BatchIoOptions {
     std::size_t max_result_values = 0;
     std::vector<std::string> lora_adapters{};
     std::filesystem::path lora_root{};
+    bool metrics = false;
 };
 
 void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions options, BatchIoOptions io);

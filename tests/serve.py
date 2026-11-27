@@ -70,7 +70,10 @@ def request(port, path, value=None, status=200):
             assert lines[-1] == b"data: [DONE]", lines
             return [json.loads(line.removeprefix(b"data: ")) for line in lines[:-1]]
         if content_type.startswith("text/"):
-            assert response.getheader("Content-Security-Policy")
+            if path.partition("?")[0] == "/metrics":
+                assert content_type.startswith("text/plain; version=0.0.4")
+            else:
+                assert response.getheader("Content-Security-Policy")
             return raw.decode()
         return json.loads(raw)
     finally:
@@ -150,16 +153,20 @@ def structured_checks(binary, checkpoint):
     messages = [{"role": "user", "content": "b"}]
     chat_path = "/v1/chat/completions"
     response_path = "/v1/responses"
-    with server(binary, checkpoint) as port:
+    with server(binary, checkpoint, "--speculative-tokens", "4") as port:
         assert request(port, "/model")["structured_outputs"]
         chat = {"messages": messages, "response_format": output, "temperature": 0, "max_tokens": 72}
         result = request(port, chat_path, chat)["choices"][0]
         assert result["finish_reason"] == "stop" and json.loads(result["message"]["content"]) == expected
         sampled = request(port, chat_path, dict(chat, temperature=0.7, seed=6))["choices"][0]
         assert sampled["finish_reason"] == "stop" and json.loads(sampled["message"]["content"]) == expected
-        events = request(port, chat_path, dict(chat, stream=True))
+        scored = request(port, chat_path, dict(chat, logprobs=True, top_logprobs=2))["choices"][0]
+        events = request(port, chat_path, dict(chat, stream=True, logprobs=True, top_logprobs=2))
         text = "".join(event["choices"][0]["delta"].get("content", "") for event in events)
         assert json.loads(text) == expected and events[-1]["choices"][0]["finish_reason"] == "stop"
+        stream_scores = [score for event in events for score in
+                         event["choices"][0].get("logprobs", {}).get("content", [])]
+        assert stream_scores and stream_scores == scored["logprobs"]["content"]
         result = request(port, chat_path, dict(chat, max_tokens=1))["choices"][0]
         assert result["finish_reason"] == "length" and result["message"]["content"] == "{"
         result = request(port, chat_path, dict(chat, max_tokens=1, response_format={"type": "json_object"}))["choices"][0]
@@ -187,7 +194,8 @@ def structured_checks(binary, checkpoint):
         (call,) = assistant["tool_calls"]
         assert choice["finish_reason"] == "tool_calls" and assistant["content"] is None
         assert call["function"]["name"] == function["name"] and json.loads(call["function"]["arguments"]) == expected
-        events = request(port, chat_path, dict(call_input, stream=True))
+        events = request(port, chat_path, dict(call_input, stream=True, logprobs=True))
+        assert any(event["choices"][0].get("logprobs", {}).get("content") for event in events)
         deltas = [event["choices"][0]["delta"]["tool_calls"][0]["function"].get("arguments", "")
                   for event in events if "tool_calls" in event["choices"][0]["delta"]]
         assert json.loads("".join(deltas)) == expected and events[-1]["choices"][0]["finish_reason"] == "tool_calls"
@@ -406,16 +414,40 @@ def user_commands(binary, checkpoint, encoder, directory):
 
 def speculative_stream(binary, checkpoint):
     prompt = dict(tokens=[20] * 18, decode=True, max_new_tokens=12, greedy=True)
+    with server(binary, checkpoint) as port:
+        baseline = request(port, "/infer", dict(prompt, top_logprobs=3))
     with server(binary, checkpoint, "--speculative-tokens", "4") as port:
-        full = request(port, "/infer", prompt)
+        full = request(port, "/infer", dict(prompt, top_logprobs=3))
         assert full["generated_ids"] == [20] * 12 and full["text"] == "a" * 12
         assert full["accepted_draft_tokens"] >= 4
+        assert len(full["token_logprobs"]) == len(baseline["token_logprobs"]) == 12
+        for actual, expected in zip(full["token_logprobs"], baseline["token_logprobs"], strict=True):
+            for a, b in zip([actual, *actual["top_logprobs"]], [expected, *expected["top_logprobs"]], strict=True):
+                assert a["token_id"] == b["token_id"]
+                assert math.isclose(a["logprob"], b["logprob"], rel_tol=1e-6, abs_tol=1e-6)
         stream = request(port, "/infer", dict(prompt, stream=True, stop=["aaa"]))
         assert [item["token_id"] for item in stream if item["event"] == "token"] == [20] * 3
         assert stream[-1]["reason"] == "stop" and stream[-1]["accepted_draft_tokens"] == 2
         assert not "".join(item.get("text", "") for item in stream)
         sampled = request(port, "/infer", dict(prompt, greedy=False, top_k=1))
         assert sampled["generated_ids"] == full["generated_ids"] and "draft_tokens" not in sampled
+
+
+def metric_value(metrics, name, model):
+    prefix = f'nathr_{name}{{model="{model}"}} '
+    return float(next(line[len(prefix):] for line in metrics.splitlines() if line.startswith(prefix)))
+
+
+def metrics_under_load(binary, checkpoint):
+    with server(binary, checkpoint, "--model-id", "chat", "--max-clients", "1", "--context", "8192",
+                "--max-queued-tokens", "8192", "--max-active", "1", "--step-tokens", "2") as port:
+        payload = json.dumps(dict(tokens=[4] * 6000, max_new_tokens=100, stream=True), separators=(",", ":"))
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+            client.sendall((f"POST /infer HTTP/1.1\r\nHost: localhost:{port}\r\n"
+                            f"Content-Length: {len(payload)}\r\n\r\n{payload}").encode())
+            until(lambda: metric_value(request(port, "/metrics"), "requests_active", "chat") == 1,
+                  "metrics did not report active generation under load")
+            request(port, "/infer", dict(tokens=[4], max_new_tokens=1), status=429)
 
 
 def multi_model_benchmark(binary, checkpoint, encoder):
@@ -428,6 +460,12 @@ def multi_model_benchmark(binary, checkpoint, encoder):
         assert set(request(port, "/health")["models"]) == {"chat", "bert"}
         request(port, "/health?model=missing", status=404)
         assert request(port, "/health?model=chat")["kv"]["peak_bytes"] == 0
+        metrics = request(port, "/metrics")
+        assert metric_value(metrics, "worker_up", "chat") == metric_value(metrics, "worker_up", "bert") == 1
+        assert metric_value(metrics, "kv_budget_bytes", "chat") > 0
+        assert metric_value(metrics, "kv_budget_bytes", "bert") == 0
+        assert "# TYPE nathr_time_to_first_token_seconds histogram" in metrics
+        request(port, "/metrics?model=missing", status=404)
         assert request(port, "/v1/responses", dict(input="b", max_output_tokens=1))["model"] == "chat"
         embedding = request(port, "/v1/embeddings", dict(model="bert", input="The sky is blue."))
         assert embedding["model"] == "bert" and len(embedding["data"][0]["embedding"]) == 12
@@ -446,6 +484,20 @@ def multi_model_benchmark(binary, checkpoint, encoder):
                                         text=True, timeout=15)
         result = json.loads(mixed)
         assert result["short"]["requests"] == 3 and result["long"]["requests"] == 1
+
+        metrics = request(port, "/metrics?model=chat")
+        assert 'model="bert"' not in metrics
+        assert metric_value(metrics, "requests_active", "chat") == metric_value(metrics, "requests_queued", "chat") == 0
+        assert metric_value(metrics, "kv_used_bytes", "chat") > 0
+        assert 0 < metric_value(metrics, "prefix_cache_hits_total", "chat") <= metric_value(
+            metrics, "prefix_cache_lookups_total", "chat")
+        assert metric_value(metrics, "prefix_cache_tokens_total", "chat") >= 64
+        assert metric_value(metrics, "time_to_first_token_seconds_count", "chat") == 10
+        assert metric_value(metrics, "request_queue_time_seconds_count", "chat") == 10
+        assert 'nathr_time_to_first_token_seconds_bucket{model="chat",le="+Inf"} 10' in metrics.splitlines()
+        metrics = request(port, "/metrics?model=bert")
+        assert metric_value(metrics, "request_duration_seconds_count", "bert") == 1
+        assert metric_value(metrics, "time_to_first_token_seconds_count", "bert") == 0
 
 
 def encoder_batch_checks(binary, encoder):
@@ -609,4 +661,5 @@ if __name__ == "__main__":
         rerank_checks(executable, fixtures / "bert", checkpoint / "reranker")
         memory_budget(executable, checkpoint, fixtures / "bert", fixtures / "gpt2")
         cancelled_checkpoint_command(executable, checkpoint)
+        metrics_under_load(executable, checkpoint)
         checkpoint_defaults(executable, checkpoint)

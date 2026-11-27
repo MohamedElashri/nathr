@@ -173,7 +173,7 @@ nathr bench --serve --workload shared-prefix --prompt-length 512 --warmups 1 --s
 
 The workloads send synthetic token IDs. The report includes time to first token, approximate inter-token percentiles, queue time, throughput, and the worker's peak KV bytes since startup. Mixed workloads also report latency separately for short and long requests. Start fresh servers with the same seed to compare settings. Use `--no-prefix-cache` for a cache-disabled trial or `--max-queue-bypasses 2` to test admission under a tight KV budget.
 
-Try `--speculative-tokens 4` with `nathr batch`, `nathr run`, or `nathr serve` to enable prompt lookup for greedy decoder requests. Compare with speculation disabled using repeated-text prompts. Batch statistics and native `/infer` results report draft and acceptance counts.
+Try `--speculative-tokens 4` with `nathr batch`, `nathr run`, or `nathr serve` to enable prompt lookup for greedy decoder requests without a JSON schema. Compare with speculation disabled using repeated-text prompts. Batch statistics and native `/infer` results report draft and acceptance counts.
 
 ## OpenAI-compatible API
 
@@ -214,6 +214,7 @@ Chat Completions accepts `logprobs=True` and `top_logprobs=0` through `20`. Scor
 | Endpoint | Use |
 | --- | --- |
 | `GET /health` | Worker status, request counts, and KV memory |
+| `GET /metrics` | Per-model Prometheus metrics for scheduler load, KV usage, cache hits, and latency |
 | `GET /model` | Checkpoint capabilities, output shapes, and request limits |
 | `GET /v1/models`, `GET /v1/models/{id}` | List and retrieve model IDs for OpenAI-compatible clients |
 | `POST /infer` | A batch-style request without an ID, for generation or a named tensor |
@@ -241,7 +242,9 @@ nathr serve smollm2 --also minilm --memory-budget-mib 512 --kv-budget-mib 128
 
 The primary model loads at startup. Additional models load on first inference or capability inspection at `/model`. Model discovery and health list configured models without loading them. Idle workers are evicted in least-recently-used order when another model needs room. Active requests keep their worker, so a request that cannot fit can retry after they drain.
 
-The allowance accounts for checkpoint files, conservative native workspace estimates, and KV capacity. It excludes process overhead such as tokenizer data and HTTP buffers. `/health` reports the total allowance, reserved bytes, and each worker's residency and memory breakdown.
+The allowance accounts for checkpoint files, conservative native workspace estimates, KV capacity, and a 256 MiB adapter allowance on the primary worker when LoRA is configured. It excludes process overhead such as tokenizer data and HTTP buffers. `/health` reports the total allowance, reserved bytes, and each worker's residency and memory breakdown.
+
+Scrape `http://127.0.0.1:8000/metrics` for all models or add `?model=smollm2` for one model. Queue and KV gauges reflect the last scheduler boundary. Latency histograms use seconds and measure worker activity. The server keeps a spare connection slot for scrapes when inference slots are full. Model counters restart when a worker is evicted and loaded again.
 
 Encoder workers group similar token lengths into bounded batches. To rerank, add `--also tinybert`
 and send a query and up to 16 documents.
@@ -254,7 +257,7 @@ curl -fsS http://127.0.0.1:8000/v1/rerank \
 
 Results include original document indices and sigmoid relevance scores in descending order.
 
-Add `--lora-root ./adapters` to enable loading and unloading without restarting. `POST /v1/load_lora_adapter` accepts `{"lora_name":"tuned","lora_path":"my-adapter"}`, where the path resolves beneath that directory. `POST /v1/unload_lora_adapter` accepts `{"lora_name":"tuned"}` once the adapter's active and queued requests finish. The primary worker holds up to 16 adapters and 256 MiB of decoded adapter weights.
+Add `--lora-root ./adapters` to enable loading and unloading without restarting. `POST /v1/load_lora_adapter` accepts `{"lora_name":"tuned","lora_path":"my-adapter"}`, where the path resolves beneath that directory. `POST /v1/unload_lora_adapter` accepts `{"lora_name":"tuned"}` once the adapter's active and queued requests finish. The primary worker holds up to 16 adapters and 256 MiB of decoded adapter weights. Keep the adapter files available so they can be reloaded after worker eviction.
 
 ### Structured outputs and function calls
 

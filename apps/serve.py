@@ -227,11 +227,13 @@ class Request:
     cancelled: bool = False
     cancel_sent: bool = False
     error: RequestError | None = None
+    submitted_at: float = field(default_factory=time.monotonic)
 
 
 class Worker:
-    def __init__(self, command, limits, static_adapters=None):
+    def __init__(self, command, limits, static_adapters=None, metrics=None):
         self.limits = limits
+        self.metrics = metrics
         self.changed = threading.Condition()
         self.pending = {}
         self.next_id = 0
@@ -357,10 +359,17 @@ class Worker:
                             else (self.static_adapters[name], False)
                             for name in event["lora_adapters"]
                         }
+                    if event["event"] == "metrics":
+                        if self.metrics is not None:
+                            self.metrics.scheduler = event["values"]
+                        continue
                     request = self.pending.get(event.get("id"))
                     if request is None:
                         continue
                     terminal = event["event"] in {"done", "error", "result"}
+                    if self.metrics is not None:
+                        duration = time.monotonic() - request.submitted_at if terminal else None
+                        self.metrics.observe(event, duration)
                     if terminal:
                         if "kv" in event:
                             self.kv = event["kv"]
@@ -421,6 +430,10 @@ class Worker:
                 kv=self.kv,
             )
 
+    def metrics_snapshot(self):
+        with self.changed:
+            return self.metrics.snapshot(up=self.error is None, pending=len(self.pending), cancelled=self.cancelled)
+
 
 @dataclass
 class WorkerSlot:
@@ -464,12 +477,13 @@ def checkpoint_command(command, check):
 
 
 class WorkerPool:
-    def __init__(self, executable, store, slots, options, worker_args):
+    def __init__(self, executable, store, slots, options, worker_args, metrics_factory):
         self.executable = executable
         self.store = store
         self.slots = slots
         self.options = options
         self.worker_args = worker_args
+        self.metrics_factory = metrics_factory
         self.budget = (getattr(options, "memory_budget_mib", None) or 0) * 1024 * 1024
         self.changed = threading.Condition()
         self.stopping = threading.Event()
@@ -548,14 +562,16 @@ class WorkerPool:
             if self.budget:
                 plan = json.loads(checkpoint_command([*command, "--memory-plan"], check))
                 self.reserve(slot, plan, check)
-            worker = Worker([*command, "--ready"], self.options, static_adapters)
+            metrics = self.metrics_factory() if self.metrics_factory else None
+            worker = Worker([*command, "--ready"], self.options, static_adapters, metrics)
             worker.start(check)
             for name, (path, runtime) in slot.adapters.items():
                 if runtime:
                     self.restore_adapter(worker, name, path, check)
             check()
-            if self.budget and worker.metadata["weight_bytes"] != plan["weights_bytes"]:
-                raise RequestError("checkpoint size changed during loading", 503)
+            if self.budget and (worker.metadata["weight_bytes"] != plan["weights_bytes"] or
+                                worker.metadata["vocabulary"] > plan["vocabulary_limit"]):
+                raise RequestError("checkpoint size or vocabulary changed during loading", 503)
             return worker
         except BaseException as error:
             if worker is not None:
@@ -650,6 +666,18 @@ class WorkerPool:
                 result["memory_budget"] = {"budget_bytes": self.budget, "reserved_bytes": self.reserved_bytes()}
             return result
 
+    def metrics(self, model_id):
+        with self.changed:
+            if model_id is None:
+                slots = self.slots.items()
+            else:
+                slots = (self.resolve(model_id),)
+            return {
+                name: slot.worker.metrics_snapshot() if slot.worker is not None
+                else self.metrics_factory().snapshot(up=False, pending=0, cancelled=0)
+                for name, slot in slots
+            }
+
     def close(self):
         self.stopping.set()
         with self.changed:
@@ -674,14 +702,20 @@ class Server(ThreadingHTTPServer):
         self.pool = pool
         self.default_model = options.model_id
         self.options = options
-        self.slots = threading.BoundedSemaphore(options.max_clients)
+        self.connections = threading.BoundedSemaphore(options.max_clients + 1)
+        self.inference_slots = threading.BoundedSemaphore(options.max_clients)
+
+    def metrics_body(self, model_id):
+        from serving_metrics import render_metrics
+
+        return render_metrics(self.pool.metrics(model_id))
 
     def process_request(self, request, client_address):
-        if self.slots.acquire(blocking=False):
+        if self.connections.acquire(blocking=False):
             try:
                 super().process_request(request, client_address)
             except Exception:
-                self.slots.release()
+                self.connections.release()
                 self.shutdown_request(request)
                 raise
         else:
@@ -696,7 +730,7 @@ class Server(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.slots.release()
+            self.connections.release()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -775,6 +809,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/health":
                 health = self.server.pool.health(model_id)
                 self.reply(health, 503 if health["status"] == "unavailable" else 200)
+            elif path == "/metrics":
+                self.send_body(self.server.metrics_body(model_id), "text/plain; version=0.0.4; charset=utf-8")
             elif path == "/v1/models":
                 cards = self.server.pool.model_cards()
                 self.reply({"object": "list", "data": cards})
@@ -1250,7 +1286,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         request = None
         lease = ExitStack()
+        admitted = self.server.inference_slots.acquire(blocking=False)
         try:
+            if not admitted:
+                raise RequestError("request limit reached", 429)
             self.check_host()
             if (origin := self.headers.get("Origin")) is not None and origin != f"http://{self.headers['Host']}":
                 raise RequestError("expected a same-origin browser request", 403)
@@ -1336,6 +1375,8 @@ class Handler(BaseHTTPRequestHandler):
             if request is not None:
                 self.worker.cancel(request)
             lease.close()
+            if admitted:
+                self.server.inference_slots.release()
 
 
 def bounded(low, high):
@@ -1447,6 +1488,7 @@ def main(executable, directory, mode, args):
         benchmark(args)
         return
     from model_store import ModelStore, command as model_command
+    from serving_metrics import ModelMetrics
 
     if mode in ("models", "pull"):
         model_command(mode, args)
@@ -1502,7 +1544,7 @@ def main(executable, directory, mode, args):
 
     limits = parser.add_argument_group("request limits" if run else "HTTP limits")
     limits.add_argument("--max-clients", type=bounded(1, 128), default=16,
-                        help=argparse.SUPPRESS if run else "simultaneous clients")
+                        help=argparse.SUPPRESS if run else "simultaneous inference clients")
     limits.add_argument("--max-body-bytes", type=bounded(1, 262144), default=65536,
                         help=argparse.SUPPRESS if run else "request body size in bytes")
     limits.add_argument("--max-output-tokens", type=bounded(1, 8192), default=256, help="generated tokens per request")
@@ -1531,6 +1573,7 @@ def main(executable, directory, mode, args):
         parser.error("--lora-root requires a directory")
     if options.max_active > options.step_tokens:
         parser.error("--step-tokens must cover all active slots")
+    serving = not run or (options.no_open and options.prompt is None)
     store = ModelStore(options.models_dir)
     model_path, model_id, source = store.locate(options.model or options.model_path)
     options.model_id = options.model_id or model_id
@@ -1558,15 +1601,17 @@ def main(executable, directory, mode, args):
             worker_args.extend(("--" + name.replace("_", "-"), str(value)))
     if options.no_prefix_cache:
         worker_args.append("--no-prefix-cache")
+    if serving:
+        worker_args.append("--metrics")
     with ExitStack() as cleanup:
-        pool = WorkerPool(executable, store, checkpoints, options, worker_args)
+        pool = WorkerPool(executable, store, checkpoints, options, worker_args, ModelMetrics if serving else None)
         cleanup.callback(pool.close)
         preload = (options.model_id,) if pool.budget else checkpoints
         for model_id in preload:
             deadline = time.monotonic() + options.request_timeout if pool.budget else None
             with pool.borrow(model_id, deadline):
                 pass
-        if run and (not options.no_open or options.prompt is not None):
+        if not serving:
             with pool.borrow(options.model_id) as worker:
                 run_terminal(worker, options)
             return

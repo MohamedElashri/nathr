@@ -46,7 +46,8 @@ class PrefixCache {
 
     void touch(Iterator page) { pages_.splice(pages_.end(), pages_, page); }
 
-    Entry* remember(std::uint64_t adapter, Entry* parent, std::span<const Token> tokens, const Cache::Page& page) {
+    Entry* remember(std::uint64_t adapter, Entry* parent, std::span<const Token> tokens,
+                    const Cache::Page& page) {
         auto [it, inserted] = index_.try_emplace(key(adapter, parent, tokens), pages_.end());
         if (!inserted) {
             touch(it->second);
@@ -312,6 +313,13 @@ struct BatchScheduler::Impl {
         }
         request.position = admission_pages.size() * Cache::page_tokens;
         request.cached_prompt_tokens = request.position;
+        if (options.prefix_cache && request.input.tokens.size() >= Cache::page_tokens) {
+            ++prefix_lookups;
+            prefix_hits += !admission_pages.empty();
+            cached_prompt_tokens += request.position;
+        }
+        cached_prompt_tokens += request.position;
+        prefix_hits += request.position > 0;
         // Replay the last token for its logits while reading the already complete page.
         if (request.position == request.input.tokens.size())
             --request.position;
@@ -490,6 +498,7 @@ struct BatchScheduler::Impl {
     std::vector<Requests::iterator> scheduled;
     std::size_t reserved = 0, queued_tokens = 0, queue_bypasses = 0;
     std::size_t prefix_page_bytes = 0;
+    std::size_t prefix_lookups = 0, prefix_hits = 0, cached_prompt_tokens = 0;
 };
 
 BatchScheduler::BatchScheduler(const Model& model, BatchOptions options)
@@ -668,5 +677,12 @@ std::size_t BatchScheduler::kv_page_reuses() const noexcept {
 
 std::size_t BatchScheduler::queue_bypasses() const noexcept {
     return impl_->queue_bypasses;
+}
+
+BatchMetrics BatchScheduler::metrics() const noexcept {
+    const auto& s = *impl_;
+    return {s.active.size(),     s.queued.size(),         s.queued_tokens,
+            s.pool.used_bytes(), s.pool.resident_bytes(), s.options.kv_budget_bytes,
+            s.prefix_lookups,    s.prefix_hits,           s.cached_prompt_tokens};
 }
 } // namespace nathr

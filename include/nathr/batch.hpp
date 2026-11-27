@@ -52,6 +52,14 @@ struct BatchEvent {
     std::size_t accepted_draft_tokens{};
 };
 
+struct BatchMetrics {
+    std::size_t active_requests{}, queued_requests{}, queued_tokens{};
+    std::size_t kv_used_bytes{}, kv_resident_bytes{}, kv_budget_bytes{};
+    std::size_t prefix_lookups{}, prefix_hits{}, cached_prompt_tokens{};
+
+    bool operator==(const BatchMetrics&) const = default;
+};
+
 // Call from one thread. Submit and cancel requests between calls to step().
 class BatchScheduler {
   public:
@@ -72,6 +80,7 @@ class BatchScheduler {
     [[nodiscard]] std::size_t resident_kv_bytes() const noexcept;
     [[nodiscard]] std::size_t kv_page_reuses() const noexcept;
     [[nodiscard]] std::size_t queue_bypasses() const noexcept;
+    [[nodiscard]] BatchMetrics metrics() const noexcept;
 
   private:
     struct Impl;
