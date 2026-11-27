@@ -46,6 +46,18 @@
       "description": "Qwen3-1.7B Q3_K_M for chat and text continuation"
     },
     {
+      "name": "qwen3-moe",
+      "repository": "bayliner1980/Qwen3-0.6B-MoE-A0.5B-GGUF",
+      "file": "Qwen3-0.6B-MoE-A0.5B-Q4_K_M.gguf",
+      "description": "Qwen3-0.6B MoE Q4_K_M for chat and text continuation"
+    },
+    {
+      "name": "tiny-mixtral",
+      "repository": "mradermacher/TinyMixtral-4x248M-MoE-i1-GGUF",
+      "file": "TinyMixtral-4x248M-MoE.i1-Q4_K_M.gguf",
+      "description": "TinyMixtral-4x248M Q4_K_M for text continuation"
+    },
+    {
       "name": "gpt2",
       "repository": "openai-community/gpt2",
       "description": "GPT-2 small for text continuation"
@@ -490,6 +502,26 @@
         {
           "filename": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
           "sha256": "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0"
+        }
+      ]
+    },
+    {
+      "repository": "bayliner1980/Qwen3-0.6B-MoE-A0.5B-GGUF",
+      "revision": "14a01b7c1b8fc63d5b4f73d424c1a08c49d914c6",
+      "files": [
+        {
+          "filename": "Qwen3-0.6B-MoE-A0.5B-Q4_K_M.gguf",
+          "sha256": "4ad1de9e1dc20670fcc02491f4ebe84cfbde41d895d3120da79566b1e2e9afd7"
+        }
+      ]
+    },
+    {
+      "repository": "mradermacher/TinyMixtral-4x248M-MoE-i1-GGUF",
+      "revision": "2f2e7a7eb0d3134158badd5d07b596be6bd459ae",
+      "files": [
+        {
+          "filename": "TinyMixtral-4x248M-MoE.i1-Q4_K_M.gguf",
+          "sha256": "b90e0951bbb19b809e92eeeea99955770625ac2db56ad40379bced7fce2ea62a"
         }
       ]
     },

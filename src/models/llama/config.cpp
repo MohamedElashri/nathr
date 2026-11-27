@@ -75,6 +75,23 @@ ModelConfig load_llama_config(const Json& json, const std::filesystem::path& con
     }
 }
 
+MoeConfig load_gguf_moe_config(const Gguf& file) {
+    const auto& metadata = file.architecture();
+    const auto prefix = metadata.at("general.architecture").get<std::string>() + ".";
+    const auto experts = metadata.find(prefix + "expert_count");
+    if (experts == metadata.end())
+        return {};
+    const auto count = natural(*experts, "expert_count");
+    const auto active = natural(metadata.at(prefix + "expert_used_count"), "expert_used_count");
+    const float scale = metadata.value(prefix + "expert_weights_scale", 1.f);
+    if (!count || count > max_moe_experts || !active || active > count || !std::isfinite(scale) ||
+        scale < 0 || !metadata.value(prefix + "expert_weights_norm", true) ||
+        natural(metadata.value(prefix + "expert_gating_func", Json(1)), "expert_gating_func") != 1) {
+        throw Error(ErrorCode::unsupported, file.path().string() + ": unsupported MoE router configuration");
+    }
+    return {count, active, scale == 0 ? 1.f : scale};
+}
+
 ModelConfig load_gguf_decoder_config(const Gguf& file) {
     const auto path = file.path().string();
     const auto& architecture = file.architecture();
@@ -82,10 +99,11 @@ ModelConfig load_gguf_decoder_config(const Gguf& file) {
         throw Error(ErrorCode::unsupported, path + ": split GGUF execution is unsupported");
     try {
         const auto name = architecture.value("general.architecture", std::string{});
-        const bool qwen3 = name == "qwen3";
+        const bool qwen_moe = name == "qwen3moe";
+        const bool qwen3 = name == "qwen3" || qwen_moe;
         if (!qwen3 && name != "qwen2" && name != "llama")
             throw Error(ErrorCode::unsupported,
-                        path + ": expected a GGUF Llama, Qwen2, or Qwen3 architecture");
+                        path + ": expected a GGUF Llama, Qwen2, Qwen3, or Qwen3 MoE architecture");
         const auto prefix = name + ".";
         const auto field = [&](std::string_view key) {
             const auto qualified = prefix + std::string(key);
@@ -100,18 +118,39 @@ ModelConfig load_gguf_decoder_config(const Gguf& file) {
                                                   "attention.key_length", "attention.value_length",
                                                   "rope.freq_base",       "attention.layer_norm_rms_epsilon",
                                                   "vocab_size",           "rope.dimension_count"};
+        constexpr std::string_view routed[] = {
+            "expert_count",        "expert_used_count",    "expert_feed_forward_length",
+            "expert_weights_norm", "expert_weights_scale", "expert_gating_func"};
+        const auto moe = load_gguf_moe_config(file);
+        if ((qwen_moe && !moe.experts) || (moe.experts && !qwen_moe && name != "llama"))
+            throw Error(ErrorCode::unsupported, path + ": unsupported GGUF MoE architecture or expert count");
         for (const auto& [key, ignored] : architecture.items()) {
             if (key == "general.architecture")
                 continue;
-            if (!key.starts_with(prefix) ||
-                std::ranges::find(supported, std::string_view(key).substr(prefix.size())) ==
-                    std::end(supported))
-                throw Error(ErrorCode::unsupported, path + ": unsupported architecture metadata " + key);
+            if (key.starts_with(prefix)) {
+                const auto suffix = std::string_view(key).substr(prefix.size());
+                if (std::ranges::find(supported, suffix) != std::end(supported) ||
+                    (moe.experts && std::ranges::find(routed, suffix) != std::end(routed)))
+                    continue;
+            }
+            throw Error(ErrorCode::unsupported, path + ": unsupported architecture metadata " + key);
         }
         ModelConfig c{};
         c.layers = field("block_count");
         c.hidden = field("embedding_length");
         c.intermediate = field("feed_forward_length");
+        if (qwen_moe) {
+            if (contains("expert_feed_forward_length")) {
+                c.intermediate = field("expert_feed_forward_length");
+            } else {
+                if (c.intermediate % moe.active)
+                    throw Error(ErrorCode::malformed, path + ": cannot derive Qwen3 MoE expert width");
+                c.intermediate /= moe.active;
+            }
+        } else if (moe.experts && contains("expert_feed_forward_length") &&
+                   field("expert_feed_forward_length") != c.intermediate) {
+            throw Error(ErrorCode::unsupported, path + ": unsupported Llama MoE expert width");
+        }
         c.query_heads = field("attention.head_count");
         c.kv_heads = contains("attention.head_count_kv") ? field("attention.head_count_kv") : c.query_heads;
         const auto embedding = file.records().find("token_embd.weight");

@@ -1,4 +1,38 @@
 {
+  "qwen3-moe": {
+    "path": "Qwen3-0.6B-MoE-A0.5B-Q4_K_M.gguf",
+    "prompt": "The sky is blue.",
+    "ids": [785, 12884, 374, 6303, 13],
+    "output": "logits",
+    "shape": [5, 151936],
+    "probes": {
+      "607744": 1.50497150,
+      "607761": 4.19227600,
+      "608320": 13.39601135,
+      "614945": -0.34975767,
+      "618300": -2.12691379,
+      "759677": 0.48944783
+    },
+    "tolerance": 0.75,
+    "last_token_argmax": 576
+  },
+  "tiny-mixtral": {
+    "path": "TinyMixtral-4x248M-MoE.i1-Q4_K_M.gguf",
+    "prompt": "The sky is blue.",
+    "ids": [415, 7212, 349, 5045, 28723],
+    "output": "logits",
+    "shape": [6, 32003],
+    "probes": {
+      "160015": -6.10075235,
+      "160032": -6.44950390,
+      "160430": 12.12690544,
+      "167216": -4.54194498,
+      "170571": -0.18682468,
+      "192015": -6.05607414
+    },
+    "tolerance": 0.25,
+    "last_token_argmax": 415
+  },
   "gguf": {
     "path": "SmolLM2-135M.Q4_0.gguf",
     "prompt": "Once upon a time",

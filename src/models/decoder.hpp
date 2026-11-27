@@ -34,7 +34,7 @@ class CpuBackend {
 
 struct Workspace {
     virtual ~Workspace() = default;
-    [[nodiscard]] std::size_t bytes() const noexcept;
+    [[nodiscard]] virtual std::size_t bytes() const noexcept;
     std::span<float> packed, scores, logits;
 
   protected:

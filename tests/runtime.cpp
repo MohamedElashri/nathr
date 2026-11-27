@@ -1281,6 +1281,60 @@ void qwen3_and_sessions() {
     compare(session.logits(), logits, 0);
 }
 
+void moe_routing() {
+    const auto path = fixtures / "moe.gguf";
+    const auto model = Model::load(path);
+    constexpr std::array<Token, 3> input{0, 1, 2};
+    // Independent FP64 calculation with zero attention and different expert pairs for these rows.
+    constexpr std::array reference{std::array{1.279307345f, 0.602800441f, -1.279307345f, -0.602800441f},
+                                   std::array{-0.639050753f, 1.261591583f, 0.639050753f, -1.261591583f},
+                                   std::array{-1.244294654f, -0.672104019f, 1.244294654f, 0.672104019f}};
+    std::size_t rows = 0;
+    model.forward(input, LogitsMode::all_tokens, {}, [&](std::size_t pos, std::span<const float> logits) {
+        compare(logits, reference.at(pos), 2e-6);
+        ++rows;
+    });
+    expect(rows == input.size(), "MoE evaluates every routed row");
+
+    auto session = Session::create(model, 8, 0, {KvPrecision::f32, 1});
+    session.prefill(std::span(input).first(1));
+    compare(session.logits(), reference.front(), 2e-6);
+    session.append(std::span(input).last(2));
+    compare(session.logits(), reference.back(), 2e-6);
+
+    BatchScheduler scheduler(model);
+    for (const auto token : input) {
+        BatchRequest request{.id = token, .tokens = {token}, .max_new_tokens = 1, .sampling = {}};
+        request.top_logprobs = 0;
+        scheduler.submit(std::move(request));
+    }
+    std::size_t emitted = 0;
+    for (const auto& event : scheduler.step()) {
+        expect(event.kind != BatchEventKind::error, event.message);
+        if (event.token) {
+            const auto& logits = reference.at(event.id);
+            const auto best = static_cast<Token>(std::ranges::max_element(logits) - logits.begin());
+            expect(*event.token == best && event.logprobs.has_value(), "MoE samples the right expert mix");
+            const auto expected = token_logprobs(logits, *event.token, 0);
+            expect(std::abs(event.logprobs->chosen.logprob - expected.chosen.logprob) < 2e-6,
+                   "grouped expert projections preserve request isolation");
+            ++emitted;
+        }
+    }
+    expect(scheduler.empty() && emitted == input.size(), "MoE batch drains all requests");
+
+    Temporary temp;
+    auto bytes = read_file(path, mib);
+    const std::string_view key = "llama.expert_used_count";
+    const auto field = std::ranges::search(bytes, std::as_bytes(std::span(key)));
+    expect(!field.empty(), "MoE fixture has expert routing metadata");
+    bytes.at(field.end() - bytes.begin() + 4) = std::byte{4};
+    const auto invalid = temp.directory / "invalid-moe.gguf";
+    std::ofstream(invalid, std::ios::binary)
+        .write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    rejects([&] { (void)Model::load(invalid); }, ErrorCode::unsupported);
+}
+
 void gguf_layout() {
     const auto golden = fixtures / "tiny.gguf";
     const Gguf metadata(golden);
@@ -1576,6 +1630,7 @@ int main(int argc, char** argv) try {
         sentencepiece_bpe();
         gguf_layout();
         qwen3_and_sessions();
+        moe_routing();
         packed_kernels();
         packed_encodings();
     } else {

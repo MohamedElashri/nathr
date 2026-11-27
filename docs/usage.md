@@ -25,6 +25,13 @@ Installed releases check for updates at most once a day when `run` or `serve` st
 
 The cache lives at `${XDG_CACHE_HOME:-$HOME/.cache}/nathr`. Set `NATHR_MODELS` or pass `--models-dir DIR` to use a different directory with `models`, `pull`, `run`, or `serve`.
 
+Use `qwen3-moe` for chat or `tiny-mixtral` for text continuation with mixture-of-experts (MoE) models. Nathr downloads the weights on first use.
+
+```sh
+nathr run qwen3-moe "What makes the sky blue?" --max-new-tokens 64
+nathr run tiny-mixtral "Once upon a time" --max-new-tokens 64
+```
+
 For your own model, pass a GGUF file or a Safetensors directory containing `config.json` and `model.safetensors`. To use text with a Safetensors checkpoint, keep `tokenizer.json` in the same directory. Check the format and architecture in the [checkpoint compatibility guide](inference-engine.md#checkpoint-support-and-limits).
 
 ```sh

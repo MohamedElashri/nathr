@@ -106,9 +106,11 @@ std::optional<ChatFormat> chat_format(const std::filesystem::path& path, const M
 
     const auto digest = detail::sha256(format);
     // These Qwen3 templates render the same plain-text prompt with thinking disabled.
-    if (model.architecture() == "qwen3" &&
-        (digest == "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361" ||
-         digest == "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"))
+    if ((model.architecture() == "qwen3" &&
+         (digest == "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361" ||
+          digest == "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5")) ||
+        (model.architecture() == "qwen3moe" &&
+         digest == "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"))
         return ChatFormat{ChatStyle::qwen3};
     // These Qwen2 templates differ only in the tool-call example.
     if (model.architecture() == "qwen2" &&
@@ -213,7 +215,8 @@ RequestDefaults request_defaults(const std::filesystem::path& path, const Model&
     RequestDefaults result;
     result.sampling.greedy = greedy;
     result.chat = chat_format(path, model, chat_override);
-    if (result.chat && ((result.chat->style == ChatStyle::qwen3 && model.architecture() == "qwen3") ||
+    if (result.chat && ((result.chat->style == ChatStyle::qwen3 &&
+                         (model.architecture() == "qwen3" || model.architecture() == "qwen3moe")) ||
                         result.chat->style == ChatStyle::qwen2))
         result.stop_ids.push_back(
             model.config().bos); // <|endoftext|> is an extra EOS in these Qwen templates.

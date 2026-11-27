@@ -33,6 +33,13 @@ execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${model_data}/model
 execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${prefix}/${NATHR_DOCDIR}/LICENSE"
     "${NATHR_SOURCE_DIR}/LICENSE" COMMAND_ERROR_IS_FATAL ANY)
 if(NATHR_PYTHON AND NATHR_BINDIR STREQUAL "bin")
+    execute_process(COMMAND "${prefix}/bin/nathr" models --models-dir "${stage}/empty-cache"
+        OUTPUT_VARIABLE models COMMAND_ERROR_IS_FATAL ANY)
+    foreach(profile IN ITEMS qwen3-moe tiny-mixtral)
+        if(NOT models MATCHES "(^|\n)${profile}[ \t]")
+            message(FATAL_ERROR "Installed CLI is missing model alias ${profile}")
+        endif()
+    endforeach()
     execute_process(COMMAND "${NATHR_PYTHON}" -B "${NATHR_SOURCE_DIR}/tests/update.py"
         "${prefix}" "${model_data}" "${stage}" "${NATHR_SOURCE_DIR}/tests/fixtures/t5"
         COMMAND_ERROR_IS_FATAL ANY)

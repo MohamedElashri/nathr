@@ -288,11 +288,14 @@ Nathr reads dimensions, attention head counts, context length, and boundary toke
 | Llama-style | GGUF v3 or Safetensors with RMSNorm, SwiGLU, unscaled full-width RoPE, and bias-free projections |
 | Qwen2 | Dense GGUF v3 with Q/K/V projection biases and unscaled, full-width RoPE. The pinned checkpoint is Qwen2.5-0.5B-Instruct Q4_K_M |
 | Qwen3 | Dense GGUF v3 with per-head query and key RMSNorm and unscaled, full-width RoPE. The pinned checkpoints are Qwen3-0.6B Q8_0 and Qwen3-1.7B Q3_K_M |
+| Qwen3 MoE and Mixtral-style | GGUF v3 (`qwen3moe` and `llama`) with packed SwiGLU experts, normalized softmax top-k routing, and unscaled, full-width RoPE |
 | GPT-2 | Safetensors with learned positions, affine LayerNorm, and the GPT-2 GELU variant |
 | BERT | Safetensors with absolute position embeddings and GELU. Uses unpadded inputs and optional segment IDs. Outputs depend on the checkpoint's heads and pooling modules |
 | T5 | Safetensors for ReLU T5 and gated-GELU FLAN-T5. The decoder uses FP32 caches. The source and decoder are each limited to 512 positions or the checkpoint context, whichever is smaller |
 
-The built-in tokenizers cover byte-level BPE, GGUF SentencePiece BPE with byte fallback, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering recognizes SmolLM2 ChatML, Zephyr-style TinyLlama, Qwen2.5 ChatML, and both pinned Qwen3 templates in non-thinking mode. Select a supported format explicitly with `--chat-format` when the checkpoint template is absent or unrecognized. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)
+For MoE layers, the router selects the `expert_used_count` highest-scoring experts per token and normalizes their weights. Nathr groups the token rows by expert, applies each selected SwiGLU block, and adds the weighted outputs to the residual. Expert weights remain in the checkpoint's packed quantized layout. The compatibility checks compare Qwen3-0.6B MoE and TinyMixtral-4x248M logits to llama.cpp. [Expert routing](../src/models/llama/model.cpp) · [Reference checks](../tests/checkpoints.json)
+
+The built-in tokenizers cover byte-level BPE, GGUF SentencePiece BPE with byte fallback, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering recognizes SmolLM2 ChatML, Zephyr-style TinyLlama, Qwen2.5 ChatML, and the pinned dense and MoE Qwen3 templates in non-thinking mode. Select a supported format explicitly with `--chat-format` when the checkpoint template is absent or unrecognized. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)
 
 ## CPU measurements
 
