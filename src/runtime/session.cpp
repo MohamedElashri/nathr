@@ -60,14 +60,21 @@ Session Session::create(const Model& model, std::size_t capacity, std::uint64_t 
                         const LoraAdapter* lora) {
     if (lora && lora->model_ != model.impl_)
         throw Error(ErrorCode::invalid_argument, "LoRA adapter belongs to a different base model");
-    if (capacity == 0)
-        capacity = std::min<std::size_t>(2048, model.config().context);
-    if (capacity > model.config().context)
-        throw Error(ErrorCode::invalid_argument, "context exceeds model capacity");
     if (!options.prefill_chunk || options.prefill_chunk > 32)
         throw Error(ErrorCode::invalid_argument, "prefill chunk must be between 1 and 32 tokens");
     if (options.kv_precision != KvPrecision::f32 && options.kv_precision != KvPrecision::f16)
         throw Error(ErrorCode::invalid_argument, "unknown KV cache precision");
+    if (!capacity) {
+        // Only decoder-only checkpoints have a Session cache.
+        (void)model.impl_->decoder();
+        capacity = std::min(
+            {detail::default_context_tokens, model.config().context,
+             detail::Cache::fit_tokens(model.config(), detail::max_kv_cache_bytes, options.kv_precision)});
+        if (!capacity)
+            throw Error(ErrorCode::resource_limit, "KV budget cannot hold one token");
+    }
+    if (capacity > model.config().context)
+        throw Error(ErrorCode::invalid_argument, "context exceeds model capacity");
     return Session(std::make_unique<Impl>(model, capacity, seed, options, lora));
 }
 

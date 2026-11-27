@@ -37,7 +37,9 @@ nathr inspect ./model.gguf --summary
 nathr run ./model.gguf "Once upon a time"
 ```
 
-Use `--threads N` to choose the CPU thread count and `--max-new-tokens N` to limit the reply. Nathr recognizes supported chat templates automatically. Use `--chat-format chatml`, `qwen3`, or `zephyr` to choose a matching format explicitly, or `--chat-format none` for text completion.
+Generation defaults to a context of up to 8,192 tokens and a reply budget of 1,024 new tokens. The checkpoint and remaining context determine the effective reply budget. Use `--context` and `--max-new-tokens` to set the limits explicitly. See the [generation limits](docs/usage.md#generation-limits).
+
+Use `--threads N` to choose the CPU thread count. Nathr recognizes supported chat templates automatically. Use `--chat-format chatml`, `qwen3`, or `zephyr` to choose a matching format explicitly, or `--chat-format none` for text completion.
 
 ## OpenAI-compatible API
 

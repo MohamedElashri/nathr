@@ -11,6 +11,7 @@ struct BatchIoOptions {
     std::filesystem::path lora_root{};
     bool metrics = false;
     std::string chat_format = "auto";
+    std::size_t max_output_tokens = 0;
 };
 
 void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions options, BatchIoOptions io);

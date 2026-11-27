@@ -396,6 +396,20 @@ def checkpoint_defaults(binary, checkpoint):
     assert result["generated_ids"] == [20] and result["stopped_at_stop"]
 
 
+def generation_limits(binary, checkpoint):
+    with server(binary, checkpoint) as port:
+        metadata = request(port, "/model")
+        assert metadata["generation_context"] == 8192 and metadata["max_new_tokens"] == 1024
+        assert metadata["limits"]["max_output_tokens"] == 4096
+        assert request(port, "/infer", {"tokens": [4] * 4})["emitted"] == 1024
+        long_prompt = {"tokens": [4] * 8192, "max_new_tokens": 0}
+        assert request(port, "/infer", long_prompt)["prompt_tokens"] == 8192
+        request(port, "/infer", dict(long_prompt, tokens=[4] * 8193), status=400)
+    with server(binary, checkpoint, "--context", "6") as port:
+        assert request(port, "/infer", {"tokens": [4] * 4})["emitted"] == 3
+        request(port, "/infer", {"tokens": [4] * 4, "max_new_tokens": 4}, status=400)
+
+
 def chat_stdin(binary, checkpoint):
     command = [binary, "generate", checkpoint, "--messages", "-", "--max-new-tokens", "1", "--json"]
     messages = [{"role": "user", "content": "b"}]
@@ -676,4 +690,5 @@ if __name__ == "__main__":
         memory_budget(executable, checkpoint, fixtures / "bert", fixtures / "gpt2")
         cancelled_checkpoint_command(executable, checkpoint)
         metrics_under_load(executable, checkpoint)
+        generation_limits(executable, checkpoint)
         checkpoint_defaults(executable, checkpoint)

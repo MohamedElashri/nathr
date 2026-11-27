@@ -352,8 +352,8 @@ void flush_tensors(const Model& model, std::vector<TensorRequest>& pending) {
 
 void command(const Line& line, const Model& model, std::optional<BatchScheduler>& scheduler,
              BatchOutput& output, const std::filesystem::path& path, const std::filesystem::path& sidecar,
-             const RequestDefaults& defaults, std::size_t max_result_values, LoraRegistry& lora,
-             std::vector<TensorRequest>* pending) {
+             const RequestDefaults& defaults, const BatchOptions& options, const BatchIoOptions& io,
+             LoraRegistry& lora, std::vector<TensorRequest>* pending) {
     std::optional<RequestId> id;
     try {
         if (line.too_long)
@@ -414,7 +414,7 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             const auto info = std::ranges::find(outputs, name, &OutputInfo::name);
             if (info == outputs.end() || info->sequence)
                 throw Error(ErrorCode::unsupported, "batched encoder inputs require a vector output");
-            if (max_result_values && info->width > max_result_values)
+            if (io.max_result_values && info->width > io.max_result_values)
                 throw Error(ErrorCode::resource_limit, "named tensor exceeds response limit");
             TensorRequest request{*id, std::move(name), {}, true};
             request.inputs.reserve(group->size());
@@ -453,11 +453,11 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             const auto outputs = model.outputs();
             const auto shape = std::ranges::find(outputs, name, &OutputInfo::name);
             if (shape != outputs.end()) {
-                if (max_result_values) {
+                if (io.max_result_values) {
                     const auto rows = !shape->sequence               ? 1
                                       : model.architecture() == "t5" ? std::max<std::size_t>(1, prefix.size())
                                                                      : input.ids.size();
-                    if (rows > max_result_values / shape->width)
+                    if (rows > io.max_result_values / shape->width)
                         throw Error(ErrorCode::resource_limit, "named tensor exceeds response limit");
                 }
                 if (pending && !shape->sequence && prefix.empty()) {
@@ -473,6 +473,15 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
         }
         if (!scheduler)
             throw Error(ErrorCode::unsupported, "this checkpoint requires an output name in batch requests");
+        const auto maximum = json.find("max_new_tokens");
+        const auto max_tokens =
+            maximum != json.end()
+                ? detail::natural(*maximum, "max_new_tokens")
+                : fit_generation_budget(model, input.ids.size(), scheduler->context(),
+                                        defaults.max_new_tokens, options.session.kv_precision,
+                                        options.kv_budget_bytes);
+        if (io.max_output_tokens && max_tokens > io.max_output_tokens)
+            throw Error(ErrorCode::invalid_argument, "max_new_tokens exceeds the output limit");
         auto stops = defaults.stop_ids;
         if (const auto field = json.find("stop_ids"); field != json.end()) {
             const auto ids = token_array(*field, "stop_ids");
@@ -489,7 +498,7 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
         scheduler->submit(
             {*id,
              std::move(input.ids),
-             integer(json, "max_new_tokens", defaults.max_new_tokens),
+             max_tokens,
              integer(json, "seed", 0),
              {json.value("greedy", defaults.sampling.greedy),
               json.value("temperature", defaults.sampling.temperature),
@@ -567,7 +576,9 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
     if (io.ready && scheduler)
         output.live_stats = &*scheduler;
     BatchInput input;
-    const auto defaults = request_defaults(path, model, true, io.chat_format);
+    auto defaults = request_defaults(path, model, true, io.chat_format);
+    if (io.max_output_tokens)
+        defaults.max_new_tokens = std::min(defaults.max_new_tokens, io.max_output_tokens);
     std::optional<BatchMetrics> last_metrics;
     const auto publish_metrics = [&] {
         if (!io.metrics || !scheduler)
@@ -616,7 +627,7 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
     std::vector<TensorRequest> tensors;
     auto* pending = model.architecture() == "bert" ? &tensors : nullptr;
     const auto process = [&](const Line& line) {
-        command(line, model, scheduler, output, path, sidecar, defaults, io.max_result_values, lora, pending);
+        command(line, model, scheduler, output, path, sidecar, defaults, options, io, lora, pending);
     };
     const auto empty = [&] { return !scheduler || scheduler->empty(); };
     while (!input.done() || !empty()) {

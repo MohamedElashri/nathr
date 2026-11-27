@@ -127,7 +127,9 @@ function payload(text) {
     if (!el(id).reportValidity()) throw new Error("Check the generation settings.");
   }
   const temperature = Number(el("temperature").value);
-  const data = { max_new_tokens: Number(el("max-tokens").value), greedy: temperature === 0, stream: true };
+  const data = { greedy: temperature === 0, stream: true };
+  const maximum = el("max-tokens").value;
+  if (maximum) data.max_new_tokens = Number(maximum);
   if (temperature) data.temperature = temperature;
   if (el("seed").value) {
     const seed = Number(el("seed").value);
@@ -298,8 +300,9 @@ async function start() {
     const selector = el("output");
     for (const output of outputs) selector.add(new Option(output.name, output.name));
     if (outputs.some((item) => item.name === "sentence_embedding")) selector.value = "sentence_embedding";
-    el("max-tokens").max = Math.min(model.limits.max_output_tokens, model.generation_context || 1);
-    el("max-tokens").value = Math.max(1, Math.min(128, Number(el("max-tokens").max)));
+    const maximum = el("max-tokens");
+    maximum.max = Math.min(model.limits.max_output_tokens, model.generation_context || 1);
+    maximum.placeholder = String(Math.min(model.max_new_tokens, Number(maximum.max)));
     el("model-id").textContent = model.id;
     el("architecture").textContent = model.architecture;
     el("context").textContent = (model.generation_context || model.context) + " tokens";

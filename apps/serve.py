@@ -943,10 +943,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             if not metadata["generation"]:
                 raise RequestError("checkpoint requires a named output")
-            default = min(metadata["max_new_tokens"], options.max_output_tokens)
-            tokens = value.setdefault("max_new_tokens", default)
-            if type(tokens) is not int or not 0 <= tokens <= options.max_output_tokens:
-                raise RequestError("max_new_tokens exceeds the server limit")
+            if "max_new_tokens" in value:
+                tokens = value["max_new_tokens"]
+                if type(tokens) is not int or not 0 <= tokens <= options.max_output_tokens:
+                    raise RequestError("max_new_tokens exceeds the server limit")
         return stream, tensor, include_usage
 
     def response_input(self, value):
@@ -1436,9 +1436,7 @@ def run_terminal(worker, options):
     if output is not None and options.max_new_tokens is not None:
         raise RequestError("--max-new-tokens requires text generation")
     count = options.max_new_tokens
-    if count is None:
-        count = min(metadata["max_new_tokens"], options.max_output_tokens)
-    if count > options.max_output_tokens:
+    if count is not None and count > options.max_output_tokens:
         raise RequestError("--max-new-tokens exceeds --max-output-tokens")
 
     history = []
@@ -1449,9 +1447,11 @@ def run_terminal(worker, options):
             value = {"prompt": prompt, "output": output}
         elif chat:
             messages = [*history, {"role": "user", "content": prompt}]
-            value = {"messages": messages, "max_new_tokens": count}
+            value = {"messages": messages}
         else:
-            value = {"prompt": prompt, "max_new_tokens": count}
+            value = {"prompt": prompt}
+        if count is not None:
+            value["max_new_tokens"] = count
         if options.lora:
             value["lora"] = "nathr-lora"
         reply = terminal_input(worker, value, options.request_timeout)
@@ -1515,7 +1515,8 @@ def main(executable, directory, mode, invoked, version, args):
         parser.add_argument("prompt", nargs="?", help="one prompt to run in the terminal")
         parser.add_argument("--prompt", dest="prompt_text", help="run one prompt")
         parser.add_argument("--no-open", action="store_true", help=argparse.SUPPRESS)
-        parser.add_argument("--max-new-tokens", type=bounded(0, 8192), help="limit generated tokens per turn")
+        parser.add_argument("--max-new-tokens", type=bounded(0, 8192),
+                            help="generated tokens per turn (checkpoint default or up to 1024)")
         parser.add_argument("--output", help="return a named tensor as JSON")
         parser.add_argument("--lora", action="append", default=[], metavar="DIR", help="apply a local PEFT LoRA adapter")
     else:
@@ -1538,7 +1539,7 @@ def main(executable, directory, mode, invoked, version, args):
                         help="chat format for the primary checkpoint")
 
     scheduler = parser.add_argument_group("generation scheduler")
-    scheduler.add_argument("--context", type=bounded(1, 65536), help="context, otherwise up to 2048 tokens")
+    scheduler.add_argument("--context", type=bounded(1, 65536), help="context, otherwise up to 8192 tokens")
     scheduler.add_argument("--prefill-chunk", type=bounded(1, 32), default=16, help="prompt tokens per request step")
     scheduler.add_argument("--max-active", type=bounded(1, 64), default=4, help="active generation requests")
     scheduler.add_argument("--step-tokens", type=bounded(1, 128), default=32, help="total tokens per scheduler step")
@@ -1548,22 +1549,22 @@ def main(executable, directory, mode, invoked, version, args):
     scheduler.add_argument("--max-queued-tokens", type=bounded(1, 262144), default=16384, help="queued prompt tokens")
     scheduler.add_argument("--max-queue-bypasses", type=bounded(0, 256), default=0,
                            help="fitting requests that may pass a KV-blocked queue head")
-    scheduler.add_argument("--kv-budget-mib", type=bounded(1, 4096), default=512, help="KV cache budget in MiB")
-    scheduler.add_argument("--kv-cache", choices=("f32", "f16"), default="f32", help="KV cache precision")
+    scheduler.add_argument("--kv-budget-mib", type=bounded(1, 4096), default=1024, help="KV cache budget in MiB")
+    scheduler.add_argument("--kv-cache", choices=("f32", "f16"), help="KV cache precision, automatically selected if omitted")
     scheduler.add_argument("--no-prefix-cache", action="store_true", help="disable decoder prefix and T5 source caching")
 
     limits = parser.add_argument_group("request limits" if run else "HTTP limits")
     limits.add_argument("--max-clients", type=bounded(1, 128), default=16,
                         help=argparse.SUPPRESS if run else "simultaneous inference clients")
-    limits.add_argument("--max-body-bytes", type=bounded(1, 262144), default=65536,
+    limits.add_argument("--max-body-bytes", type=bounded(1, 262144), default=262144,
                         help=argparse.SUPPRESS if run else "request body size in bytes")
-    limits.add_argument("--max-output-tokens", type=bounded(1, 8192), default=256, help="generated tokens per request")
+    limits.add_argument("--max-output-tokens", type=bounded(1, 8192), default=4096, help="generated tokens per request")
     limits.add_argument("--max-result-values", type=bounded(1, 262144), default=65536, help="values per named tensor")
     limits.add_argument("--max-buffer-bytes", type=bounded(128, 8388608), default=2097152,
                         help="response buffer and streaming event limit in bytes")
     limits.add_argument("--io-timeout", type=bounded(1, 60), default=5,
                         help=argparse.SUPPRESS if run else "socket I/O timeout in seconds")
-    limits.add_argument("--request-timeout", type=bounded(1, 600), default=120, help="inference timeout in seconds")
+    limits.add_argument("--request-timeout", type=bounded(1, 3600), default=600, help="inference timeout in seconds")
     options = parser.parse_args(args)
     budget = getattr(options, "memory_budget_mib", None)
     if budget is not None and budget <= 0:
@@ -1609,7 +1610,8 @@ def main(executable, directory, mode, invoked, version, args):
     worker_args = []
     for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens",
                  "speculative_tokens", "max_queued",
-                 "max_queued_tokens", "max_queue_bypasses", "kv_budget_mib", "kv_cache", "max_result_values"):
+                 "max_queued_tokens", "max_queue_bypasses", "kv_budget_mib", "kv_cache", "max_result_values",
+                 "max_output_tokens"):
         if (value := getattr(options, name)) is not None:
             worker_args.extend(("--" + name.replace("_", "-"), str(value)))
     if options.no_prefix_cache:

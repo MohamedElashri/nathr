@@ -16,13 +16,16 @@ struct ChatFormat {
 
 struct RequestDefaults {
     SamplingOptions sampling;
-    std::size_t max_new_tokens = 32;
+    std::size_t max_new_tokens = 1024;
     std::vector<Token> stop_ids;
     std::optional<ChatFormat> chat;
 };
 
 RequestDefaults request_defaults(const std::filesystem::path& path, const Model& model, bool greedy,
                                  std::string_view chat_override = "auto");
+KvPrecision default_cache_precision(const Model& model, std::size_t context, std::size_t kv_budget);
+std::size_t fit_generation_budget(const Model& model, std::size_t prompt, std::size_t context,
+                                  std::size_t desired, KvPrecision precision, std::size_t kv_budget);
 void add_capabilities(detail::Json& info, const Model& model);
 std::optional<ChatFormat> chat_format(const std::filesystem::path& path, const Model& model,
                                       std::string_view selection = "auto");

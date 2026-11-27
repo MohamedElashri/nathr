@@ -1,5 +1,6 @@
 #include "requests.hpp"
 
+#include "backend/cpu/scalar.hpp"
 #include "core/sha256.hpp"
 
 #include <algorithm>
@@ -241,6 +242,30 @@ RequestDefaults request_defaults(const std::filesystem::path& path, const Model&
     if (std::ranges::any_of(result.stop_ids, [&](Token id) { return id >= model.config().vocabulary; }))
         throw Error(ErrorCode::malformed, "checkpoint stop ID exceeds model vocabulary");
     return result;
+}
+
+KvPrecision default_cache_precision(const Model& model, std::size_t context, std::size_t kv_budget) {
+    const auto target = std::min(context ? context : detail::default_context_tokens, model.config().context);
+    if (model.supports_fused_batch() &&
+        target > detail::Cache::fit_tokens(model.config(), kv_budget, KvPrecision::f32))
+        return KvPrecision::f16;
+    return KvPrecision::f32;
+}
+
+std::size_t fit_generation_budget(const Model& model, std::size_t prompt, std::size_t context,
+                                  std::size_t desired, KvPrecision precision, std::size_t kv_budget) {
+    const bool causal = model.supports_fused_batch();
+    const auto input_limit = causal ? context : model.config().context;
+    if (prompt > input_limit)
+        throw Error(ErrorCode::invalid_argument, "prompt exceeds context");
+    if (!desired)
+        return 0;
+    const auto cache = detail::Cache::fit_tokens(model.config(), kv_budget, precision);
+    const auto capacity = causal ? std::min(context, cache) : cache;
+    if (prompt > capacity || (!causal && prompt == capacity))
+        throw Error(ErrorCode::resource_limit, "prompt leaves no room for generation within the KV budget");
+    const auto remaining = capacity - prompt;
+    return std::min(desired, causal ? remaining + 1 : std::min(context, remaining));
 }
 
 detail::Json logprobs_json(const TokenLogprobs& scores, const Tokenizer* tokenizer, bool first) {

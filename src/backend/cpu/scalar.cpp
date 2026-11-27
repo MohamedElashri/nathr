@@ -147,12 +147,16 @@ Cache::Cache(const ModelConfig& config, std::size_t limit, KvPrecision format, C
       bank_width_(product({config.layers, kv_heads, width}, "KV cache")),
       bytes_per_token_(required_bytes(config, 1, format)), pool_(pool) {
     if (product({capacity, bytes_per_token_}, "KV cache") > max_kv_cache_bytes)
-        throw Error(ErrorCode::resource_limit, "KV cache exceeds 512 MiB");
+        throw Error(ErrorCode::resource_limit, "KV cache exceeds 1 GiB");
 }
 
 std::size_t Cache::required_bytes(const ModelConfig& config, std::size_t capacity, KvPrecision precision) {
     const auto element_size = precision == KvPrecision::f16 ? sizeof(std::uint16_t) : sizeof(float);
     return product({2, config.layers, config.kv_heads, config.head_dim, capacity, element_size}, "KV cache");
+}
+
+std::size_t Cache::fit_tokens(const ModelConfig& config, std::size_t budget, KvPrecision precision) {
+    return std::min(budget, max_kv_cache_bytes) / required_bytes(config, 1, precision);
 }
 
 std::size_t Cache::page_length(std::size_t page) const noexcept {

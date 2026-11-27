@@ -27,6 +27,12 @@ Installed releases check for updates at most once a day when `run` or `serve` st
 
 Use `--sample` with `--temperature`, `--top-k`, `--top-p`, or `--seed` to control sampling. Repeat `--stop TEXT` or pass comma-separated `--stop-ids IDS` to end generation early. Add `--logprobs` to include chosen-token scores or `--top-logprobs N` for up to 20 alternatives. Scores use the model distribution before sampling filters.
 
+### Generation limits
+
+For decoder-only models, the context covers the input, chat history, and reply together. The default is up to 8,192 positions, subject to the model context and KV budget. Replies default to up to 1,024 new tokens. Nathr honors a checkpoint's configured reply limit and reduces the default when a long prompt leaves less room. T5 uses separate source and decoder contexts.
+
+`run` and `serve` allow requests of up to 4,096 output tokens by default. Use `--max-output-tokens` to adjust that cap, up to 8,192. Use `--kv-budget-mib` to change the worker's 1,024 MiB KV budget. The worker allocates pages as needed and selects FP16 for decoder caches when FP32 would exceed the budget for the target context. Use `--kv-cache f32` or `--kv-cache f16` to choose explicitly.
+
 ### Chat history
 
 Pass a message array with `--messages FILE` or pipe it into `--messages -`. An optional system message comes first. Alternate user and assistant messages and end with a user message. Qwen3 uses its non-thinking chat format.

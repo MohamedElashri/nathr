@@ -88,6 +88,8 @@ struct Cache {
     static constexpr std::size_t page_tokens = 16;
     [[nodiscard]] static std::size_t required_bytes(const ModelConfig& config, std::size_t capacity,
                                                     KvPrecision precision);
+    [[nodiscard]] static std::size_t fit_tokens(const ModelConfig& config, std::size_t budget,
+                                                KvPrecision precision);
 
     Cache(const ModelConfig& config, std::size_t capacity, KvPrecision precision = KvPrecision::f32,
           CachePagePool* pool = nullptr);

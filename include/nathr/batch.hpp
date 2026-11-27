@@ -10,7 +10,7 @@ struct BatchOptions {
     std::size_t max_queued = 32;
     std::size_t max_queued_tokens = 16384;
     std::size_t step_tokens = 32;
-    std::size_t kv_budget_bytes = 512 * 1024 * 1024;
+    std::size_t kv_budget_bytes = 1024 * 1024 * 1024;
     SessionOptions session;
     bool prefix_cache = true;
     std::size_t max_queue_bypasses = 0;

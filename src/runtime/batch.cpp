@@ -211,8 +211,6 @@ struct BatchScheduler::Impl {
             seq2seq = loaded->get();
         if (!model.supports_generation())
             throw Error(ErrorCode::unsupported, "checkpoint does not support generation");
-        if (!options.context)
-            options.context = std::min<std::size_t>(2048, model.config().context);
         if (!options.max_active || !options.max_queued || !options.max_queued_tokens ||
             options.step_tokens < options.max_active || !options.kv_budget_bytes ||
             options.context > model.config().context || !options.session.prefill_chunk ||
@@ -220,6 +218,14 @@ struct BatchScheduler::Impl {
             (options.session.kv_precision != KvPrecision::f32 &&
              options.session.kv_precision != KvPrecision::f16))
             throw Error(ErrorCode::invalid_argument, "invalid batch context, scheduling, or cache settings");
+        if (!options.context) {
+            const auto slots =
+                Cache::fit_tokens(model.config(), options.kv_budget_bytes, options.session.kv_precision);
+            if (slots <= (seq2seq ? 1u : 0u))
+                throw Error(ErrorCode::resource_limit, "KV budget cannot hold a generation request");
+            options.context =
+                std::min({detail::default_context_tokens, model.config().context, slots - (seq2seq ? 1 : 0)});
+        }
         if (options.speculative_tokens > max_draft_tokens)
             throw Error(ErrorCode::invalid_argument, "speculative tokens must be between 0 and 8");
         if (decoder) {

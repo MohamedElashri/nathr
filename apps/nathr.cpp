@@ -637,11 +637,15 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         invalid("top logprobs must be between 0 and 20");
     const auto top_logprobs = logprobs ? std::optional(count) : std::nullopt;
     const bool as_json = args.flag("--json") || logprobs;
-    const auto max_tokens = number(args, "--max-new-tokens", defaults.max_new_tokens);
+    const bool explicit_max = args.has("--max-new-tokens");
+    auto max_tokens = number(args, "--max-new-tokens", defaults.max_new_tokens);
     const auto context = number(args, "--context", std::size_t{0});
     const auto seed = number(args, "--seed", std::uint64_t{0});
-    const auto decoder_flags = args.has("--kv-cache") || args.has("--prefill-chunk");
-    const auto settings = session_options(args);
+    const bool explicit_precision = args.has("--kv-cache");
+    const bool decoder_flags = explicit_precision || args.has("--prefill-chunk");
+    auto settings = session_options(args);
+    if (!explicit_precision)
+        settings.kv_precision = cli::default_cache_precision(model, context, detail::max_kv_cache_bytes);
     const bool greedy = args.flag("--greedy"), sample = args.flag("--sample");
     if (greedy && sample)
         invalid("choose --greedy or --sample");
@@ -686,6 +690,10 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
     if (tokenizer)
         decoder.emplace(*tokenizer, std::move(stops));
     if (seq2seq) {
+        if (!explicit_max)
+            max_tokens =
+                cli::fit_generation_budget(model, ids.size(), context ? context : model.config().context,
+                                           max_tokens, KvPrecision::f32, detail::max_kv_cache_bytes);
         const auto capacity = context ? context : std::max<std::size_t>(1, max_tokens);
         if (max_tokens > capacity)
             invalid("T5 generation budget exceeds decoder context");
@@ -696,6 +704,9 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
     }
     const auto lora = adapter ? std::optional(model.load_lora(*adapter)) : std::nullopt;
     auto session = Session::create(model, context, seed, settings, lora ? &*lora : nullptr);
+    if (!explicit_max)
+        max_tokens = cli::fit_generation_budget(model, ids.size(), session.capacity(), max_tokens,
+                                                settings.kv_precision, detail::max_kv_cache_bytes);
     if (ids.empty() || ids.size() > session.capacity() ||
         (max_tokens && max_tokens - 1 > session.capacity() - ids.size()))
         invalid("prompt and generation budget exceed context, or prompt is empty");
@@ -717,6 +728,7 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
     batch_options.kv_budget_bytes = detail::product(
         {number(args, "--kv-budget-mib", batch_options.kv_budget_bytes / detail::mib), detail::mib},
         "batch KV budget");
+    const bool explicit_precision = args.has("--kv-cache");
     batch_options.session = session_options(args);
     const cli::BatchIoOptions io{args.flag("--stats"),
                                  args.flag("--ready"),
@@ -724,13 +736,18 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
                                  args.adapters(),
                                  args.option("--lora-root").value_or(""),
                                  args.flag("--metrics"),
-                                 args.option("--chat-format").value_or("auto")};
+                                 args.option("--chat-format").value_or("auto"),
+                                 number(args, "--max-output-tokens", std::size_t{0})};
     const auto tokenizer = args.option("--tokenizer").value_or("");
     const bool memory_plan = args.flag("--memory-plan");
     args.finish();
     if (memory_plan)
         return cli::print_batch_memory_plan(path, batch_options, io);
-    cli::run_batch(Model::load(path, options), path, tokenizer, batch_options, io);
+    const auto model = Model::load(path, options);
+    if (!explicit_precision)
+        batch_options.session.kv_precision =
+            cli::default_cache_precision(model, batch_options.context, batch_options.kv_budget_bytes);
+    cli::run_batch(model, path, tokenizer, batch_options, io);
 }
 
 void launch_frontend(std::string_view action, const char* invoked, std::span<char*> options, bool help) {
@@ -894,13 +911,13 @@ constexpr CommandHelp commands[] = {
      "generate MODEL (PROMPT | --stdin | --tokens IDS | --messages FILE)",
      "  --stdin                       Read one plain-text prompt through EOF.\n"
      "  --messages FILE               Read a JSON array of chat messages. Use - for stdin.\n"
-     "  --max-new-tokens N            Set the token budget (checkpoint default or 32).\n"
+     "  --max-new-tokens N            Set the token budget (checkpoint default or up to 1024).\n"
      "  --greedy | --sample           Choose the highest score or sample.\n"
      "  --temperature T --top-k K --top-p P --seed N\n"
      "  --stop TEXT                   Stop on text. Repeat to add more strings.\n"
      "  --stop-ids IDS                Add comma-separated stop token IDs.\n"
      "  --bos                         Prepend the start token to decoder-only input.\n"
-     "  --context N                   Limit session context (decoder context for T5).\n"
+     "  --context N                   Limit session context (up to 8192 by default, decoder for T5).\n"
      "  --kv-cache f32|f16 --prefill-chunk N\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
      "  --lora DIR                    Apply a PEFT LoRA adapter.\n"
@@ -935,7 +952,8 @@ constexpr CommandHelp commands[] = {
      "  --step-tokens N               Set the total tokens per scheduler step (default 32).\n"
      "  --chat-format auto|none|chatml|qwen3|zephyr\n"
      "  --speculative-tokens N        Verify up to 8 prompt lookup drafts in greedy decoding (default 0).\n"
-     "  --kv-budget-mib N             Limit KV memory (default 512).\n"
+     "  --kv-budget-mib N             Limit KV memory (default 1024).\n"
+     "  --max-output-tokens N         Cap generated tokens per request.\n"
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"
      "  --no-prefix-cache             Disable decoder prefix and T5 source caching.\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"

@@ -393,7 +393,7 @@ T5Session T5Session::create(const Model& model, std::span<const Token> source, s
     const auto bytes =
         Cache::required_bytes(config, sum(source.size(), capacity, "T5 cache positions"), KvPrecision::f32);
     if (bytes > max_kv_cache_bytes)
-        throw Error(ErrorCode::resource_limit, "T5 self-attention and cross-attention caches exceed 512 MiB");
+        throw Error(ErrorCode::resource_limit, "T5 self-attention and cross-attention caches exceed 1 GiB");
     return T5Session(std::make_unique<Impl>(model, **decoder, source, capacity, seed));
 }
 
