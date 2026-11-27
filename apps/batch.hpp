@@ -9,6 +9,7 @@ struct BatchIoOptions {
     std::size_t max_result_values = 0;
 };
 
+void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions options, BatchIoOptions io);
 void run_batch(const Model& model, const std::filesystem::path& path, const std::filesystem::path& sidecar,
                BatchOptions options, BatchIoOptions io);
 

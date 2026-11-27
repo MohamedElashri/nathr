@@ -204,6 +204,16 @@ nathr serve smollm2 --also minilm
 
 Use `smollm2` for generation and `minilm` for embedding up to 16 inputs per request. Repeat `--also` to load more checkpoints. The first model handles requests without a model ID. Each model has its own worker and KV budget. Use `/model?model=minilm` or `/health?model=minilm` to inspect one worker.
 
+Set `--memory-budget-mib` to share a memory allowance across model workers.
+
+```sh
+nathr serve smollm2 --also minilm --memory-budget-mib 512 --kv-budget-mib 128
+```
+
+The primary model loads at startup. Additional models load on first inference or capability inspection at `/model`. Model discovery and health list configured models without loading them. Idle workers are evicted in least-recently-used order when another model needs room. Active requests keep their worker, so a request that cannot fit can retry after they drain.
+
+The allowance accounts for checkpoint files, conservative native workspace estimates, and KV capacity. It excludes process overhead such as tokenizer data and HTTP buffers. `/health` reports the total allowance, reserved bytes, and each worker's residency and memory breakdown.
+
 ## Build from source
 
 ### Prerequisites

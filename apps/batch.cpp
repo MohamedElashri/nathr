@@ -1,6 +1,8 @@
 #include "batch.hpp"
 
+#include "backend/cpu/scalar.hpp"
 #include "core/input.hpp"
+#include "models/t5/model.hpp"
 #include "requests.hpp"
 
 #include <nathr/tokenizer.hpp>
@@ -259,6 +261,49 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
 }
 } // namespace
 
+void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions options, BatchIoOptions io) {
+    const bool directory = detail::is_model_directory(path);
+    const auto weights_path = directory ? path / "model.safetensors" : path;
+    const auto file_bytes = std::filesystem::file_size(weights_path);
+    if (file_bytes > detail::max_checkpoint_bytes)
+        throw Error(ErrorCode::resource_limit, "checkpoint exceeds 1 GiB");
+    const auto weights = static_cast<std::size_t>(file_bytes);
+
+    // A decoder worker can have generation scratch and a transient tensor inference.
+    // BERT's hidden-state buffer can be as large as its scratch.
+    std::size_t workspaces = 2;
+    auto kv = options.kv_budget_bytes;
+    if (directory) {
+        const auto config_path = path / "config.json";
+        const auto config = detail::read_json(config_path, detail::mib);
+        const auto type = config.find("model_type");
+        if (type != config.end() && *type == "bert")
+            kv = 0;
+        else if (type != config.end() && *type == "t5") {
+            const auto c = detail::t5_config(config, config_path);
+            // Active decoder scratch, a separate tensor decoder, and one encoder at a time.
+            workspaces = detail::sum(options.max_active, 2, "T5 workspaces");
+            const auto tensor_kv = detail::Cache::required_bytes(c, 2 * c.context, KvPrecision::f32);
+            kv = detail::sum(kv, std::min(tensor_kv, detail::max_kv_cache_bytes), "worker KV capacity");
+        }
+    }
+    auto workspace = detail::product({workspaces, detail::max_workspace_bytes}, "worker workspaces");
+    if (kv) {
+        // Cover retained logits and sampler candidates for each active request.
+        const auto sampling =
+            detail::product({options.max_active, detail::max_vocabulary, 32}, "worker sampling buffers");
+        workspace = detail::sum(workspace, sampling, "worker workspace total");
+    }
+    workspace =
+        detail::sum(workspace, detail::product({io.max_result_values, sizeof(float)}, "tensor result"),
+                    "worker workspace total");
+    const auto total = detail::sum(detail::sum(weights, workspace, "worker memory"), kv, "worker memory");
+    write_output({{"weights_bytes", weights},
+                  {"workspace_bytes", workspace},
+                  {"kv_bytes", kv},
+                  {"total_bytes", total}});
+}
+
 void run_batch(const Model& model, const std::filesystem::path& path, const std::filesystem::path& sidecar,
                BatchOptions options, BatchIoOptions io) {
     std::optional<BatchScheduler> scheduler;
@@ -281,6 +326,7 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
             {"chat", model.supports_generation() && defaults.chat_system.has_value() && output.tokenizer},
             {"max_new_tokens", defaults.max_new_tokens}};
         add_capabilities(ready, model);
+        ready["weight_bytes"] = model.memory().file_bytes;
         if (scheduler)
             ready["generation_context"] = scheduler->context();
         write_output(ready);

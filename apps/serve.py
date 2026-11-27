@@ -3,11 +3,12 @@
 import argparse
 import base64
 from collections import deque
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import os
 from pathlib import Path
 import select
 import signal
@@ -129,12 +130,22 @@ class Worker:
         for thread in self.threads:
             thread.start()
 
-    def start(self):
+    def start(self, check=None):
+        deadline = time.monotonic() + 60
         with self.changed:
-            if not self.changed.wait_for(lambda: self.metadata is not None or self.error, timeout=60):
-                raise RuntimeError("model did not become ready")
+            while self.metadata is None and self.error is None:
+                if check is not None:
+                    check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("model did not become ready")
+                self.changed.wait(min(remaining, 0.1))
             if self.error:
                 raise self.error
+
+    def idle(self):
+        with self.changed:
+            return not self.pending
 
     def fail(self, message):
         with self.changed:
@@ -278,10 +289,209 @@ class Worker:
             )
 
 
+@dataclass
+class WorkerSlot:
+    path: Path
+    source: str | None
+    worker: Worker | None = None
+    plan: dict | None = None
+    leases: int = 0
+    last_used: float = 0
+
+
+def checkpoint_command(command, check):
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as process:
+        try:
+            while True:
+                check()
+                try:
+                    result, stderr = process.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+            raise
+        if process.returncode:
+            raise RuntimeError(stderr.strip() or "checkpoint command failed")
+        return result
+
+
+class WorkerPool:
+    def __init__(self, executable, store, slots, options, worker_args):
+        self.executable = executable
+        self.store = store
+        self.slots = slots
+        self.options = options
+        self.worker_args = worker_args
+        self.budget = (getattr(options, "memory_budget_mib", None) or 0) * 1024 * 1024
+        self.changed = threading.Condition()
+        self.stopping = threading.Event()
+        self.loading = None
+
+    def slot(self, model_id):
+        if not isinstance(model_id, str) or model_id not in self.slots:
+            raise RequestError("model is not configured", 404)
+        return self.slots[model_id]
+
+    def reserved_bytes(self):
+        return sum(slot.plan["total_bytes"] for slot in self.slots.values() if slot.plan is not None)
+
+    def reserve(self, slot, plan, check):
+        size = plan["total_bytes"]
+        if size > self.budget:
+            raise RequestError(f"checkpoint needs {size} bytes, above the server memory budget of {self.budget} bytes",
+                               429)
+        victims = []
+        with self.changed:
+            need = self.reserved_bytes() + size - self.budget
+            if need > 0:
+                idle = sorted((item for item in self.slots.values()
+                               if item.worker is not None and not item.leases and item.worker.idle()),
+                              key=lambda item: item.last_used)
+                for item in idle:
+                    victims.append((item, item.worker))
+                    need -= item.plan["total_bytes"]
+                    if need <= 0:
+                        break
+                if need > 0:
+                    raise RequestError("active requests are occupying the server memory budget", 429)
+                for item, _ in victims:
+                    item.worker = None
+        for item, worker in victims:
+            worker.close()
+            with self.changed:
+                item.plan = None
+        check()
+        with self.changed:
+            slot.plan = plan
+
+    def load(self, model_id, slot, check):
+        worker = None
+        try:
+            if slot.source is not None:
+                if self.budget:
+                    checkpoint_command([self.executable, "pull", slot.source, "--models-dir",
+                                        str(self.store.directory)], check)
+                else:
+                    self.store.pull(slot.source)
+            command = [self.executable, "batch", "--model", str(slot.path), *self.worker_args]
+            if self.options.tokenizer and model_id == self.options.model_id:
+                command.extend(("--tokenizer", self.options.tokenizer))
+            if self.budget:
+                plan = json.loads(checkpoint_command([*command, "--memory-plan"], check))
+                self.reserve(slot, plan, check)
+            worker = Worker([*command, "--ready"], self.options)
+            worker.start(check)
+            check()
+            if self.budget and worker.metadata["weight_bytes"] != plan["weights_bytes"]:
+                raise RequestError("checkpoint size changed during loading", 503)
+            return worker
+        except BaseException as error:
+            if worker is not None:
+                worker.close()
+            with self.changed:
+                slot.plan = None
+            if isinstance(error, (OSError, RuntimeError, ValueError)) and not isinstance(error, ConnectionError):
+                raise RequestError(f"{model_id}: {error}", 503) from error
+            raise
+
+    @contextmanager
+    def borrow(self, model_id, deadline=None, check_peer=None):
+        slot = self.slot(model_id)
+
+        def check():
+            if self.stopping.is_set():
+                raise RequestError("engine is shutting down", 503)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RequestError("model load deadline exceeded", 504)
+            if check_peer is not None:
+                check_peer()
+
+        loading = False
+        try:
+            with self.changed:
+                while True:
+                    check()
+                    if slot.worker is not None:
+                        worker = slot.worker
+                        slot.leases += 1
+                        break
+                    if self.loading is None:
+                        loading = True
+                        self.loading = model_id
+                        break
+                    self.changed.wait(0.1)
+            if loading:
+                worker = self.load(model_id, slot, check)
+                with self.changed:
+                    slot.worker = worker
+                    slot.leases += 1
+        finally:
+            if loading:
+                with self.changed:
+                    self.loading = None
+                    self.changed.notify_all()
+        try:
+            yield worker
+        finally:
+            with self.changed:
+                slot.leases -= 1
+                slot.last_used = time.monotonic()
+
+    def health(self, model_id=None):
+        def snapshot(name, slot):
+            if slot.worker is not None:
+                value = slot.worker.health()
+            else:
+                state = "loading" if self.loading == name else "evicting" if slot.plan else "unloaded"
+                value = {"status": state, "pending_requests": 0, "cancelled_requests": 0,
+                         "queue_bypasses": 0, "kv": {"peak_bytes": 0, "resident_bytes": 0}}
+            if self.budget:
+                value["model_memory"] = slot.plan
+            return value
+
+        with self.changed:
+            if model_id is not None:
+                result = snapshot(model_id, self.slot(model_id))
+            elif len(self.slots) == 1:
+                name, slot = next(iter(self.slots.items()))
+                result = snapshot(name, slot)
+            else:
+                models = {name: snapshot(name, slot) for name, slot in self.slots.items()}
+                failed = sum(value["status"] == "unavailable" for value in models.values())
+                status = "unavailable" if failed == len(models) else "degraded" if failed else "ok"
+                result = {"status": status, "models": models}
+            if self.budget:
+                result["memory_budget"] = {"budget_bytes": self.budget, "reserved_bytes": self.reserved_bytes()}
+            return result
+
+    def close(self):
+        self.stopping.set()
+        with self.changed:
+            self.changed.notify_all()
+            self.changed.wait_for(lambda: self.loading is None)
+        for slot in self.slots.values():
+            if slot.worker is not None:
+                slot.worker.close()
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, workers, options):
+    def __init__(self, pool, options):
         directory = Path(__file__).with_name("nathr-web")
         self.assets = {route: ((directory / name).read_bytes(), content_type) for route, name, content_type in (
             ("/", "index.html", "text/html; charset=utf-8"),
@@ -289,24 +499,10 @@ class Server(ThreadingHTTPServer):
             ("/app.js", "app.js", "text/javascript; charset=utf-8"),
         )}
         super().__init__(("127.0.0.1", options.port), Handler)
-        self.workers = workers
-        self.default_model = next(iter(workers))
+        self.pool = pool
+        self.default_model = options.model_id
         self.options = options
         self.slots = threading.BoundedSemaphore(options.max_clients)
-
-    def worker_for(self, model_id):
-        if not isinstance(model_id, str) or model_id not in self.workers:
-            raise RequestError("model is not loaded", 404)
-        return self.workers[model_id]
-
-    def health(self, model_id):
-        if model_id is not None or len(self.workers) == 1:
-            selected = self.default_model if model_id is None else model_id
-            return self.worker_for(selected).health()
-        models = {name: worker.health() for name, worker in self.workers.items()}
-        healthy = sum(snapshot["status"] == "ok" for snapshot in models.values())
-        status = "unavailable" if not healthy else "ok" if healthy == len(models) else "degraded"
-        return {"status": status, "models": models}
 
     def process_request(self, request, client_address):
         if self.slots.acquire(blocking=False):
@@ -405,21 +601,22 @@ class Handler(BaseHTTPRequestHandler):
             if path in self.server.assets:
                 self.send_body(*self.server.assets[path], ui=True)
             elif path == "/health":
-                health = self.server.health(model_id)
+                health = self.server.pool.health(model_id)
                 self.reply(health, 503 if health["status"] == "unavailable" else 200)
             elif path == "/v1/models":
-                self.reply({"object": "list", "data": [model_card(name) for name in self.server.workers]})
+                self.reply({"object": "list", "data": [model_card(name) for name in self.server.pool.slots]})
             elif path.startswith("/v1/models/"):
                 name = unquote(path.removeprefix("/v1/models/"))
-                self.server.worker_for(name)
+                self.server.pool.slot(name)
                 self.reply(model_card(name))
             elif path == "/model":
                 name = self.server.default_model if model_id is None else model_id
-                worker = self.server.worker_for(name)
                 options = self.server.options
                 limits = {name: getattr(options, name) for name in
                           ("max_body_bytes", "max_output_tokens", "max_result_values", "max_buffer_bytes")}
-                self.reply(dict(worker.metadata, id=name, limits=limits))
+                deadline = time.monotonic() + options.request_timeout
+                with self.server.pool.borrow(name, deadline, self.check_peer) as worker:
+                    self.reply(dict(worker.metadata, id=name, limits=limits))
             else:
                 raise RequestError("endpoint not found", 404)
         except RequestError as error:
@@ -747,6 +944,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request = None
+        lease = ExitStack()
         try:
             self.check_host()
             if (origin := self.headers.get("Origin")) is not None and origin != f"http://{self.headers['Host']}":
@@ -757,8 +955,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError("endpoint not found", 404)
             value = self.body()
             self.model_id = value.pop("model", self.server.default_model)
-            self.worker = self.server.worker_for(self.model_id)
             deadline = time.monotonic() + self.server.options.request_timeout
+            self.worker = lease.enter_context(self.server.pool.borrow(self.model_id, deadline, self.check_peer))
             if kind == "embeddings":
                 self.embeddings(value, deadline)
                 return
@@ -785,6 +983,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             if request is not None:
                 self.worker.cancel(request)
+            lease.close()
 
 
 def bounded(low, high):
@@ -917,6 +1116,8 @@ def main(executable, directory, mode, args):
     else:
         parser.add_argument("--also", action="append", default=[], metavar="MODEL",
                             help="load an additional checkpoint under its usual ID; repeat to load more")
+        parser.add_argument("--memory-budget-mib", type=int,
+                            help="account total worker memory and load additional models on demand")
     parser.add_argument("--model-id", help=argparse.SUPPRESS if run else "API model ID, otherwise the checkpoint name")
     parser.add_argument("--port", type=bounded(0, 65535), default=0 if run else 8000,
                         help=argparse.SUPPRESS if run else "HTTP port, or 0 for an available port")
@@ -950,6 +1151,9 @@ def main(executable, directory, mode, args):
                         help=argparse.SUPPRESS if run else "socket I/O timeout in seconds")
     limits.add_argument("--request-timeout", type=bounded(1, 600), default=120, help="inference timeout in seconds")
     options = parser.parse_args(args)
+    budget = getattr(options, "memory_budget_mib", None)
+    if budget is not None and budget <= 0:
+        parser.error("--memory-budget-mib must be positive")
     if run:
         if options.prompt is not None and options.prompt_text is not None:
             parser.error("pass one prompt")
@@ -960,14 +1164,14 @@ def main(executable, directory, mode, args):
     if options.max_active > options.step_tokens:
         parser.error("--step-tokens must cover all active slots")
     store = ModelStore(options.models_dir)
-    model_path, model_id = store.resolve(options.model or options.model_path)
+    model_path, model_id, source = store.locate(options.model or options.model_path)
     options.model_id = options.model_id or model_id
-    checkpoints = {options.model_id: model_path}
+    checkpoints = {options.model_id: WorkerSlot(model_path, source)}
     for name in getattr(options, "also", []):
-        path, model_id = store.resolve(name)
+        path, model_id, source = store.locate(name)
         if model_id in checkpoints:
             parser.error(f"duplicate model ID: {model_id}")
-        checkpoints[model_id] = path
+        checkpoints[model_id] = WorkerSlot(path, source)
     worker_args = []
     for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens", "max_queued",
                  "max_queued_tokens", "max_queue_bypasses", "kv_budget_mib", "kv_cache", "max_result_values"):
@@ -976,22 +1180,18 @@ def main(executable, directory, mode, args):
     if options.no_prefix_cache:
         worker_args.append("--no-prefix-cache")
     with ExitStack() as cleanup:
-        workers = {}
-        for model_id, path in checkpoints.items():
-            command = [executable, "batch", "--model", str(path), "--ready", *worker_args]
-            if options.tokenizer and model_id == options.model_id:
-                command.extend(("--tokenizer", options.tokenizer))
-            worker = Worker(command, options)
-            cleanup.callback(worker.close)
-            try:
-                worker.start()
-            except (RequestError, RuntimeError) as error:
-                raise RequestError(f"{model_id}: {error}") from error
-            workers[model_id] = worker
+        pool = WorkerPool(executable, store, checkpoints, options, worker_args)
+        cleanup.callback(pool.close)
+        preload = (options.model_id,) if pool.budget else checkpoints
+        for model_id in preload:
+            deadline = time.monotonic() + options.request_timeout if pool.budget else None
+            with pool.borrow(model_id, deadline):
+                pass
         if run and (not options.no_open or options.prompt is not None):
-            run_terminal(workers[options.model_id], options)
+            with pool.borrow(options.model_id) as worker:
+                run_terminal(worker, options)
             return
-        with Server(workers, options) as server:
+        with Server(pool, options) as server:
             url = f"http://127.0.0.1:{server.server_address[1]}"
             print(f"Listening on {url}", flush=True)
             server.serve_forever()
