@@ -412,6 +412,66 @@ void batch_scheduler() {
            "additional stop IDs finish a batch request at the sampled match");
 }
 
+void speculative_decoding() {
+    const auto model = Model::load(fixture / "f32");
+    for (const auto precision : {KvPrecision::f32, KvPrecision::f16}) {
+        BatchOptions options;
+        options.context = 32;
+        options.max_active = 2;
+        options.step_tokens = 8;
+        options.session = {precision, 4};
+        const BatchRequest repeated{1, std::vector<Token>(18, 20), 12, 0, {}};
+        // The first generated token completes a matching 4,4,20 suffix with a wrong continuation.
+        const BatchRequest divergent{2, {4, 4, 20, 4, 4, 4, 4, 4}, 12, 0, {}};
+        options.kv_budget_bytes = Cache::required_bytes(
+            model.config(), repeated.tokens.size() + divergent.tokens.size() + 22, precision);
+        const auto run = [&](const BatchOptions& config) {
+            BatchScheduler scheduler(model, config);
+            scheduler.submit(repeated);
+            scheduler.submit(divergent);
+            std::array<std::vector<Token>, 2> tokens;
+            std::array<std::optional<BatchEvent>, 2> finished;
+            for (unsigned step = 0; step < 64 && !scheduler.empty(); ++step) {
+                for (const auto& event : scheduler.step()) {
+                    const auto index = event.id - 1;
+                    if (event.token)
+                        tokens.at(index).push_back(*event.token);
+                    else {
+                        expect(event.kind == BatchEventKind::length, "speculative batch finishes");
+                        finished.at(index) = event;
+                    }
+                }
+            }
+            expect(scheduler.empty() && finished[0] && finished[1], "speculative batch drains");
+            expect(scheduler.peak_kv_bytes() <= config.kv_budget_bytes, "draft rows stay within KV budget");
+            return std::pair(std::move(tokens), std::move(finished));
+        };
+        const auto baseline = run(options);
+        options.speculative_tokens = 4;
+        const auto [tokens, finished] = run(options);
+        expect(tokens == baseline.first && tokens[0].size() == 12 && tokens[1].size() == 12,
+               "verified and rejected drafts preserve greedy tokens and budget");
+        expect(finished[0]->accepted_draft_tokens >= 4 &&
+                   finished[0]->draft_tokens == finished[0]->accepted_draft_tokens &&
+                   finished[1]->draft_tokens >= 2 && finished[1]->accepted_draft_tokens == 0,
+               "speculation verifies several matches and rolls back a rejected batch");
+
+        BatchScheduler cancelled(model, options);
+        cancelled.submit(repeated);
+        std::size_t emitted = 0;
+        for (unsigned step = 0; step < 32 && !emitted; ++step) {
+            for (const auto& event : cancelled.step()) {
+                if (event.accepted_draft_tokens)
+                    emitted = event.emitted;
+            }
+        }
+        auto done = cancelled.cancel(repeated.id);
+        expect(done && emitted > 1 && done->emitted == emitted && done->kind == BatchEventKind::cancelled &&
+                   cancelled.empty(),
+               "cancel releases a request after a multi-token speculative step");
+    }
+}
+
 void decoder_prefix_cache() {
     const auto run = [](BatchScheduler& engine, const BatchRequest& input, std::size_t expected_hit) {
         engine.submit(input);
@@ -1256,6 +1316,7 @@ int main(int argc, char** argv) try {
         model_and_sessions();
         paged_cache();
         batch_scheduler();
+        speculative_decoding();
         decoder_prefix_cache();
         queue_bypass();
         gpt2_and_sessions();

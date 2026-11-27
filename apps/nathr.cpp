@@ -675,6 +675,7 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
     batch_options.max_queued = number(args, "--max-queued", batch_options.max_queued);
     batch_options.max_queued_tokens = number(args, "--max-queued-tokens", batch_options.max_queued_tokens);
     batch_options.max_queue_bypasses = number(args, "--max-queue-bypasses", batch_options.max_queue_bypasses);
+    batch_options.speculative_tokens = number(args, "--speculative-tokens", batch_options.speculative_tokens);
     batch_options.prefix_cache = !args.flag("--no-prefix-cache");
     batch_options.step_tokens = number(args, "--step-tokens", batch_options.step_tokens);
     batch_options.kv_budget_bytes = detail::product(
@@ -882,6 +883,7 @@ constexpr CommandHelp commands[] = {
      "  --max-queued-tokens N         Limit queued prompt tokens (default 16384).\n"
      "  --max-queue-bypasses N        Let up to N fitting requests pass a blocked queue head (default 0).\n"
      "  --step-tokens N               Set the total tokens per scheduler step (default 32).\n"
+     "  --speculative-tokens N        Verify up to 8 prompt lookup drafts in greedy decoding (default 0).\n"
      "  --kv-budget-mib N             Limit KV memory (default 512).\n"
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"
      "  --no-prefix-cache             Disable sharing of computed decoder KV pages.\n"

@@ -14,6 +14,7 @@ struct BatchOptions {
     SessionOptions session;
     bool prefix_cache = true;
     std::size_t max_queue_bypasses = 0;
+    std::size_t speculative_tokens = 0; // Up to eight prompt lookup candidates per greedy decoder step.
 };
 
 using RequestId = std::uint64_t;
@@ -43,6 +44,8 @@ struct BatchEvent {
     std::size_t prompt_tokens{};
     std::size_t cached_prompt_tokens{};
     double queue_ms{};
+    std::size_t draft_tokens{};
+    std::size_t accepted_draft_tokens{};
 };
 
 // Call from one thread. Submit and cancel requests between calls to step().

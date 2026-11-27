@@ -929,6 +929,8 @@ def main(executable, directory, mode, args):
     scheduler.add_argument("--prefill-chunk", type=bounded(1, 32), default=16, help="prompt tokens per request step")
     scheduler.add_argument("--max-active", type=bounded(1, 64), default=4, help="active generation requests")
     scheduler.add_argument("--step-tokens", type=bounded(1, 128), default=32, help="total tokens per scheduler step")
+    scheduler.add_argument("--speculative-tokens", type=bounded(0, 8), default=0,
+                           help="prompt lookup candidates to verify in greedy decoding")
     scheduler.add_argument("--max-queued", type=bounded(1, 256), default=16, help="queued generation requests")
     scheduler.add_argument("--max-queued-tokens", type=bounded(1, 262144), default=16384, help="queued prompt tokens")
     scheduler.add_argument("--max-queue-bypasses", type=bounded(0, 256), default=0,
@@ -969,7 +971,8 @@ def main(executable, directory, mode, args):
             parser.error(f"duplicate model ID: {model_id}")
         checkpoints[model_id] = path
     worker_args = []
-    for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens", "max_queued",
+    for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens",
+                 "speculative_tokens", "max_queued",
                  "max_queued_tokens", "max_queue_bypasses", "kv_budget_mib", "kv_cache", "max_result_values"):
         if (value := getattr(options, name)) is not None:
             worker_args.extend(("--" + name.replace("_", "-"), str(value)))

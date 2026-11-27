@@ -151,6 +151,8 @@ nathr bench --serve --workload shared-prefix --prompt-length 512 --warmups 1 --s
 
 The workloads send synthetic token IDs. The report includes time to first token, approximate inter-token percentiles, queue time, throughput, and the worker's peak KV bytes since startup. Mixed workloads also report latency separately for short and long requests. Start fresh servers with the same seed to compare settings. Use `--no-prefix-cache` for a cache-disabled trial or `--max-queue-bypasses 2` to test admission under a tight KV budget.
 
+Try `--speculative-tokens 4` with `nathr batch`, `nathr run`, or `nathr serve` to enable prompt lookup for greedy decoder requests. Compare with speculation disabled using repeated-text prompts. Batch statistics and native `/infer` results report draft and acceptance counts.
+
 ## OpenAI-compatible API
 
 Start the local server with the default `smollm2` model.

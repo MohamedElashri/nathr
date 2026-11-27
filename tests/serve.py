@@ -284,6 +284,20 @@ def user_commands(binary, checkpoint, encoder, directory):
     assert json.loads(output)["shape"] == [12]
 
 
+def speculative_stream(binary, checkpoint):
+    prompt = dict(tokens=[20] * 18, decode=True, max_new_tokens=12, greedy=True)
+    with server(binary, checkpoint, "--speculative-tokens", "4") as port:
+        full = request(port, "/infer", prompt)
+        assert full["generated_ids"] == [20] * 12 and full["text"] == "a" * 12
+        assert full["accepted_draft_tokens"] >= 4
+        stream = request(port, "/infer", dict(prompt, stream=True, stop=["aaa"]))
+        assert [item["token_id"] for item in stream if item["event"] == "token"] == [20] * 3
+        assert stream[-1]["reason"] == "stop" and stream[-1]["accepted_draft_tokens"] == 2
+        assert not "".join(item.get("text", "") for item in stream)
+        sampled = request(port, "/infer", dict(prompt, greedy=False, top_k=1))
+        assert sampled["generated_ids"] == full["generated_ids"] and "draft_tokens" not in sampled
+
+
 def multi_model_benchmark(binary, checkpoint, encoder):
     with server(binary, checkpoint, "--model-id", "chat", "--also", encoder, "--context", "128") as port:
         models = request(port, "/v1/models")["data"]
@@ -325,5 +339,6 @@ if __name__ == "__main__":
         stalled_consumer(executable, checkpoint)
         chat_stdin(executable, checkpoint)
         user_commands(executable, checkpoint, fixtures / "bert", checkpoint / "empty cache")
+        speculative_stream(executable, checkpoint)
         multi_model_benchmark(executable, checkpoint, fixtures / "bert")
         checkpoint_defaults(executable, checkpoint)
