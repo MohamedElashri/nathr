@@ -195,7 +195,7 @@ Look up each emitted ID's byte sequence and pass it to an incremental UTF-8 deco
 
 The scheduler gives active requests one decode token per step, then divides the remaining token budget among prompt chunks. The causal decoder packs scheduled rows into shared projection calls. Each row carries its absolute position and its request’s KV table, so it attends only to the visible rows of its own sequence. T5 encodes one whole source as a scheduling unit. [Batch scheduler](../src/runtime/batch.cpp) · [Decoder input rows](../src/models/decoder.hpp)
 
-Admission reserves enough KV capacity for a request’s token budget. FIFO is the default. A configured bypass limit lets fitting requests pass a memory-blocked queue head, then holds the queue until that request fits. The engine allocates pages on demand from a budgeted pool. [Batch scheduler](../src/runtime/batch.cpp) · [KV page pool](../src/backend/cpu/scalar.hpp)
+Admission reserves each request’s private KV capacity and charges shared prefix pages once across active readers. A shared page stays reserved until its last reader leaves. FIFO is the default. A configured bypass limit lets fitting requests pass a memory-blocked queue head. [Batch scheduler](../src/runtime/batch.cpp) · [KV page pool](../src/backend/cpu/scalar.hpp)
 
 The decoder scheduler indexes full prompt pages by their exact token IDs and the parent page's identity. Later requests can share those pages and skip their prefill rows. A fully cached prompt replays its final token with read-only KV access to obtain the first logits. Shared pages are immutable, with unreferenced leaves reclaimed under memory pressure. [Prefix cache](../src/runtime/batch.cpp) · [Serving benchmark](../README.md#benchmark-a-running-server)
 

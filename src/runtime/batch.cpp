@@ -31,21 +31,24 @@ class PrefixCache {
         Entry* parent;
         std::size_t id;
         std::size_t children = 0;
+        std::size_t active_references = 0;
     };
 
-    Entry* find(std::uint64_t adapter, Entry* parent, std::span<const Token> tokens) {
+    using Iterator = std::list<Entry>::iterator;
+
+    std::optional<Iterator> find(std::uint64_t adapter, Entry* parent, std::span<const Token> tokens) {
         const auto it = index_.find(key(adapter, parent, tokens));
         if (it == index_.end())
-            return nullptr;
-        pages_.splice(pages_.end(), pages_, it->second);
-        return &*it->second;
+            return {};
+        return it->second;
     }
 
-    Entry* remember(std::uint64_t adapter, Entry* parent, std::span<const Token> tokens,
-                    const Cache::Page& page) {
+    void touch(Iterator page) { pages_.splice(pages_.end(), pages_, page); }
+
+    Entry* remember(std::uint64_t adapter, Entry* parent, std::span<const Token> tokens, const Cache::Page& page) {
         auto [it, inserted] = index_.try_emplace(key(adapter, parent, tokens), pages_.end());
         if (!inserted) {
-            pages_.splice(pages_.end(), pages_, it->second);
+            touch(it->second);
             return &*it->second;
         }
         try {
@@ -80,7 +83,7 @@ class PrefixCache {
     }
 
     std::list<Entry> pages_;
-    std::map<Key, std::list<Entry>::iterator> index_;
+    std::map<Key, Iterator> index_;
     std::size_t next_id_ = 0;
 };
 
@@ -145,26 +148,60 @@ struct BatchScheduler::Impl {
             (options.session.kv_precision != KvPrecision::f32 &&
              options.session.kv_precision != KvPrecision::f16))
             throw Error(ErrorCode::invalid_argument, "invalid batch context, scheduling, or cache settings");
-        if (decoder)
+        if (decoder) {
             scratch = decoder->workspace(options.context, options.step_tokens);
-        else if (options.session.kv_precision != KvPrecision::f32)
+            if (options.prefix_cache)
+                prefix_page_bytes =
+                    Cache::required_bytes(model.config(), Cache::page_tokens, options.session.kv_precision);
+        } else if (options.session.kv_precision != KvPrecision::f32) {
             throw Error(ErrorCode::unsupported, "T5 batches use an FP32 KV cache");
+        }
     }
 
     void remove_active(Requests::iterator request) {
         reserved -= request->reservation;
+        // A shared page remains reserved until its last active reader leaves.
+        for (auto* page = request->prefix; page; page = page->parent) {
+            if (--page->active_references)
+                reserved += prefix_page_bytes;
+        }
         active.erase(request);
+    }
+
+    std::size_t admission_cost(const Request& request) {
+        admission_pages.clear();
+        auto cost = request.reservation;
+        if (!prefix_page_bytes || !cost)
+            return cost;
+
+        const auto tokens = std::span(request.input.tokens);
+        PrefixCache::Entry* parent = nullptr;
+        for (std::size_t start = 0; tokens.size() - start >= Cache::page_tokens;
+             start += Cache::page_tokens) {
+            auto page = prefixes.find(request.lora_key(), parent, tokens.subspan(start));
+            if (!page)
+                break;
+            parent = &**page;
+            admission_pages.push_back(*page);
+            if (parent->active_references)
+                cost -= prefix_page_bytes;
+        }
+        return cost;
     }
 
     void admit(std::vector<BatchEvent>& events) {
         while (!queued.empty() && active.size() < options.max_active) {
             const auto available = options.kv_budget_bytes - reserved;
+            std::size_t cost = 0;
+            const auto fits = [&](const Request& item) {
+                cost = admission_cost(item);
+                return cost <= available;
+            };
             auto candidate = queued.begin();
-            if (candidate->reservation > available) {
+            if (!fits(*candidate)) {
                 if (candidate->bypasses >= options.max_queue_bypasses)
                     break;
-                candidate = std::find_if(std::next(candidate), queued.end(),
-                                         [=](const Request& item) { return item.reservation <= available; });
+                candidate = std::find_if(std::next(candidate), queued.end(), fits);
                 if (candidate == queued.end())
                     break;
             }
@@ -182,8 +219,7 @@ struct BatchScheduler::Impl {
                     request.cache.emplace(model.config(), request.capacity, options.session.kv_precision,
                                           &pool);
                     request.logits.resize(model.config().vocabulary);
-                    if (options.prefix_cache)
-                        reuse_prefix(request);
+                    reuse_prefix(request);
                 }
             } catch (const Error& error) {
                 auto event = request.event(BatchEventKind::error);
@@ -197,25 +233,24 @@ struct BatchScheduler::Impl {
                 ++queued.front().bypasses;
                 ++queue_bypasses;
             }
-            reserved += request.reservation;
+            reserved += cost;
             queued_tokens -= request.input.tokens.size();
             active.splice(active.end(), queued, candidate);
         }
     }
 
     void reuse_prefix(Request& request) {
-        const auto tokens = std::span(request.input.tokens);
-        while (tokens.size() - request.position >= Cache::page_tokens) {
-            auto* page = prefixes.find(request.lora_key(), request.prefix, tokens.subspan(request.position));
-            if (!page)
-                break;
-            request.cache->use_prefix_page(request.position / Cache::page_tokens, page->page);
-            request.prefix = page;
-            request.position += Cache::page_tokens;
+        for (std::size_t index = 0; index < admission_pages.size(); ++index)
+            request.cache->use_prefix_page(index, admission_pages[index]->page);
+        for (auto page : admission_pages) {
+            ++page->active_references;
+            prefixes.touch(page);
+            request.prefix = &*page;
         }
+        request.position = admission_pages.size() * Cache::page_tokens;
         request.cached_prompt_tokens = request.position;
         // Replay the last token for its logits while reading the already complete page.
-        if (request.position == tokens.size())
+        if (request.position == request.input.tokens.size())
             --request.position;
     }
 
@@ -259,6 +294,8 @@ struct BatchScheduler::Impl {
                                                     tokens.subspan(index * Cache::page_tokens),
                                                     request->cache->page(index));
                 request->cache->use_prefix_page(index, request->prefix->page);
+                if (request->prefix->active_references++)
+                    reserved -= prefix_page_bytes;
             }
         }
         if (eval.mode == LogitsMode::last_token && !emit_token(*request, events))
@@ -308,11 +345,13 @@ struct BatchScheduler::Impl {
     const detail::Decoder* decoder = nullptr;
     detail::CachePagePool pool;
     PrefixCache prefixes;
+    std::vector<PrefixCache::Iterator> admission_pages;
     std::unique_ptr<detail::Workspace> scratch;
     Requests queued, active;
     std::vector<Evaluation> evaluations;
     std::vector<Requests::iterator> scheduled;
     std::size_t reserved = 0, queued_tokens = 0, queue_bypasses = 0;
+    std::size_t prefix_page_bytes = 0;
 };
 
 BatchScheduler::BatchScheduler(const Model& model, BatchOptions options)
