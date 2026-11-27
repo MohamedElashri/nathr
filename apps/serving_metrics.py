@@ -10,7 +10,7 @@ GAUGES = {
     "requests_active": "Active generation requests at the last scheduler boundary.",
     "requests_queued": "Queued generation requests at the last scheduler boundary.",
     "queued_tokens": "Prompt tokens awaiting admission to the generation scheduler.",
-    "kv_used_bytes": "KV page bytes in use, including retained prefix pages.",
+    "kv_used_bytes": "KV page bytes in use, including retained decoder prefixes and T5 sources.",
     "kv_resident_bytes": "KV page bytes held by the page pool, including free pages.",
     "kv_budget_bytes": "Configured KV page budget in bytes.",
 }
@@ -19,9 +19,9 @@ COUNTERS = {
     "requests_finished_total": "Native requests with a terminal event.",
     "requests_cancelled_total": "Requests cancelled before or during inference.",
     "generated_tokens_total": "Generation tokens emitted by the native worker.",
-    "prefix_cache_lookups_total": "Generation requests eligible for prefix reuse.",
-    "prefix_cache_hits_total": "Generation requests that reused at least one KV page.",
-    "prefix_cache_tokens_total": "Prompt tokens reused through the prefix cache.",
+    "prefix_cache_lookups_total": "Generation requests eligible for prompt KV reuse.",
+    "prefix_cache_hits_total": "Generation requests that reused a decoder prefix or a full T5 source.",
+    "prefix_cache_tokens_total": "Prompt tokens covered by reused KV pages.",
 }
 
 HISTOGRAMS = {

@@ -1546,7 +1546,7 @@ def main(executable, directory, mode, args):
                            help="fitting requests that may pass a KV-blocked queue head")
     scheduler.add_argument("--kv-budget-mib", type=bounded(1, 4096), default=512, help="KV cache budget in MiB")
     scheduler.add_argument("--kv-cache", choices=("f32", "f16"), default="f32", help="KV cache precision")
-    scheduler.add_argument("--no-prefix-cache", action="store_true", help="disable sharing of computed decoder KV pages")
+    scheduler.add_argument("--no-prefix-cache", action="store_true", help="disable decoder prefix and T5 source caching")
 
     limits = parser.add_argument_group("request limits" if run else "HTTP limits")
     limits.add_argument("--max-clients", type=bounded(1, 128), default=16,

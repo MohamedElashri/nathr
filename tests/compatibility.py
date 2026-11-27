@@ -75,19 +75,23 @@ def check(binary, path, case, backend):
         require(max(range(len(last)), key=last.__getitem__) == case["last_token_argmax"],
                 "last-token greedy ID diverged")
 
-    if "seeded_ids" in case:
+    if "seeded_ids" in case or "greedy_ids" in case:
+        greedy = "greedy_ids" in case
+        expected = case["greedy_ids" if greedy else "seeded_ids"]
+        sampling = ["--greedy"] if greedy else ["--sample", "--seed", "7", "--top-k", "20",
+                                                  "--temperature", "0.8", "--top-p", "0.95"]
         standalone = run(binary, "generate", path, "--tokens", csv(case["ids"]), "--max-new-tokens", "8",
-                         "--sample", "--seed", "7", "--top-k", "20", "--temperature", "0.8", "--top-p", "0.95",
-                         "--backend", backend, "--json")
-        request = dict(tokens=case["ids"], max_new_tokens=8, greedy=False,
-                       seed=7, top_k=20, temperature=0.8, top_p=0.95)
+                         *sampling, "--backend", backend, "--json")
+        request = dict(tokens=case["ids"], max_new_tokens=8, greedy=greedy)
+        if not greedy:
+            request.update(seed=7, top_k=20, temperature=0.8, top_p=0.95)
         events = run(binary, "batch", path, "--backend", backend, "--max-active", "2",
                      requests=[dict(request, id=1), dict(request, id=2)])
-        require(standalone["generated_ids"] == case["seeded_ids"], "seeded standalone IDs diverged")
+        require(standalone["generated_ids"] == expected, "standalone generation IDs diverged")
         for req_id in (1, 2):
             require([event["token_id"] for event in events
-                     if event["id"] == req_id and event["event"] == "token"] == case["seeded_ids"],
-                    f"seeded batch IDs diverged for request {req_id}")
+                     if event["id"] == req_id and event["event"] == "token"] == expected,
+                    f"batch generation IDs diverged for request {req_id}")
 
     if chat := case.get("chat"):
         with tempfile.TemporaryDirectory() as directory:

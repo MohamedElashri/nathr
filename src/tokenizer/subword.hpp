@@ -38,6 +38,7 @@ class SubwordTokenizer {
     std::optional<std::string_view> normalize_lookup(std::string_view text) const;
 
     bool wordpiece_, lower_ = false, accents_ = false, clean_ = false, chinese_ = false, cleanup_ = false;
+    bool split_whitespace_ = true, collapse_spaces_ = false;
     std::string prefix_, metaspace_;
     std::size_t max_word_ = 0;
     std::optional<std::size_t> max_length_;

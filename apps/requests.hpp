@@ -6,7 +6,7 @@
 
 namespace nathr::cli {
 
-enum class ChatStyle { chatml, qwen3, zephyr };
+enum class ChatStyle { chatml, qwen2, qwen3, zephyr };
 
 struct ChatFormat {
     ChatStyle style;

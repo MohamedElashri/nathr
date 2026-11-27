@@ -22,6 +22,12 @@
       "description": "Original SmolLM2-135M weights"
     },
     {
+      "name": "qwen2.5",
+      "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "description": "Qwen2.5-0.5B-Instruct Q4_K_M for chat"
+    },
+    {
       "name": "qwen3",
       "repository": "Qwen/Qwen3-0.6B-GGUF",
       "file": "Qwen3-0.6B-Q8_0.gguf",
@@ -53,6 +59,11 @@
       "name": "t5",
       "repository": "google-t5/t5-small",
       "description": "T5 small for text-to-text generation"
+    },
+    {
+      "name": "flan-t5",
+      "repository": "google/flan-t5-small",
+      "description": "FLAN-T5 Small for instruction-tuned text-to-text generation"
     },
     {
       "name": "minilm",
@@ -329,6 +340,16 @@
       ]
     },
     {
+      "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+      "files": [
+        {
+          "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+          "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db"
+        }
+      ]
+    },
+    {
       "repository": "Qwen/Qwen3-0.6B-GGUF",
       "revision": "23749fefcc72300e3a2ad315e1317431b06b590a",
       "files": [
@@ -389,6 +410,28 @@
         {
           "filename": "tokenizer.json",
           "sha256": "d2acde0d8d71dd30a711834b07781b9c89feaac33fd332f60507699282740066"
+        }
+      ]
+    },
+    {
+      "repository": "google/flan-t5-small",
+      "revision": "0fc9ddf78a1e988dac52e2dac162b0ede4fd74ab",
+      "files": [
+        {
+          "filename": "config.json",
+          "sha256": "439aa0fecf5a5546a1def68b1fc45e538e2c94528ce805378daf091e2bf6e4de"
+        },
+        {
+          "filename": "generation_config.json",
+          "sha256": "f5a1c7e2be8092018d8835128987edf0111637dd98e90599cc80310fef75d95a"
+        },
+        {
+          "filename": "model.safetensors",
+          "sha256": "495fa51e204676f1a857a9fc13c4c89f3f5ba9f480b898cebca02add25e6d749"
+        },
+        {
+          "filename": "tokenizer.json",
+          "sha256": "fe2ebbbbde2985be723e0ce18217853e4020c5e9d35bd07be2c27ab9d3ead57a"
         }
       ]
     },

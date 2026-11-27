@@ -9,13 +9,16 @@
 #include <list>
 #include <map>
 #include <tuple>
+#include <utility>
 
 namespace nathr {
 namespace {
 using Clock = std::chrono::steady_clock;
 using detail::Cache;
 using detail::Evaluation;
+using detail::T5;
 constexpr std::size_t max_draft_tokens = 8;
+constexpr std::size_t retained_t5_sources = 32;
 
 double milliseconds(Clock::duration duration) {
     return std::chrono::duration<double, std::milli>(duration).count();
@@ -140,6 +143,14 @@ struct Speculation {
     LogitsSink verify;
 };
 
+struct T5Source {
+    std::vector<Token> tokens;
+    std::size_t bytes;
+    T5::Source cross;
+    std::size_t references = 0;
+    bool used = false;
+};
+
 struct Request {
     Request(BatchRequest&& input, std::size_t capacity, std::size_t reservation,
             const detail::LoraWeights* lora)
@@ -156,7 +167,7 @@ struct Request {
     std::optional<Clock::time_point> admitted;
     std::optional<Clock::time_point> last_token;
     std::optional<Cache> cache;
-    std::optional<T5Session> seq2seq;
+    std::optional<T5::State> seq2seq;
     std::optional<Sampler> sampler;
     std::optional<Token> pending;
     std::optional<GenerationText> text;
@@ -165,6 +176,7 @@ struct Request {
     std::vector<float> logits;
     std::size_t emitted = 0, position = 0;
     PrefixCache::Entry* prefix = nullptr;
+    T5Source* source = nullptr;
     std::size_t cached_prompt_tokens = 0, bypasses = 0;
     std::size_t draft_tokens = 0, accepted_draft_tokens = 0;
 
@@ -192,9 +204,11 @@ using Requests = std::list<Request>;
 struct BatchScheduler::Impl {
     Impl(const Model& source, BatchOptions settings)
         : model(source), options(settings),
-          pool(settings.kv_budget_bytes, [this] { return prefixes.reclaim(); }) {
+          pool(settings.kv_budget_bytes, [this] { return prefixes.reclaim() || reclaim_source(); }) {
         if (const auto* loaded = std::get_if<std::unique_ptr<detail::Decoder>>(&model.impl_->execution))
             decoder = loaded->get();
+        if (const auto* loaded = std::get_if<std::unique_ptr<T5>>(&model.impl_->execution))
+            seq2seq = loaded->get();
         if (!model.supports_generation())
             throw Error(ErrorCode::unsupported, "checkpoint does not support generation");
         if (!options.context)
@@ -213,9 +227,29 @@ struct BatchScheduler::Impl {
             if (options.prefix_cache)
                 prefix_page_bytes =
                     Cache::required_bytes(model.config(), Cache::page_tokens, options.session.kv_precision);
-        } else if (options.session.kv_precision != KvPrecision::f32) {
-            throw Error(ErrorCode::unsupported, "T5 batches use an FP32 KV cache");
+        } else {
+            if (options.session.kv_precision != KvPrecision::f32)
+                throw Error(ErrorCode::unsupported, "T5 batches use an FP32 KV cache");
+            decode_rows = std::min(options.max_active, detail::batch_tile);
+            for (;;) {
+                try {
+                    scratch = seq2seq->workspace(decode_rows, options.context);
+                    break;
+                } catch (const Error& error) {
+                    if (error.code() != ErrorCode::resource_limit || decode_rows == 1)
+                        throw;
+                    decode_rows /= 2;
+                }
+            }
         }
+    }
+
+    bool reclaim_source() {
+        const auto idle = std::ranges::find(sources, 0, &T5Source::references);
+        if (idle == sources.end())
+            return false;
+        sources.erase(idle);
+        return true;
     }
 
     void remove_active(Requests::iterator request) {
@@ -225,12 +259,28 @@ struct BatchScheduler::Impl {
             if (--page->active_references)
                 reserved += prefix_page_bytes;
         }
+        auto* source = request->source;
         active.erase(request);
+        if (source) {
+            if (--source->references) {
+                reserved += source->bytes;
+            } else if (!options.prefix_cache || !source->used) {
+                std::erase_if(sources, [&](const auto& entry) { return &entry == source; });
+            } else if (sources.size() > retained_t5_sources) {
+                (void)reclaim_source();
+            }
+        }
     }
 
     std::size_t admission_cost(const Request& request) {
         admission_pages.clear();
+        admission_source = sources.end();
         auto cost = request.reservation;
+        if (seq2seq && options.prefix_cache && cost) {
+            admission_source = std::ranges::find(sources, request.input.tokens, &T5Source::tokens);
+            if (admission_source != sources.end() && admission_source->references)
+                cost -= admission_source->bytes;
+        }
         if (!prefix_page_bytes || !cost)
             return cost;
 
@@ -275,15 +325,25 @@ struct BatchScheduler::Impl {
                     queued.erase(candidate);
                     continue;
                 }
+                request.logits.resize(model.config().vocabulary);
                 if (decoder) {
                     request.cache.emplace(model.config(), request.capacity, options.session.kv_precision,
                                           &pool);
-                    request.logits.resize(model.config().vocabulary);
                     if (options.speculative_tokens && request.input.sampling.greedy &&
                         !request.input.constraint && request.input.tokens.size() > Speculation::ngram)
                         request.speculation.emplace(request.input.tokens, *request.sampler, request.rng,
                                                     request.input.top_logprobs);
                     reuse_prefix(request);
+                } else {
+                    if (admission_source == sources.end()) {
+                        const auto bytes = Cache::required_bytes(model.config(), request.input.tokens.size(),
+                                                                 KvPrecision::f32);
+                        sources.push_back({request.input.tokens, bytes, {}});
+                    } else {
+                        sources.splice(sources.end(), sources, admission_source);
+                    }
+                    request.source = &sources.back();
+                    ++request.source->references;
                 }
             } catch (const Error& error) {
                 auto event = request.event(BatchEventKind::error);
@@ -324,14 +384,10 @@ struct BatchScheduler::Impl {
     }
 
     bool emit_token(Request& request, std::vector<BatchEvent>& events) {
-        const auto logits =
-            request.seq2seq ? request.seq2seq->logits() : std::span<const float>(request.logits);
+        const auto logits = std::span<const float>(request.logits);
         const auto [token, complete] =
-            request.input.constraint
-                ? request.input.constraint(*request.sampler, logits, request.rng)
-                : ConstrainedToken{request.seq2seq ? request.seq2seq->sample(*request.sampler)
-                                                   : request.sampler->select(logits, request.rng),
-                                   false};
+            request.input.constraint ? request.input.constraint(*request.sampler, logits, request.rng)
+                                     : ConstrainedToken{request.sampler->select(logits, request.rng), false};
         auto scores = request.input.top_logprobs
                           ? std::optional(token_logprobs(logits, token, *request.input.top_logprobs))
                           : std::nullopt;
@@ -453,49 +509,115 @@ struct BatchScheduler::Impl {
         remove_active(request);
     }
 
+    void prepare_sources(std::vector<BatchEvent>& events) {
+        std::vector<T5Source*> waiting;
+        std::vector<std::span<const Token>> inputs;
+        const auto budget = std::max(options.context, options.step_tokens);
+        std::size_t rows = 0;
+        for (const auto& request : active) {
+            auto* source = request.source;
+            if (source->cross || std::ranges::find(waiting, source) != waiting.end())
+                continue;
+            if (source->tokens.size() > budget - rows)
+                break;
+            waiting.push_back(source);
+            inputs.emplace_back(source->tokens);
+            rows += source->tokens.size();
+        }
+        if (waiting.empty())
+            return;
+        try {
+            auto encoded = seq2seq->prepare_sources(inputs, &pool);
+            for (std::size_t i = 0; i < waiting.size(); ++i)
+                waiting[i]->cross = std::move(encoded[i]);
+            return;
+        } catch (const Error&) {
+            // A source fitting the individual workspace can exceed it as part of a batch.
+        }
+        for (std::size_t i = 0; i < waiting.size(); ++i) {
+            auto* source = waiting[i];
+            try {
+                source->cross = seq2seq->prepare_sources(std::span(inputs).subspan(i, 1), &pool).front();
+            } catch (const Error& error) {
+                for (auto next = active.begin(); next != active.end();) {
+                    const auto it = next++;
+                    if (it->source != source)
+                        continue;
+                    const bool last = source->references == 1;
+                    fail(it, error, events);
+                    if (last)
+                        break;
+                }
+            }
+        }
+    }
+
     void step_seq2seq(std::vector<BatchEvent>& events) {
-        // A bidirectional source is encoded as a whole. Admit at most one new source per step.
-        auto waiting = active.end();
+        prepare_sources(events);
+        scheduled.clear();
         for (auto next = active.begin(); next != active.end();) {
             const auto it = next++;
-            if (!it->seq2seq) {
-                if (waiting == active.end())
-                    waiting = it;
+            if (!it->source->cross)
                 continue;
-            }
             try {
-                const auto token = *it->pending;
-                it->seq2seq->append(std::span(&token, 1));
-                if (!emit_token(*it, events))
-                    remove_active(it);
+                if (!it->seq2seq)
+                    it->seq2seq.emplace(model.config(), it->capacity, it->source->cross, &pool);
+                it->seq2seq->self.ensure(it->seq2seq->length + 1);
+                scheduled.push_back(it);
             } catch (const Error& error) {
                 fail(it, error, events);
             }
         }
-        if (waiting == active.end())
-            return;
-        try {
-            waiting->seq2seq.emplace(T5Session::create_pooled(model, waiting->input.tokens, waiting->capacity,
-                                                              waiting->input.seed, &pool));
-            if (!emit_token(*waiting, events))
-                remove_active(waiting);
-        } catch (const Error& error) {
-            fail(waiting, error, events);
+        const auto ready = std::span(scheduled);
+        for (std::size_t start = 0; start < ready.size(); start += decode_rows) {
+            const auto tile = ready.subspan(start, std::min(decode_rows, ready.size() - start));
+            t5_steps.clear();
+            for (const auto it : tile)
+                t5_steps.push_back({*it->seq2seq, it->pending.value_or(model.config().bos), it->logits});
+            bool retry = false;
+            try {
+                seq2seq->step(*scratch, t5_steps);
+            } catch (const Error&) {
+                retry = true;
+            }
+            for (std::size_t i = 0; i < tile.size(); ++i) {
+                const auto it = tile[i];
+                try {
+                    if (retry)
+                        seq2seq->step(*scratch, std::span(t5_steps).subspan(i, 1));
+                    if (it->seq2seq->length == 1 && options.prefix_cache) {
+                        ++prefix_lookups;
+                        if (std::exchange(it->source->used, true)) {
+                            ++prefix_hits;
+                            it->cached_prompt_tokens = it->source->tokens.size();
+                            cached_prompt_tokens += it->cached_prompt_tokens;
+                        }
+                    }
+                    if (!emit_token(*it, events))
+                        remove_active(it);
+                } catch (const Error& error) {
+                    fail(it, error, events);
+                }
+            }
         }
     }
 
     Model model;
     BatchOptions options;
     const detail::Decoder* decoder = nullptr;
+    const T5* seq2seq = nullptr;
     detail::CachePagePool pool;
     PrefixCache prefixes;
+    std::list<T5Source> sources;
+    std::list<T5Source>::iterator admission_source;
     std::vector<PrefixCache::Iterator> admission_pages;
     std::unique_ptr<detail::Workspace> scratch;
     Requests queued, active;
     std::vector<Evaluation> evaluations;
+    std::vector<T5::Step> t5_steps;
     std::vector<Requests::iterator> scheduled;
     std::size_t reserved = 0, queued_tokens = 0, queue_bypasses = 0;
-    std::size_t prefix_page_bytes = 0;
+    std::size_t prefix_page_bytes = 0, decode_rows = 0;
     std::size_t prefix_lookups = 0, prefix_hits = 0, cached_prompt_tokens = 0;
 };
 

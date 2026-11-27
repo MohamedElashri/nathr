@@ -45,6 +45,8 @@ KernelChoice select_kernel(DType type, ExecutionPolicy policy, CpuFeatures featu
         case DType::q4_0:
             return {x86::q4_0_dot, "avx2-q4_0", nullptr, x86::q4_0_batch};
         default:
+            if (const auto kernel = x86::k_kernel(type); kernel.dot)
+                return kernel;
             break;
         }
     }

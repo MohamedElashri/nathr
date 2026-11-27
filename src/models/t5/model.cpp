@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 
 namespace nathr::detail {
 namespace {
@@ -26,11 +27,14 @@ std::size_t max_distance(const Json& json) {
 
 ModelConfig t5_config(const Json& json, const std::filesystem::path& path) {
     try {
-        if (!json.value("is_encoder_decoder", true) ||
-            json.value("feed_forward_proj", std::string("relu")) != "relu" ||
-            json.value("dense_act_fn", std::string("relu")) != "relu" || json.value("is_gated_act", false) ||
+        const auto projection = json.value("feed_forward_proj", std::string("relu"));
+        const bool gated = projection == "gated-gelu";
+        const std::string activation = gated ? "gelu_new" : "relu";
+        if (!json.value("is_encoder_decoder", true) || (!gated && projection != "relu") ||
+            json.value("dense_act_fn", activation) != activation ||
+            json.value("is_gated_act", gated) != gated ||
             !json.value("pruned_heads", Json::object()).empty()) {
-            throw Error(ErrorCode::unsupported, path.string() + ": expected an original ReLU T5 model");
+            throw Error(ErrorCode::unsupported, path.string() + ": expected a ReLU or gated-GELU T5 model");
         }
         const auto encoder_layers = field(json, "num_layers");
         const auto decoder_layers = json.find("num_decoder_layers");
@@ -66,7 +70,8 @@ ModelConfig t5_config(const Json& json, const std::filesystem::path& path) {
 
 T5::T5(SafeTensors& file, const std::filesystem::path& path, const ModelConfig& c, const Json& json,
        CpuBackend& backend)
-    : config_(c), backend_(backend), buckets_(buckets(json)), max_distance_(max_distance(json)) {
+    : config_(c), backend_(backend), buckets_(buckets(json)), max_distance_(max_distance(json)),
+      gated_(json.value("feed_forward_proj", std::string("relu")) == "gated-gelu") {
     const auto h = c.hidden, f = c.intermediate;
     const auto inner = product({c.query_heads, c.head_dim}, "T5 attention width");
     const auto take = [&](std::string_view name, std::initializer_list<std::size_t> shape) {
@@ -110,8 +115,11 @@ T5::T5(SafeTensors& file, const std::filesystem::path& path, const ModelConfig& 
             weights.self = attention(layer + "0.", "SelfAttention");
             if (decoder)
                 weights.cross = attention(layer + "1.", "EncDecAttention");
-            weights.ff = {take(ff + "layer_norm.weight", {h}), take(ff + "DenseReluDense.wi.weight", {f, h}),
-                          take(ff + "DenseReluDense.wo.weight", {h, f})};
+            const auto dense = ff + "DenseReluDense.";
+            weights.ff = {take(ff + "layer_norm.weight", {h}),
+                          take(dense + (gated_ ? "wi_0.weight" : "wi.weight"), {f, h}),
+                          take(dense + "wo.weight", {h, f}),
+                          gated_ ? take(dense + "wi_1.weight", {f, h}) : TensorView{}};
             layers.push_back(weights);
         }
     };
@@ -129,10 +137,12 @@ T5::T5(SafeTensors& file, const std::filesystem::path& path, const ModelConfig& 
 }
 
 struct T5::Scratch final : Workspace {
-    Scratch(const ModelConfig& c, std::size_t rows, std::size_t positions)
-        : count(rows), inner(product({c.query_heads, c.head_dim}, "T5 attention width")) {
-        const auto hidden_rows = product({count, c.hidden}, "T5 hidden workspace");
-        const auto attention_rows = product({count, inner}, "T5 attention workspace");
+    Scratch(const ModelConfig& c, std::size_t rows, std::size_t positions, bool gated, bool decode)
+        : count(rows), inner(product({c.query_heads, c.head_dim}, "T5 attention width")),
+          bias_stride(product({c.query_heads, positions}, "T5 position bias row")) {
+        const auto hidden_rows = product({rows, c.hidden}, "T5 hidden workspace");
+        const auto attention_rows = product({rows, inner}, "T5 attention workspace");
+        const auto ff_rows = product({rows, c.intermediate}, "T5 feed-forward workspace");
         allocate({{&hidden, hidden_rows},
                   {&norm, hidden_rows},
                   {&projected, hidden_rows},
@@ -140,26 +150,30 @@ struct T5::Scratch final : Workspace {
                   {&key, attention_rows},
                   {&value, attention_rows},
                   {&attended, attention_rows},
-                  {&ff, product({count, c.intermediate}, "T5 feed-forward workspace")},
-                  {&packed, count == 1 ? 0
-                                       : product({batch_tile, std::max({c.hidden, c.intermediate, inner})},
-                                                 "T5 matrix tile workspace")},
-                  {&bias, product({c.query_heads, positions}, "T5 position bias workspace")},
-                  {&scores, positions}});
+                  {&ff, ff_rows},
+                  {&up, gated ? ff_rows : 0},
+                  {&packed, rows == 1 ? 0
+                                      : product({batch_tile, std::max({c.hidden, c.intermediate, inner})},
+                                                "T5 matrix tile workspace")},
+                  {&bias, product({decode ? rows : 1, bias_stride}, "T5 position bias workspace")},
+                  {&scores, positions},
+                  {&logits, decode && rows > 1 ? product({rows, c.vocabulary}, "T5 logits workspace") : 0}});
     }
-    const std::size_t count, inner;
-    std::span<float> hidden, norm, projected, query, key, value, attended, ff, bias;
-};
 
-struct T5::State {
-    State(const ModelConfig& c, std::size_t source_length, std::size_t capacity, CachePagePool* pool)
-        : scratch(c, 1, std::max(source_length, capacity)), self(c, capacity, KvPrecision::f32, pool),
-          source(c, source_length, KvPrecision::f32, pool), logits(c.vocabulary) {}
+    void resize(const ModelConfig& c, std::size_t rows) {
+        for (auto* buffer : {&hidden, &norm, &projected})
+            *buffer = std::span(buffer->data(), rows * c.hidden);
+        for (auto* buffer : {&query, &key, &value, &attended})
+            *buffer = std::span(buffer->data(), rows * inner);
+        ff = std::span(ff.data(), rows * c.intermediate);
+        if (!up.empty())
+            up = std::span(up.data(), rows * c.intermediate);
+        count = rows;
+    }
 
-    Scratch scratch;
-    Cache self, source;
-    std::vector<float> logits;
-    std::size_t length = 0;
+    std::size_t count;
+    const std::size_t inner, bias_stride;
+    std::span<float> hidden, norm, projected, query, key, value, attended, ff, up, bias;
 };
 
 void T5::project(Scratch& w, TensorView weight, std::span<const float> input, std::span<float> output) const {
@@ -180,14 +194,21 @@ void T5::project_attention(Scratch& w, const Attention& weights) const {
 
 void T5::feed_forward(Scratch& w, const FeedForward& weights) const {
     normalize(w, weights.norm);
-    project(w, weights.input, w.norm, w.ff);
-    for (auto& value : w.ff)
-        value = std::max(value, 0.f);
+    if (gated_) {
+        backend_.project({{weights.input, w.ff}, {weights.up, w.up}}, w.norm, w.count, w.packed);
+        Scalar::gelu(w.ff);
+        for (std::size_t i = 0; i < w.ff.size(); ++i)
+            w.ff[i] *= w.up[i];
+    } else {
+        project(w, weights.input, w.norm, w.ff);
+        for (auto& value : w.ff)
+            value = std::max(value, 0.f);
+    }
     project(w, weights.output, w.ff, w.projected);
     Scalar::add(w.hidden, w.projected);
 }
 
-void T5::position_bias(Scratch& w, std::size_t query, std::size_t keys, bool bidirectional) const {
+void T5::position_bias(std::span<float> bias, std::size_t query, std::size_t keys, bool bidirectional) const {
     const auto count = bidirectional ? buckets_ / 2 : buckets_;
     const auto exact = count / 2;
     const auto heads = config_.query_heads;
@@ -204,20 +225,32 @@ void T5::position_bias(Scratch& w, std::size_t query, std::size_t keys, bool bid
         if (bidirectional && i > query)
             bucket += count;
         for (std::size_t head = 0; head < heads; ++head)
-            w.bias[head * keys + i] = table[bucket * heads + head];
+            bias[head * keys + i] = table[bucket * heads + head];
     }
 }
 
-void T5::encode(std::span<const Token> tokens, Scratch& w) const {
-    for (std::size_t i = 0; i < tokens.size(); ++i)
-        Scalar::embedding(embedding_, tokens[i], row(w.hidden, config_.hidden, i));
+void T5::encode(std::span<const std::span<const Token>> inputs, Scratch& w) const {
+    std::size_t index = 0;
+    for (const auto tokens : inputs) {
+        for (const auto token : tokens)
+            Scalar::embedding(embedding_, token, row(w.hidden, config_.hidden, index++));
+    }
     for (const auto& layer : encoder_) {
         const auto& weights = layer.self;
         project_attention(w, weights);
-        for (std::size_t i = 0; i < tokens.size(); ++i) {
-            position_bias(w, i, tokens.size(), true);
-            Scalar::attention_range(config_, 0, nullptr, w.key, w.value, row(w.query, w.inner, i),
-                                    row(w.attended, w.inner, i), w.scores, 1.0, w.bias);
+        std::size_t start = 0;
+        // Rows share projections, while bidirectional attention stays inside each source.
+        for (const auto tokens : inputs) {
+            const auto size = tokens.size();
+            const auto keys = w.key.subspan(start * w.inner, size * w.inner);
+            const auto values = w.value.subspan(start * w.inner, size * w.inner);
+            for (std::size_t i = 0; i < size; ++i) {
+                position_bias(w.bias, i, size, true);
+                Scalar::attention_range(config_, 0, nullptr, keys, values, row(w.query, w.inner, start + i),
+                                        row(w.attended, w.inner, start + i), w.scores.first(size), 1.0,
+                                        w.bias);
+            }
+            start += size;
         }
         project(w, weights.output, w.attended, w.projected);
         Scalar::add(w.hidden, w.projected);
@@ -226,47 +259,68 @@ void T5::encode(std::span<const Token> tokens, Scratch& w) const {
     normalize(w, encoder_norm_);
 }
 
-std::unique_ptr<T5::State> T5::start(std::span<const Token> tokens, std::size_t capacity,
-                                     CachePagePool* pool) const {
-    const auto bytes =
-        Cache::required_bytes(config_, sum(tokens.size(), capacity, "T5 cache positions"), KvPrecision::f32);
-    if (bytes > max_kv_cache_bytes)
-        throw Error(ErrorCode::resource_limit, "T5 self-attention and cross-attention caches exceed 512 MiB");
-    Scratch encoder(config_, tokens.size(), tokens.size());
-    encode(tokens, encoder);
-    auto state = std::make_unique<State>(config_, tokens.size(), capacity, pool);
-    state->source.ensure(tokens.size());
-    state->self.ensure(1);
+std::vector<T5::Source> T5::prepare_sources(std::span<const std::span<const Token>> inputs,
+                                            CachePagePool* pool) const {
+    std::size_t rows = 0, positions = 0;
+    for (const auto tokens : inputs) {
+        rows = sum(rows, tokens.size(), "T5 source batch rows");
+        positions = std::max(positions, tokens.size());
+    }
+    Scratch encoder(config_, rows, positions, gated_, false);
+    encode(inputs, encoder);
+    std::vector<std::shared_ptr<Cache>> caches;
+    caches.reserve(inputs.size());
+    for (const auto tokens : inputs) {
+        auto cache = std::make_shared<Cache>(config_, tokens.size(), KvPrecision::f32, pool);
+        cache->ensure(tokens.size());
+        caches.push_back(std::move(cache));
+    }
     for (std::size_t i = 0; i < decoder_.size(); ++i) {
         const auto& weights = decoder_[i].cross;
         backend_.project({{weights.key, encoder.key}, {weights.value, encoder.value}}, encoder.norm,
                          encoder.count, encoder.packed);
-        for (std::size_t pos = 0; pos < tokens.size(); ++pos)
-            Scalar::store(state->source, i, pos, row(encoder.key, encoder.inner, pos),
-                          row(encoder.value, encoder.inner, pos));
+        std::size_t index = 0;
+        for (auto& cache : caches) {
+            for (std::size_t pos = 0; pos < cache->capacity; ++pos, ++index)
+                Scalar::store(*cache, i, pos, row(encoder.key, encoder.inner, index),
+                              row(encoder.value, encoder.inner, index));
+        }
     }
-    step(*state, config_.bos);
-    return state;
+    return {std::make_move_iterator(caches.begin()), std::make_move_iterator(caches.end())};
 }
 
-void T5::step(State& state, Token token) const {
-    auto& w = state.scratch;
-    const auto pos = state.length;
-    const auto visible = pos + 1;
-    Scalar::embedding(embedding_, token, w.hidden);
-    position_bias(w, pos, visible, false);
+std::unique_ptr<Workspace> T5::workspace(std::size_t rows, std::size_t positions) const {
+    return std::make_unique<Scratch>(config_, rows, positions, gated_, true);
+}
+
+void T5::step(Workspace& scratch, std::span<const Step> steps) const {
+    auto& w = static_cast<Scratch&>(scratch);
+    w.resize(config_, steps.size());
+    for (std::size_t slot = 0; slot < steps.size(); ++slot) {
+        const auto& [state, token, output] = steps[slot];
+        Scalar::embedding(embedding_, token, row(w.hidden, config_.hidden, slot));
+        position_bias(row(w.bias, w.bias_stride, slot), state.length, state.length + 1, false);
+    }
     for (std::size_t i = 0; i < decoder_.size(); ++i) {
         const auto& layer = decoder_[i];
         project_attention(w, layer.self);
-        Scalar::store(state.self, i, pos, w.key, w.value);
-        Scalar::attention_range(config_, i, &state.self, {}, {}, w.query, w.attended, w.scores.first(visible),
-                                1.0, w.bias);
+        for (std::size_t slot = 0; slot < steps.size(); ++slot) {
+            auto& state = steps[slot].state;
+            Scalar::store(state.self, i, state.length, row(w.key, w.inner, slot),
+                          row(w.value, w.inner, slot));
+            Scalar::attention_range(config_, i, &state.self, {}, {}, row(w.query, w.inner, slot),
+                                    row(w.attended, w.inner, slot), w.scores.first(state.length + 1), 1.0,
+                                    row(w.bias, w.bias_stride, slot));
+        }
         project(w, layer.self.output, w.attended, w.projected);
         Scalar::add(w.hidden, w.projected);
         normalize(w, layer.cross.norm);
         project(w, layer.cross.query, w.norm, w.query);
-        Scalar::attention_range(config_, i, &state.source, {}, {}, w.query, w.attended,
-                                w.scores.first(state.source.capacity), 1.0);
+        for (std::size_t slot = 0; slot < steps.size(); ++slot) {
+            const auto& source = steps[slot].state.source;
+            Scalar::attention_range(config_, i, source.get(), {}, {}, row(w.query, w.inner, slot),
+                                    row(w.attended, w.inner, slot), w.scores.first(source->capacity), 1.0);
+        }
         project(w, layer.cross.output, w.attended, w.projected);
         Scalar::add(w.hidden, w.projected);
         feed_forward(w, layer.ff);
@@ -277,10 +331,17 @@ void T5::step(State& state, Token token) const {
         for (auto& value : w.norm)
             value = static_cast<float>(value * scale);
     }
-    project(w, output_, w.norm, state.logits);
-    if (!std::ranges::all_of(state.logits, [](float value) { return std::isfinite(value); }))
+    const bool single = steps.size() == 1;
+    auto logits = single ? steps.front().logits : w.logits.first(steps.size() * config_.vocabulary);
+    project(w, output_, w.norm, logits);
+    if (!std::ranges::all_of(logits, [](float value) { return std::isfinite(value); }))
         throw Error(ErrorCode::backend, "T5 output projection produced non-finite logits");
-    ++state.length;
+    // Publish only once all rows can commit. Retry can overwrite the same self-attention positions.
+    for (std::size_t slot = 0; slot < steps.size(); ++slot) {
+        if (!single)
+            std::ranges::copy(row(logits, config_.vocabulary, slot), steps[slot].logits.begin());
+        ++steps[slot].state.length;
+    }
 }
 
 } // namespace nathr::detail
@@ -290,12 +351,25 @@ using namespace detail;
 
 struct T5Session::Impl {
     Impl(const Model& model, const T5& decoder, std::span<const Token> source, std::size_t capacity,
-         std::uint64_t seed, CachePagePool* pool)
-        : model(model), decoder(decoder), state(decoder.start(source, capacity, pool)), rng(seed) {}
+         std::uint64_t seed)
+        : model(model), decoder(decoder),
+          state(model.config(), capacity, decoder.prepare_sources(std::span(&source, 1)).front(), nullptr),
+          scratch(decoder.workspace(1, std::max(source.size(), capacity))), logits(model.config().vocabulary),
+          rng(seed) {
+        state.self.ensure(1);
+        step(model.config().bos);
+    }
+
+    void step(Token token) {
+        const T5::Step input{state, token, logits};
+        decoder.step(*scratch, std::span(&input, 1));
+    }
 
     Model model;
     const T5& decoder;
-    std::unique_ptr<T5::State> state;
+    T5::State state;
+    std::unique_ptr<Workspace> scratch;
+    std::vector<float> logits;
     std::mt19937_64 rng;
     bool valid = true;
 };
@@ -307,11 +381,6 @@ T5Session& T5Session::operator=(T5Session&&) noexcept = default;
 
 T5Session T5Session::create(const Model& model, std::span<const Token> source, std::size_t capacity,
                             std::uint64_t seed) {
-    return create_pooled(model, source, capacity, seed, nullptr);
-}
-
-T5Session T5Session::create_pooled(const Model& model, std::span<const Token> source, std::size_t capacity,
-                                   std::uint64_t seed, CachePagePool* pool) {
     const auto* decoder = std::get_if<std::unique_ptr<T5>>(&model.impl_->execution);
     if (!decoder)
         throw Error(ErrorCode::unsupported, "T5Session requires a T5 model");
@@ -321,24 +390,28 @@ T5Session T5Session::create_pooled(const Model& model, std::span<const Token> so
         capacity = config.context;
     if (capacity > config.context)
         throw Error(ErrorCode::invalid_argument, "T5 decoder capacity exceeds model limit");
-    return T5Session(std::make_unique<Impl>(model, **decoder, source, capacity, seed, pool));
+    const auto bytes =
+        Cache::required_bytes(config, sum(source.size(), capacity, "T5 cache positions"), KvPrecision::f32);
+    if (bytes > max_kv_cache_bytes)
+        throw Error(ErrorCode::resource_limit, "T5 self-attention and cross-attention caches exceed 512 MiB");
+    return T5Session(std::make_unique<Impl>(model, **decoder, source, capacity, seed));
 }
 
 void T5Session::append(std::span<const Token> tokens) {
     if (!impl_->valid)
         throw Error(ErrorCode::invalid_argument, "T5 session is invalid");
     validate_tokens(tokens, impl_->model.config(), capacity() - length());
-    impl_->state->self.ensure(length() + tokens.size());
+    impl_->state.self.ensure(length() + tokens.size());
     impl_->valid = false;
     for (const auto token : tokens)
-        impl_->decoder.step(*impl_->state, token);
+        impl_->step(token);
     impl_->valid = true;
 }
 
 std::span<const float> T5Session::logits() const {
     if (!impl_->valid)
         throw Error(ErrorCode::invalid_argument, "T5 logits are unavailable");
-    return impl_->state->logits;
+    return impl_->logits;
 }
 
 Token T5Session::sample(Sampler& sampler) {
@@ -346,11 +419,11 @@ Token T5Session::sample(Sampler& sampler) {
 }
 
 std::size_t T5Session::length() const noexcept {
-    return impl_->state->length;
+    return impl_->state.length;
 }
 
 std::size_t T5Session::capacity() const noexcept {
-    return impl_->state->self.capacity;
+    return impl_->state.self.capacity;
 }
 
 } // namespace nathr

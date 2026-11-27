@@ -155,7 +155,7 @@ struct Scalar {
                           std::span<const float> keys, std::span<const float> values,
                           std::span<const float> query, std::span<float> output, std::span<float> scores);
     // Scores cover exactly the visible keys. Optional bias has one row per query head.
-    static void attention_range(const ModelConfig& config, std::size_t layer, Cache* cache,
+    static void attention_range(const ModelConfig& config, std::size_t layer, const Cache* cache,
                                 std::span<const float> keys, std::span<const float> values,
                                 std::span<const float> query, std::span<float> output,
                                 std::span<float> scores, double scale, std::span<const float> bias = {});

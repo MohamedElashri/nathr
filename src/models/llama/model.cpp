@@ -41,13 +41,14 @@ RotaryWorkspace::RotaryWorkspace(const ModelConfig& c, std::size_t positions, st
 struct LayerWeights {
     TensorView input_norm, q, k, v, o, post_attention_norm, gate, up, down;
     TensorView query_norm{}, key_norm{};
+    TensorView query_bias{}, key_bias{}, value_bias{};
 };
 
 class RotaryDecoder final : public Decoder {
   public:
     template <class File>
     RotaryDecoder(File& file, const std::filesystem::path& path, const ModelConfig& config,
-                  CpuBackend& backend, bool qwen3 = false);
+                  CpuBackend& backend, std::string_view architecture = "llama");
     std::unique_ptr<Workspace> workspace(std::size_t positions, std::size_t block) const override {
         return std::make_unique<RotaryWorkspace>(config, positions, block);
     }
@@ -64,7 +65,7 @@ class RotaryDecoder final : public Decoder {
 
 template <class File>
 RotaryDecoder::RotaryDecoder(File& file, const std::filesystem::path& path, const ModelConfig& c,
-                             CpuBackend& cpu, bool qwen3)
+                             CpuBackend& cpu, std::string_view architecture)
     : config(c), backend(cpu) {
     constexpr bool gguf = std::is_same_v<File, Gguf>;
     const auto h = config.hidden;
@@ -100,9 +101,20 @@ RotaryDecoder::RotaryDecoder(File& file, const std::filesystem::path& path, cons
             take(prefix + (gguf ? "ffn_gate.weight" : "mlp.gate_proj.weight"), {ff, h}),
             take(prefix + (gguf ? "ffn_up.weight" : "mlp.up_proj.weight"), {ff, h}),
             take(prefix + (gguf ? "ffn_down.weight" : "mlp.down_proj.weight"), {h, ff})};
-        if (qwen3) {
+        if (architecture == "qwen3") {
             layer.query_norm = take(prefix + "attn_q_norm.weight", {config.head_dim});
             layer.key_norm = take(prefix + "attn_k_norm.weight", {config.head_dim});
+        } else if (architecture == "qwen2") {
+            const auto bias = [&](std::string_view suffix, std::size_t width) {
+                const auto weight = take(prefix + std::string(suffix), {width});
+                if (encoding(weight.desc.dtype)->elements != 1)
+                    throw Error(ErrorCode::unsupported,
+                                path.string() + ": Qwen2 attention biases must be dense");
+                return weight;
+            };
+            layer.query_bias = bias("attn_q.bias", query_width);
+            layer.key_bias = bias("attn_k.bias", kv);
+            layer.value_bias = bias("attn_v.bias", kv);
         } else if constexpr (gguf) {
             layer.q.rotary_head_width = layer.k.rotary_head_width = config.head_dim;
         }
@@ -189,6 +201,11 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
                 normalize_heads(weights.query_norm, q);
                 normalize_heads(weights.key_norm, k);
             }
+            if (!weights.query_bias.bytes.empty()) {
+                Scalar::add_bias(q, weights.query_bias);
+                Scalar::add_bias(k, weights.key_bias);
+                Scalar::add_bias(v, weights.value_bias);
+            }
             e.record("q_before_rope", layer, i, q);
             e.record("k_before_rope", layer, i, k);
             e.record("value", layer, i, v);
@@ -248,8 +265,9 @@ std::unique_ptr<Decoder> load_llama(SafeTensors& file, const std::filesystem::pa
 }
 
 std::unique_ptr<Decoder> load_gguf_decoder(Gguf& file, const std::filesystem::path& path,
-                                           const ModelConfig& config, CpuBackend& backend, bool qwen3) {
-    return std::make_unique<RotaryDecoder>(file, path, config, backend, qwen3);
+                                           const ModelConfig& config, CpuBackend& backend,
+                                           std::string_view architecture) {
+    return std::make_unique<RotaryDecoder>(file, path, config, backend, architecture);
 }
 
 } // namespace nathr::detail

@@ -109,6 +109,12 @@ std::optional<ChatFormat> chat_format(const std::filesystem::path& path, const M
         (digest == "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361" ||
          digest == "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5"))
         return ChatFormat{ChatStyle::qwen3};
+    // These Qwen2 templates differ only in the tool-call example.
+    if (model.architecture() == "qwen2" &&
+        (digest == "d5495a1e5db0611132a97e46a65dbb64a642a499421228b9c8b93229097fa9a4" ||
+         digest == "cd8e9439f0570856fd70470bf8889ebd8b5d1107207f67a5efb46e342330527f"))
+        return ChatFormat{ChatStyle::qwen2,
+                          "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."};
     if (digest == "66291cf0045c2425a3a667cf3cbb7af2b11f09e025c02f97245323ab79119362")
         return ChatFormat{ChatStyle::zephyr};
 
@@ -138,6 +144,7 @@ std::string render_chat(const Json& messages, const std::optional<ChatFormat>& f
     if (!messages.is_array() || messages.empty())
         throw Error(ErrorCode::invalid_argument, "messages must be a nonempty array");
     const bool qwen3 = format->style == ChatStyle::qwen3;
+    const bool qwen = qwen3 || format->style == ChatStyle::qwen2;
     const bool zephyr = format->style == ChatStyle::zephyr;
     constexpr std::string_view zephyr_delimiters[] = {"<s>", "</s>", "<|system|>", "<|user|>",
                                                       "<|assistant|>"};
@@ -149,7 +156,7 @@ std::string render_chat(const Json& messages, const std::optional<ChatFormat>& f
         const auto contains = [&](std::string_view tag) { return text.find(tag) != text.npos; };
         if ((zephyr && std::ranges::any_of(zephyr_delimiters, contains)) ||
             (!zephyr && (contains("<|im_start|>") || contains("<|im_end|>"))) ||
-            (qwen3 && std::ranges::any_of(qwen_delimiters, contains)))
+            (qwen && std::ranges::any_of(qwen_delimiters, contains)))
             throw Error(ErrorCode::invalid_argument, "message text contains a reserved chat delimiter");
         const auto size = detail::sum(text.size(), role.size() + 24, "chat prompt");
         if (size > detail::mib - prompt.size())
@@ -167,9 +174,9 @@ std::string render_chat(const Json& messages, const std::optional<ChatFormat>& f
         const auto& message = messages[i];
         const auto role = message.at("role").get<std::string>();
         const auto text = message.at("content").get<std::string>();
-        if (qwen3 && (!message.value("tool_calls", Json{}).is_null() ||
-                      !message.value("reasoning_content", Json{}).is_null()))
-            throw Error(ErrorCode::unsupported, "Qwen3 chat supports plain-text messages");
+        if (qwen && (!message.value("tool_calls", Json{}).is_null() ||
+                     !message.value("reasoning_content", Json{}).is_null()))
+            throw Error(ErrorCode::unsupported, "Qwen chat supports plain-text messages");
         if (!i && role == "system") {
             append(role, text);
             continue;
@@ -205,8 +212,10 @@ RequestDefaults request_defaults(const std::filesystem::path& path, const Model&
     RequestDefaults result;
     result.sampling.greedy = greedy;
     result.chat = chat_format(path, model, chat_override);
-    if (result.chat && result.chat->style == ChatStyle::qwen3 && model.architecture() == "qwen3")
-        result.stop_ids.push_back(model.config().bos); // Qwen3 checkpoints use <|endoftext|> as an extra EOS.
+    if (result.chat && ((result.chat->style == ChatStyle::qwen3 && model.architecture() == "qwen3") ||
+                        result.chat->style == ChatStyle::qwen2))
+        result.stop_ids.push_back(
+            model.config().bos); // <|endoftext|> is an extra EOS in these Qwen templates.
     if (!model.supports_generation() || !detail::is_model_directory(path))
         return result;
 

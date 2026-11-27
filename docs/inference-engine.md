@@ -193,7 +193,7 @@ Look up each emitted ID's byte sequence and pass it to an incremental UTF-8 deco
 
 ### Schedule multiple requests
 
-The scheduler gives active requests one decode token per step, then divides the remaining token budget among prompt chunks. The causal decoder packs scheduled rows into shared projection calls. Each row carries its absolute position and its request’s KV table, so it attends only to the visible rows of its own sequence. T5 encodes one whole source as a scheduling unit. [Batch scheduler](../src/runtime/batch.cpp) · [Decoder input rows](../src/models/decoder.hpp)
+The scheduler gives active requests one decode token per step, then divides the causal decoder’s remaining token budget among prompt chunks. The decoder packs scheduled rows into shared projection calls. Each row carries its absolute position and its request’s KV table, so it attends only to the visible rows of its own sequence. T5 also batches projection calls across whole source sequences and across requests ready to decode. [Batch scheduler](../src/runtime/batch.cpp) · [Decoder input rows](../src/models/decoder.hpp)
 
 Admission reserves each request’s private KV capacity and charges shared prefix pages once across active readers. A shared page stays reserved until its last reader leaves. FIFO is the default. A configured bypass limit lets fitting requests pass a memory-blocked queue head. [Batch scheduler](../src/runtime/batch.cpp) · [KV page pool](../src/backend/cpu/scalar.hpp)
 
@@ -257,7 +257,7 @@ Both Llama fixture calls return 23 logits and a greedy ID of `2`. Compare their 
 
 Once the numeric path agrees, try the CLI examples with full SmolLM2 and GPT-2 checkpoints. Reuse the prompt IDs returned by `tokenize` for reproducible forward comparisons. The `bench` command uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [CLI examples](../README.md#cli-examples)
 
-The compatibility checker verifies SHA-256 hashes, token IDs, sampled tensor values, and seeded generation across standalone and batched execution where supported. Transformers 4.57.6 supplies the dense tensor and two-turn chat reference values. SmolLM2 GGUF tensor values and seeded samples come from Nathr. Qwen3 and TinyLlama GGUF token IDs, sampled logits, and chat prompt IDs come from llama.cpp 1.1.0. The optional mixed-length GGUF benchmark reports short-request time to first token, p95 inter-token latency, output throughput, and KV memory for one and three active requests. [Run the compatibility checker](usage.md#check-model-compatibility) · [Reference values](../tests/checkpoints.json)
+The compatibility checker verifies SHA-256 hashes, token IDs, sampled tensor values, and seeded generation across standalone and batched execution where supported. Transformers 4.57.6 supplies the dense tensor and two-turn chat reference values. SmolLM2 GGUF tensor values and seeded samples come from Nathr. Qwen2.5, Qwen3, and TinyLlama GGUF token IDs, sampled logits, and chat prompt IDs come from llama.cpp 1.1.0. The optional mixed-length GGUF benchmark reports short-request time to first token, p95 inter-token latency, output throughput, and KV memory for one and three active requests. [Run the compatibility checker](usage.md#check-model-compatibility) · [Reference values](../tests/checkpoints.json)
 
 ## 9. Bring up a second checkpoint
 
@@ -273,6 +273,8 @@ BERT learns a position embedding for each input position. Each layer projects th
 
 T5's encoder also sees the full input. Its self-attention adds a learned bias based on the bucketed distance between each query and key. During decoding, each layer reads two sets of keys and values. The causal self-attention cache grows with each decoder token. The cross-attention cache is projected once per decoder layer from the final encoder output. The decoder begins with the configured start token and uses the same sampling loop as the decoder-only models. [T5 model](../src/models/t5/model.cpp) · [T5 paper](https://jmlr.org/papers/volume21/20-074/20-074.pdf)
 
+A worker can share the immutable cross-attention cache when complete source token IDs match. The source uses the same KV budget as the per-request decoder caches, and the worker can evict it after the final reader leaves. A suffix change can alter every encoder position because attention is bidirectional. T5 cache hits report the full source length in cached prompt tokens. [Batch scheduler](../src/runtime/batch.cpp)
+
 ### Expose checkpoint outputs
 
 Use a tensor name and shape as the common inference contract. A checkpoint describes which outputs exist and how many input tokens they take. A BERT checkpoint can expose all hidden states or bind weights for its pooler and a classification head. Sentence Transformers checkpoints describe extra pooling and normalization in their module configuration. T5 logits are indexed by decoder position and can be compared using an explicit decoder prefix. Generation wraps logits with a sampling loop and request state. [Model inference API](../include/nathr/nathr.hpp) · [Output examples](../README.md#cli-examples)
@@ -284,16 +286,17 @@ Nathr reads dimensions, attention head counts, context length, and boundary toke
 | Architecture | Supported configuration |
 | --- | --- |
 | Llama-style | GGUF v3 or Safetensors with RMSNorm, SwiGLU, unscaled full-width RoPE, and bias-free projections |
+| Qwen2 | Dense GGUF v3 with Q/K/V projection biases and unscaled, full-width RoPE. The pinned checkpoint is Qwen2.5-0.5B-Instruct Q4_K_M |
 | Qwen3 | Dense GGUF v3 with per-head query and key RMSNorm and unscaled, full-width RoPE. The pinned checkpoints are Qwen3-0.6B Q8_0 and Qwen3-1.7B Q3_K_M |
 | GPT-2 | Safetensors with learned positions, affine LayerNorm, and the GPT-2 GELU variant |
 | BERT | Safetensors with absolute position embeddings and GELU. Uses unpadded inputs and optional segment IDs. Outputs depend on the checkpoint's heads and pooling modules |
-| T5 | Safetensors for original ReLU T5. The decoder uses FP32 caches. The source and decoder are each limited to 512 positions or the checkpoint context, whichever is smaller |
+| T5 | Safetensors for ReLU T5 and gated-GELU FLAN-T5. The decoder uses FP32 caches. The source and decoder are each limited to 512 positions or the checkpoint context, whichever is smaller |
 
-The built-in tokenizers cover byte-level BPE, GGUF SentencePiece BPE with byte fallback, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering recognizes SmolLM2 ChatML, Zephyr-style TinyLlama, and both pinned Qwen3 templates in non-thinking mode. Select a supported format explicitly with `--chat-format` when the checkpoint template is absent or unrecognized. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)
+The built-in tokenizers cover byte-level BPE, GGUF SentencePiece BPE with byte fallback, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering recognizes SmolLM2 ChatML, Zephyr-style TinyLlama, Qwen2.5 ChatML, and both pinned Qwen3 templates in non-thinking mode. Select a supported format explicitly with `--chat-format` when the checkpoint template is absent or unrecognized. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)
 
 ## CPU measurements
 
-Local run on an AMD Ryzen 7 7735HS, using four pinned physical cores and AVX2 dispatch. Each native benchmark used a 64-token synthetic prompt, 16 decode tokens, a 512-token context, and a prefill chunk of 16. The command ran one warmup and three measured repetitions. First-logits latency is the median prefill time. Peak RSS is the native process high-water mark, including resident model weights.
+The v0.8.0 baseline ran on an AMD Ryzen 7 7735HS, using four pinned physical cores and AVX2 dispatch. Each native benchmark used a 64-token synthetic prompt, 16 decode tokens, a 512-token context, and a prefill chunk of 16. The command ran one warmup and three measured repetitions. First-logits latency is the median prefill time. Peak RSS is the native process high-water mark, including resident model weights.
 
 | Checkpoint | First logits | Prefill tok/s | Decode tok/s | Peak RSS |
 | --- | ---: | ---: | ---: | ---: |
@@ -312,6 +315,17 @@ taskset -c 8,10,12,14 nathr bench "$model" --backend avx2 --threads 4 \
 ```
 
 Choose four physical cores for your machine. The timings describe one local run with the host's ordinary clock settings. Prefill variability across repetitions ranged from 2% to 19% by coefficient of variation. The native benchmark includes the individual samples.
+
+### AVX2 K-quant projection
+
+The Q2_K through Q6_K kernels unpack weights in vector registers and accumulate products in FP64. Batched projections reuse the unpacked block across input rows. [AVX2 kernels](../src/backend/cpu/x86/avx2.cpp)
+
+A separate comparison used the released v0.8.0 binary and the AVX2 K-quant build on the same four cores. Both used a 32-token prompt, eight decode tokens, context 256, one warmup, and three measured repetitions.
+
+| Checkpoint | v0.8.0 decode tok/s | AVX2 K-quant decode tok/s | Peak RSS |
+| --- | ---: | ---: | ---: |
+| TinyLlama-1.1B Q4_K_M | 2.20 | 8.30 | 615 MiB |
+| Qwen3-1.7B Q3_K_M | 1.36 | 5.15 | 929 MiB |
 
 A loopback server run used Qwen3-0.6B with context 512, a 64 MiB KV budget, and four CPU threads. Each trial warmed four requests, then ran 12 requests at concurrency four with 128 prompt tokens, up to 16 output tokens, and seed 43. All requests completed.
 

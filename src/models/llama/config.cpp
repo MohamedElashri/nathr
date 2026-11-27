@@ -83,8 +83,9 @@ ModelConfig load_gguf_decoder_config(const Gguf& file) {
     try {
         const auto name = architecture.value("general.architecture", std::string{});
         const bool qwen3 = name == "qwen3";
-        if (!qwen3 && name != "llama")
-            throw Error(ErrorCode::unsupported, path + ": expected a GGUF Llama or Qwen3 architecture");
+        if (!qwen3 && name != "qwen2" && name != "llama")
+            throw Error(ErrorCode::unsupported,
+                        path + ": expected a GGUF Llama, Qwen2, or Qwen3 architecture");
         const auto prefix = name + ".";
         const auto field = [&](std::string_view key) {
             const auto qualified = prefix + std::string(key);

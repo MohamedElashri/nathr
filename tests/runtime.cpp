@@ -881,19 +881,84 @@ void encoder_models() {
     for (std::size_t i = 0; i < target.size(); ++i)
         compare(std::span(evaluated.values).subspan(i * t5.config().vocabulary, t5.config().vocabulary),
                 logits.at(i), 2e-5);
-    BatchScheduler scheduler(t5);
-    scheduler.submit({1, source, 5, 0, {}});
-    scheduler.submit({2, source, 5, 0, {}});
-    std::array<std::vector<Token>, 2> scheduled;
-    for (unsigned i = 0; i < 64 && !scheduler.empty(); ++i) {
-        for (const auto& event : scheduler.step()) {
+    constexpr std::size_t limit = 5;
+    auto different = source;
+    different.back() = 3;
+    const auto bytes = Cache::required_bytes(t5.config(), 1, KvPrecision::f32);
+    BatchOptions options;
+    options.kv_budget_bytes = (2 * source.size() + 3 * limit) * bytes;
+    BatchScheduler scheduler(t5, options);
+    const BatchRequest first{1, source, limit, 0, {}, {}, {}, {}, {}, 2};
+    auto duplicate = first;
+    duplicate.id = 2;
+    auto other_request = first;
+    other_request.id = 3;
+    other_request.tokens = different;
+    scheduler.submit(first);
+    scheduler.submit(duplicate);
+    scheduler.submit(other_request);
+    std::array references{T5Session::create(t5, source, limit), T5Session::create(t5, source, limit),
+                          T5Session::create(t5, different, limit)};
+    std::array<std::size_t, 3> counts{};
+    for (std::size_t step = 0; step < limit && !scheduler.empty(); ++step) {
+        const auto events = scheduler.step();
+        if (!step) {
+            const auto metrics = scheduler.metrics();
+            expect(metrics.active_requests == 3 && metrics.kv_used_bytes == options.kv_budget_bytes &&
+                       metrics.prefix_lookups == 3 && metrics.prefix_hits == 1,
+                   "T5 admits all three requests with two full sources under a shared KV budget");
+        }
+        for (const auto& event : events) {
             expect(event.kind != BatchEventKind::error, event.message);
-            if (event.token)
-                scheduled.at(event.id - 1).push_back(*event.token);
+            expect(event.cached_prompt_tokens == (event.id == 2 ? source.size() : 0),
+                   "T5 only hits on complete identical sources");
+            if (!event.token)
+                continue;
+            auto& reference = references.at(event.id - 1);
+            const auto token = reference.sample(greedy);
+            expect(*event.token == token && event.logprobs.has_value(), "T5 fused decoder token parity");
+            const auto expected = token_logprobs(reference.logits(), token, 2);
+            expect(std::abs(event.logprobs->chosen.logprob - expected.chosen.logprob) < 2e-5,
+                   "T5 fused decoder logprob parity");
+            if (++counts.at(event.id - 1) < limit && token != t5.config().eos)
+                reference.append(std::span(&token, 1));
         }
     }
-    expect(scheduler.empty() && scheduled[0] == emitted && scheduled[1] == emitted,
-           "T5 batch matches standalone");
+    expect(scheduler.empty() && counts[0] == limit && counts[1] == limit && counts[2] > 0,
+           "T5 fused batch drains");
+
+    scheduler.submit(first);
+    (void)scheduler.step();
+    scheduler.submit(duplicate);
+    const auto staggered = scheduler.step();
+    expect(staggered.size() == 2 && staggered[0].emitted == 2 && staggered[1].emitted == 1 &&
+               staggered[0].token == emitted[1] && staggered[1].token == emitted[0],
+           "T5 batches different decoder positions");
+    expect(scheduler.cancel(1).has_value() &&
+               scheduler.metrics().kv_used_bytes == (2 * source.size() + limit) * bytes,
+           "cancellation releases only the cancelled T5 decoder cache");
+    expect(scheduler.cancel(2).has_value() && scheduler.metrics().kv_used_bytes == 2 * source.size() * bytes,
+           "idle T5 sources remain available for reuse");
+
+    options.kv_budget_bytes = (source.size() + limit) * bytes;
+    for (const bool cache : {true, false}) {
+        options.prefix_cache = cache;
+        BatchScheduler bounded(t5, options);
+        for (const auto* request :
+             std::array<const BatchRequest*, 4>{&first, &first, &other_request, &first}) {
+            bounded.submit(*request);
+            while (!bounded.empty()) {
+                for (const auto& event : bounded.step())
+                    expect(event.kind != BatchEventKind::error, event.message);
+            }
+        }
+        const auto metrics = bounded.metrics();
+        expect(metrics.prefix_lookups == (cache ? 4 : 0) && metrics.prefix_hits == (cache ? 1 : 0) &&
+                   metrics.kv_used_bytes == (cache ? source.size() * bytes : 0) &&
+                   bounded.peak_kv_bytes() <= options.kv_budget_bytes &&
+                   bounded.resident_kv_bytes() <= options.kv_budget_bytes,
+               "idle T5 sources evict within the KV budget or release immediately when caching is disabled");
+    }
 }
 
 void checkpoint_outputs() {
@@ -1399,10 +1464,13 @@ void packed_encodings() {
         const auto& entry = atlas.at(format.name);
         const auto& blocks = entry.at("blocks");
         expect(blocks.size() % 2 == 0 && scalar.unpack, "packed fixture row layout");
-        expect(select_kernel(format.type, ExecutionPolicy::automatic, features).name == scalar.name,
-               "observable packed scalar fallback");
+        const auto automatic = select_kernel(format.type, ExecutionPolicy::automatic, features);
+        const bool avx2_k = features.avx2 && format.type >= DType::q2_k && format.type <= DType::q6_k;
+        expect(automatic.name.starts_with(avx2_k ? "avx2-" : "scalar-"), "packed kernel dispatch");
+        expect(select_kernel(format.type, ExecutionPolicy::automatic, {}).name == scalar.name,
+               "packed scalar fallback without AVX2");
         std::vector<std::byte> storage(1);
-        std::vector<float> weights, block(format.elements);
+        std::vector<float> weights, block(format.elements), selected(format.elements);
         for (std::size_t i = 0; i < blocks.size(); ++i) {
             const auto& raw = blocks[i].get_ref<const std::string&>();
             const auto& expected = entry["fp32_le"][i].get_ref<const std::string&>();
@@ -1412,6 +1480,7 @@ void packed_encodings() {
             for (std::size_t j = 0; j < raw.size(); j += 2)
                 storage.push_back(static_cast<std::byte>(std::stoul(raw.substr(j, 2), nullptr, 16)));
             scalar.unpack(storage.data() + start, block.data());
+            automatic.unpack(storage.data() + start, selected.data());
             for (std::size_t j = 0; j < block.size(); ++j) {
                 std::uint32_t bits = 0;
                 for (unsigned b = 0; b < 4; ++b) {
@@ -1420,16 +1489,18 @@ void packed_encodings() {
                 }
                 expect(std::bit_cast<std::uint32_t>(block[j]) == bits,
                        std::string(format.name) + ": FP32 block differs from independent oracles");
+                expect(std::bit_cast<std::uint32_t>(selected[j]) == bits, "selected packed block decoding");
                 weights.push_back(std::bit_cast<float>(bits));
             }
         }
         const auto width = weights.size() / 2;
         const TensorView view{{format.type, {2, width}, 2, weights.size()}, std::span(storage).subspan(1)};
         std::vector<float> decoded(width), activations(width);
-        std::array<float, 2> projected{};
+        std::array<float, 2> projected{}, selected_projection{};
         for (std::size_t i = 0; i < width; ++i)
             activations[i] = static_cast<float>(static_cast<int>(i % 23) - 11) / 12;
         project(scalar, serial, view, activations, projected, 1, {});
+        project(automatic, serial, view, activations, selected_projection, 1, {});
         const auto gamma = width * std::numeric_limits<double>::epsilon() / 2;
         for (std::size_t row = 0; row < 2; ++row) {
             const auto expected = std::span(weights).subspan(row * width, width);
@@ -1443,7 +1514,21 @@ void packed_encodings() {
             }
             const auto rounding = std::abs(dot) * std::numeric_limits<float>::epsilon() / 2 +
                                   std::numeric_limits<float>::denorm_min() / 2.0;
-            close(projected[row], dot, gamma / (1 - gamma) * magnitude + rounding, format.name);
+            const auto tolerance = gamma / (1 - gamma) * magnitude + rounding;
+            close(projected[row], dot, tolerance, format.name);
+            close(selected_projection[row], dot, tolerance, format.name);
+        }
+        if (avx2_k) {
+            std::vector<float> input(width * batch_tile), packed(input.size());
+            for (std::size_t i = 0; i < input.size(); ++i)
+                input[i] = static_cast<float>(static_cast<int>(i % 29) - 14) / 16;
+            for (std::size_t tokens : {2, 3, 5, 16}) {
+                std::vector<float> reference(tokens * 2), results(tokens * 2);
+                auto active_input = std::span(input).first(tokens * width);
+                project(scalar, serial, view, active_input, reference, tokens, packed);
+                project(automatic, serial, view, active_input, results, tokens, packed);
+                expect(reference == results, "packed batched projection parity");
+            }
         }
     }
 }

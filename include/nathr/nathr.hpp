@@ -15,7 +15,6 @@
 namespace nathr {
 
 namespace detail {
-class CachePagePool;
 class LoraWeights;
 } // namespace detail
 
@@ -196,9 +195,6 @@ class T5Session {
     [[nodiscard]] std::size_t capacity() const noexcept;
 
   private:
-    static T5Session create_pooled(const Model& model, std::span<const Token> source, std::size_t capacity,
-                                   std::uint64_t seed, detail::CachePagePool* pool);
-    friend class BatchScheduler;
     struct Impl;
     explicit T5Session(std::unique_ptr<Impl> impl);
     std::unique_ptr<Impl> impl_;

@@ -1,8 +1,10 @@
 #pragma once
 
-#include <cstddef>
+#include "backend/cpu/kernels.hpp"
 
 namespace nathr::detail::x86 {
+
+KernelChoice k_kernel(DType type);
 
 float f32_dot(const std::byte*, const float*, std::size_t);
 float f16_dot(const std::byte*, const float*, std::size_t);

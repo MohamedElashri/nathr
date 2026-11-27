@@ -312,7 +312,7 @@ const auto& decoded_half_values() {
 }
 
 template <class T, class Decode>
-void attend(const ModelConfig& config, std::size_t layer, Cache* cache, std::span<const float> keys,
+void attend(const ModelConfig& config, std::size_t layer, const Cache* cache, std::span<const float> keys,
             std::span<const float> values, std::span<const float> query, std::span<float> output,
             std::span<float> scores, double scale, std::span<const float> bias, Decode decode) {
     const auto width = config.head_dim;
@@ -368,7 +368,7 @@ void Scalar::attention(const ModelConfig& config, std::size_t layer, std::size_t
                     1.0 / std::sqrt(static_cast<double>(config.head_dim)));
 }
 
-void Scalar::attention_range(const ModelConfig& config, std::size_t layer, Cache* cache,
+void Scalar::attention_range(const ModelConfig& config, std::size_t layer, const Cache* cache,
                              std::span<const float> keys, std::span<const float> values,
                              std::span<const float> query, std::span<float> output, std::span<float> scores,
                              double scale, std::span<const float> bias) {

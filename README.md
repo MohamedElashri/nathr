@@ -26,7 +26,7 @@ nathr pull qwen3
 nathr run qwen3 "What is the capital of France?"
 ```
 
-`nathr models` lists checkpoint names and cache status. With `run` or `serve`, a named model downloads on first use. `nathr pull` downloads it ahead of time and prints its local path. Other chat models include `smollm2`, `tinyllama`, and `qwen3-1.7b`. The model defaults to `smollm2`. Omit the prompt to start an interactive session.
+`nathr models` lists checkpoint names and cache status. With `run` or `serve`, a named model downloads on first use. `nathr pull` downloads it ahead of time and prints its local path. Other chat models include `smollm2`, `tinyllama`, `qwen2.5`, and `qwen3-1.7b`. The model defaults to `smollm2`. Omit the prompt to start an interactive session.
 
 The cache lives at `${XDG_CACHE_HOME:-$HOME/.cache}/nathr`. Set `NATHR_MODELS` or pass `--models-dir DIR` to use a different directory.
 
@@ -84,6 +84,12 @@ Use a quantized checkpoint to inspect token IDs and generate a short continuatio
 model=$(nathr pull gguf)
 nathr tokenize "$model" "Once upon a time"
 nathr generate "$model" "Once upon a time" --greedy --max-new-tokens 8 --backend auto --json
+```
+
+Send a plain-text instruction to FLAN-T5 Small.
+
+```sh
+nathr run flan-t5 "What is the capital of Italy?"
 ```
 
 Request a sentence embedding from MiniLM.

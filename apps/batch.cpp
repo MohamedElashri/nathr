@@ -516,9 +516,8 @@ void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions opt
         throw Error(ErrorCode::resource_limit, "checkpoint exceeds 1 GiB");
     const auto weights = static_cast<std::size_t>(file_bytes);
 
-    // A decoder worker can have generation scratch and a transient tensor inference.
+    // Generation scratch can coexist with a source encoder or a tensor inference workspace.
     // BERT's hidden-state buffer can be as large as its scratch.
-    std::size_t workspaces = 2;
     auto kv = options.kv_budget_bytes;
     std::size_t result_count = 1;
     auto vocabulary = detail::max_vocabulary;
@@ -533,13 +532,11 @@ void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions opt
             result_count = 16;
         } else if (type != config.end() && *type == "t5") {
             const auto c = detail::t5_config(config, config_path);
-            // Active decoder scratch, a separate tensor decoder, and one encoder at a time.
-            workspaces = detail::sum(options.max_active, 2, "T5 workspaces");
             const auto tensor_kv = detail::Cache::required_bytes(c, 2 * c.context, KvPrecision::f32);
             kv = detail::sum(kv, std::min(tensor_kv, detail::max_kv_cache_bytes), "worker KV capacity");
         }
     }
-    auto workspace = detail::product({workspaces, detail::max_workspace_bytes}, "worker workspaces");
+    auto workspace = 2 * detail::max_workspace_bytes;
     if (kv) {
         // Cover retained logits and sampler candidates for each active request.
         const auto sampling =

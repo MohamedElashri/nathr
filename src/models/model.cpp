@@ -156,12 +156,12 @@ Model::Impl::Impl(const std::filesystem::path& path, Checkpoint checkpoint, Mode
     case Checkpoint::decoder_gguf: {
         auto& file = std::get<Gguf>(tensors);
         config = load_gguf_decoder_config(file);
-        architecture = file.architecture().at("general.architecture") == "qwen3" ? "qwen3" : "llama";
+        architecture = file.architecture().at("general.architecture").get<std::string>();
         const auto& tokenizer = file.tokenizer();
         const auto format = tokenizer.find("tokenizer.chat_template");
         if (format != tokenizer.end() && format->is_string())
             chat_template = format->get_ref<const std::string&>();
-        execution = load_gguf_decoder(file, path, config, backend, architecture == "qwen3");
+        execution = load_gguf_decoder(file, path, config, backend, architecture);
         break;
     }
     case Checkpoint::llama_safetensors:

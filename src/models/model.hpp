@@ -27,6 +27,6 @@ struct nathr::Model::Impl {
     detail::CpuBackend backend;
     std::variant<std::unique_ptr<detail::Decoder>, std::unique_ptr<detail::Bert>, std::unique_ptr<detail::T5>>
         execution;
-    std::string_view architecture;
+    std::string architecture;
     std::string chat_template;
 };

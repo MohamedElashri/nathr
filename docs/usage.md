@@ -125,6 +125,8 @@ nathr bench "$model" --prompt-length 16 --decode-length 4 --warmups 1 --repetiti
 
 With `nathr serve` running, use `nathr bench --serve --workload mixed --concurrency 4 --requests 16` to measure streaming requests. Use the same `--seed` and restart the server when comparing settings such as `--no-prefix-cache`. `--speculative-tokens 4` enables prompt lookup for unconstrained greedy decoder requests. See [CPU measurements](inference-engine.md#cpu-measurements) for results and commands.
 
+T5 and FLAN-T5 take plain text prompts on `/v1/completions`. Repeated requests with the same source tokens can reuse the source encoding. Pass `--no-prefix-cache` to disable reuse.
+
 ## Build and verify
 
 With the [build prerequisites](../README.md#prerequisites) installed, build and test from the repository root.

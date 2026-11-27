@@ -160,27 +160,44 @@ SubwordTokenizer::SubwordTokenizer(const Json& json) : wordpiece_(json.at("model
             malformed("WordPiece unknown ID");
         unknown_ = found->second;
     } else {
-        if (!vocab.is_array() || model.value("byte_fallback", false) || !type(pre, "Sequence") ||
-            !type(decoder, "Metaspace") || (!normalizer.is_null() && !type(normalizer, "Precompiled")))
+        if (!vocab.is_array() || model.value("byte_fallback", false) || !type(decoder, "Metaspace"))
             unsupported("Unigram pipeline");
-        const auto& stages = pre.at("pretokenizers");
-        if (!stages.is_array() || stages.size() != 2 || !type(stages[0], "WhitespaceSplit") ||
-            !type(stages[1], "Metaspace") || !stages[1].value("split", true))
+        const Json* metaspace = &pre;
+        split_whitespace_ = type(pre, "Sequence");
+        if (split_whitespace_) {
+            const auto& stages = pre.at("pretokenizers");
+            if (!stages.is_array() || stages.size() != 2 || !type(stages[0], "WhitespaceSplit"))
+                unsupported("Unigram pretokenization");
+            metaspace = &stages[1];
+        }
+        if (!type(*metaspace, "Metaspace") || !metaspace->value("split", true))
             unsupported("Unigram pretokenization");
         const auto always = [](const Json& stage) {
             return stage.value("add_prefix_space", true) &&
                    stage.value("prepend_scheme", std::string("always")) == "always";
         };
-        metaspace_ = stages[1].at("replacement").get<std::string>();
+        metaspace_ = metaspace->at("replacement").get<std::string>();
         if (metaspace_.empty() || character(metaspace_, 0).next != metaspace_.size() ||
-            decoder.at("replacement") != metaspace_ || !always(stages[1]) || !always(decoder))
+            decoder.at("replacement") != metaspace_ || !always(*metaspace) || !always(decoder))
             unsupported("Unigram metaspace configuration");
         const auto unk = natural(model.at("unk_id"), "Unigram unknown ID");
         if (unk >= vocab_.size())
             malformed("Unigram unknown ID");
         unknown_ = static_cast<Token>(unk);
-        if (!normalizer.is_null()) {
-            const auto bytes = base64(normalizer.at("precompiled_charsmap").get<std::string>());
+        const Json* table = &normalizer;
+        if (type(normalizer, "Sequence")) {
+            const auto& stages = normalizer.at("normalizers");
+            if (!stages.is_array() || stages.size() != 2 || !type(stages[0], "Precompiled") ||
+                !type(stages[1], "Replace") || stages[1].at("pattern") != Json{{"Regex", " {2,}"}} ||
+                stages[1].at("content") != " ")
+                unsupported("Unigram normalization");
+            table = &stages[0];
+            collapse_spaces_ = true;
+        }
+        if (!table->is_null()) {
+            if (!type(*table, "Precompiled"))
+                unsupported("Unigram normalization");
+            const auto bytes = base64(table->at("precompiled_charsmap").get<std::string>());
             if (bytes.size() < 9)
                 malformed("SentencePiece normalization table");
             const auto data = std::span(bytes);
@@ -376,7 +393,14 @@ std::string SubwordTokenizer::normalize(std::string_view text) const {
     const auto append = [&](std::string_view piece) {
         if (piece.size() > mib - result.size())
             throw Error(ErrorCode::resource_limit, "normalized input exceeds 1 MiB");
-        result.append(piece);
+        if (collapse_spaces_) {
+            for (const char byte : piece) {
+                if (byte != ' ' || result.empty() || result.back() != ' ')
+                    result.push_back(byte);
+            }
+        } else {
+            result.append(piece);
+        }
     };
     auto start = ubrk_first(graphemes.get());
     for (auto end = ubrk_next(graphemes.get()); end != UBRK_DONE; end = ubrk_next(graphemes.get())) {
@@ -419,6 +443,18 @@ std::vector<std::string> SubwordTokenizer::pieces(std::string_view text) const {
             }
         }
     };
+    if (!split_whitespace_) {
+        std::string marked;
+        marked.reserve(normalized.size());
+        for (const char byte : normalized) {
+            if (byte == ' ')
+                marked += metaspace_;
+            else
+                marked.push_back(byte);
+        }
+        add(marked);
+        return parts;
+    }
     const auto source = std::string_view(normalized);
     std::size_t start = 0;
     for (std::size_t i = 0; i < source.size();) {

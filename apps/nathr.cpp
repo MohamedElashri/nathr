@@ -935,7 +935,7 @@ constexpr CommandHelp commands[] = {
      "  --speculative-tokens N        Verify up to 8 prompt lookup drafts in greedy decoding (default 0).\n"
      "  --kv-budget-mib N             Limit KV memory (default 512).\n"
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"
-     "  --no-prefix-cache             Disable sharing of computed decoder KV pages.\n"
+     "  --no-prefix-cache             Disable decoder prefix and T5 source caching.\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
      "  --lora NAME=DIR               Register a PEFT LoRA adapter. Repeat to register more.\n"
      "  --lora-root DIR               Enable runtime loading of adapters beneath this directory.\n"

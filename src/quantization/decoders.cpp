@@ -56,19 +56,6 @@ template <bool affine> void decode_q5(const std::byte* p, float* out) {
     }
 }
 
-struct KScale {
-    unsigned scale, minimum;
-};
-KScale k_scale(const std::byte* p, unsigned group) {
-    const unsigned i = group % 4;
-    const auto lower_scales = byte(p, i);
-    const auto lower_mins = byte(p, 4 + i);
-    if (group < 4)
-        return {lower_scales & 63, lower_mins & 63};
-    const auto packed = byte(p, 8 + i);
-    return {(packed & 15) | ((lower_scales >> 6) << 4), (packed >> 4) | ((lower_mins >> 6) << 4)};
-}
-
 template <bool five> void affine_k(const std::byte* p, float* out) {
     const auto base_scale = half(p, 0);
     const auto base_min = half(p, 2);
@@ -158,10 +145,7 @@ void decode_q3_k(const std::byte* p, float* out) {
     const auto base = half(p, 108);
     const auto* scales = p + 96;
     for (unsigned group = 0; group < 16; ++group) {
-        const auto low = bits(byte(scales, group % 8), 4 * (group / 8), 15);
-        const auto high = bits(byte(scales, 8 + group % 4), 2 * (group / 4), 3);
-        const int scale = static_cast<int>(low | (high << 4)) - 32;
-        const auto d = base * scale;
+        const auto d = base * q3_k_scale(scales, group);
         const auto mask_offset = (group % 2) * 16;
         const auto offset = 32 + (group / 8) * 32 + mask_offset;
         for (unsigned i = 0; i < 16; ++i) {
