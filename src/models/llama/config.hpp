@@ -6,6 +6,6 @@ namespace nathr::detail {
 
 class Gguf;
 ModelConfig load_llama_config(const Json& json, const std::filesystem::path& path);
-ModelConfig load_llama_config(const Gguf& file);
+ModelConfig load_gguf_decoder_config(const Gguf& file);
 
 } // namespace nathr::detail

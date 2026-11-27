@@ -18,8 +18,8 @@ constexpr std::size_t input_limit = detail::mib;
 constexpr Token missing = std::numeric_limits<Token>::max();
 constexpr std::string_view replacement = "\xef\xbf\xbd";
 
-enum class Pretokenizer { byte_level, digits_byte_level, unsupported };
-enum class GgufTokenType : std::size_t { normal = 1, control = 3 };
+enum class Pretokenizer { byte_level, digits_byte_level, qwen2, unsupported };
+enum class GgufTokenType : std::size_t { normal = 1, control = 3, user_defined = 4, unused = 5 };
 
 enum class Utf8Status { valid, invalid, incomplete };
 struct Codepoint {
@@ -139,20 +139,27 @@ std::string_view slice(std::string_view text, std::span<const Unit> codepoints, 
     return text.substr(codepoints[begin].byte, codepoints[end].byte - codepoints[begin].byte);
 }
 
+std::size_t contraction_length(std::string_view text, bool fold_case) {
+    constexpr std::array<std::string_view, 7> contractions{"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
+    if (!text.starts_with('\''))
+        return 0;
+    for (const auto contraction : contractions) {
+        const auto same = [&](char input, char lower) {
+            return input == lower ||
+                   (fold_case && input >= 'A' && input <= 'Z' && input + ('a' - 'A') == lower);
+        };
+        if (contraction.size() <= text.size() &&
+            std::ranges::equal(contraction, text.substr(0, contraction.size()),
+                               [&](char lower, char input) { return same(input, lower); }))
+            return contraction.size();
+    }
+    return 0;
+}
+
 void byte_level(std::string_view text, std::span<const Unit> cp, std::size_t begin, std::size_t end,
                 const auto& emit) {
-    constexpr std::array<std::string_view, 7> contractions{"'s", "'t", "'re", "'ve", "'m", "'ll", "'d"};
     while (begin < end) {
-        auto next = begin;
-        if (cp[begin].cp == U'\'') {
-            const auto rest = slice(text, cp, begin, end);
-            for (const auto contraction : contractions) {
-                if (rest.starts_with(contraction)) {
-                    next = begin + contraction.size();
-                    break;
-                }
-            }
-        }
+        auto next = begin + contraction_length(slice(text, cp, begin, end), false);
         if (next == begin) {
             const auto first = cp[begin].cp;
             if (first == U' ' && begin + 1 < end && category(cp[begin + 1].cp) != Category::space)
@@ -169,8 +176,53 @@ void byte_level(std::string_view text, std::span<const Unit> cp, std::size_t beg
     }
 }
 
+void qwen2_split(std::string_view text, std::span<const Unit> cp, std::size_t begin, std::size_t end,
+                 const auto& emit) {
+    const auto newline = [](char32_t value) { return value == U'\r' || value == U'\n'; };
+    const auto kind = [&](std::size_t index) { return category(cp[index].cp); };
+    while (begin < end) {
+        auto next = begin + contraction_length(slice(text, cp, begin, end), true);
+        if (next == begin) {
+            const auto first = kind(begin);
+            const auto follows = begin + 1 < end ? kind(begin + 1) : Category::space;
+            if (first == Category::letter ||
+                (first != Category::number && !newline(cp[begin].cp) && follows == Category::letter)) {
+                next = begin + 1;
+                while (next < end && kind(next) == Category::letter)
+                    ++next;
+            } else if (first == Category::number) {
+                next = begin + 1;
+            } else if (first == Category::other || (cp[begin].cp == U' ' && follows == Category::other)) {
+                next = begin + 1;
+                while (next < end && kind(next) == Category::other)
+                    ++next;
+                while (next < end && newline(cp[next].cp))
+                    ++next;
+            } else {
+                auto last_newline = begin;
+                next = begin;
+                while (next < end && kind(next) == Category::space) {
+                    if (newline(cp[next].cp))
+                        last_newline = next + 1;
+                    ++next;
+                }
+                if (last_newline != begin)
+                    next = last_newline;
+                else if (next < end && next - begin > 1)
+                    --next;
+            }
+        }
+        emit(slice(text, cp, begin, next));
+        begin = next;
+    }
+}
+
 void split(std::string_view text, std::span<const Unit> cp, std::size_t begin, std::size_t end,
            Pretokenizer pre, const auto& emit) {
+    if (pre == Pretokenizer::qwen2) {
+        qwen2_split(text, cp, begin, end, emit);
+        return;
+    }
     if (pre == Pretokenizer::byte_level) {
         byte_level(text, cp, begin, end, emit);
         return;
@@ -188,23 +240,6 @@ void split(std::string_view text, std::span<const Unit> cp, std::size_t begin, s
 
 std::uint64_t pair_id(Token a, Token b) {
     return (std::uint64_t(a) << 32) | b;
-}
-
-detail::Json byte_level_config(bool add_prefix_space) {
-    using detail::Json;
-    return Json{{"type", "ByteLevel"},
-                {"add_prefix_space", add_prefix_space},
-                {"trim_offsets", true},
-                {"use_regex", true}};
-}
-
-detail::Json pretokenizer_config(Pretokenizer pre) {
-    using detail::Json;
-    const auto bytes = byte_level_config(false);
-    if (pre == Pretokenizer::byte_level)
-        return bytes;
-    return {{"type", "Sequence"},
-            {"pretokenizers", Json::array({{{"type", "Digits"}, {"individual_digits", true}}, bytes})}};
 }
 
 bool has_type(const detail::Json& config, std::string_view type) {
@@ -258,7 +293,8 @@ struct Tokenizer::Impl {
         Token id;
     };
 
-    explicit Impl(const detail::Json& json) {
+    explicit Impl(const detail::Json& json, Pretokenizer embedded_pre = Pretokenizer::unsupported,
+                  std::span<const GgufTokenType> embedded_types = {}) {
         const auto& model = json.at("model");
         if (model.at("vocab").is_array() || has_type(json.at("decoder"), "WordPiece")) {
             subword = std::make_unique<detail::SubwordTokenizer>(json);
@@ -269,7 +305,8 @@ struct Tokenizer::Impl {
             (!json.at("post_processor").is_null() && !has_type(json.at("post_processor"), "ByteLevel")) ||
             !has_type(json.at("decoder"), "ByteLevel"))
             throw Error(ErrorCode::unsupported, "unsupported tokenizer pipeline");
-        pre = read_pretokenizer(json.at("pre_tokenizer"));
+        pre = embedded_pre == Pretokenizer::unsupported ? read_pretokenizer(json.at("pre_tokenizer"))
+                                                        : embedded_pre;
         if (model.value("type", std::string("BPE")) != "BPE" || !model.at("dropout").is_null() ||
             !model.at("unk_token").is_null() || !empty_affix(model.at("continuing_subword_prefix")) ||
             !empty_affix(model.at("end_of_word_suffix")) || model.value("fuse_unk", false) ||
@@ -307,11 +344,22 @@ struct Tokenizer::Impl {
             added_starts[static_cast<unsigned char>(text.front())] = true;
             added.push_back({std::move(text), id});
         }
+        for (std::size_t id = 0; id < embedded_types.size(); ++id) {
+            const auto type = embedded_types[id];
+            special[id] = type == GgufTokenType::control || type == GgufTokenType::unused;
+            if (type == GgufTokenType::control || type == GgufTokenType::user_defined) {
+                const auto& text = raw[id];
+                if (text.empty() || text.size() > 128 || added.size() >= 64)
+                    throw Error(ErrorCode::malformed, "invalid GGUF added-token list");
+                added_starts[static_cast<unsigned char>(text.front())] = true;
+                added.push_back({text, static_cast<Token>(id)});
+            }
+        }
         std::ranges::sort(added,
                           [](const Added& a, const Added& b) { return a.text.size() > b.text.size(); });
 
         for (std::size_t id = 0; id < raw.size(); ++id) {
-            if (special[id])
+            if (special[id] || (!embedded_types.empty() && embedded_types[id] == GgufTokenType::user_defined))
                 continue;
             raw[id] = as_bytes(raw[id], "BPE vocabulary");
             if (raw[id].size() == 1)
@@ -456,11 +504,15 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
             pre = Pretokenizer::digits_byte_level;
         else if (name == "gpt-2")
             pre = Pretokenizer::byte_level;
+        else if (name == "qwen2")
+            pre = Pretokenizer::qwen2;
         if (metadata.value("tokenizer.ggml.add_space_prefix", false))
             throw Error(ErrorCode::unsupported, "GGUF tokenizer prefix spaces are unsupported");
 
         Json vocabulary = Json::object();
-        std::vector<bool> special(tokens.size());
+        std::vector<GgufTokenType> token_types;
+        if (types != metadata.end())
+            token_types.reserve(tokens.size());
         for (std::size_t id = 0; id < tokens.size(); ++id) {
             const auto& text = tokens[id].get_ref<const std::string&>();
             if (vocabulary.contains(text))
@@ -469,9 +521,11 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
             if (types != metadata.end()) {
                 const auto type =
                     static_cast<GgufTokenType>(detail::natural((*types)[id], "GGUF token type"));
-                if (type != GgufTokenType::normal && type != GgufTokenType::control)
-                    throw Error(ErrorCode::unsupported, "expected normal or control GGUF BPE tokens");
-                special[id] = type == GgufTokenType::control;
+                const bool qwen_token = pre == Pretokenizer::qwen2 && (type == GgufTokenType::user_defined ||
+                                                                       type == GgufTokenType::unused);
+                if (type != GgufTokenType::normal && type != GgufTokenType::control && !qwen_token)
+                    throw Error(ErrorCode::unsupported, "unsupported GGUF BPE token type");
+                token_types.push_back(type);
             }
         }
 
@@ -489,7 +543,9 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
             auto impl = std::make_shared<Impl>(json);
             if (impl->subword)
                 throw Error(ErrorCode::unsupported, "GGUF requires a byte-level BPE sidecar");
-            if (types != metadata.end() && impl->special != special)
+            const auto control = [](GgufTokenType type) { return type == GgufTokenType::control; };
+            if (!token_types.empty() &&
+                !std::ranges::equal(impl->special, token_types, {}, std::identity{}, control))
                 throw Error(ErrorCode::malformed, "GGUF token types differ from the tokenizer sidecar");
             if (pre != Pretokenizer::unsupported && impl->pre != pre)
                 throw Error(ErrorCode::malformed, "GGUF pretokenizer differs from the tokenizer sidecar");
@@ -499,25 +555,8 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
         if (pre == Pretokenizer::unsupported || types == metadata.end())
             throw Error(ErrorCode::unsupported,
                         "unsupported or incomplete GGUF pretokenizer; supply a matching tokenizer.json");
-        auto added = Json::array();
-        for (std::size_t id = 0; id < tokens.size(); ++id) {
-            if (special[id]) {
-                added.push_back({{"content", tokens[id]},
-                                 {"id", id},
-                                 {"special", true},
-                                 {"normalized", false},
-                                 {"single_word", false},
-                                 {"lstrip", false},
-                                 {"rstrip", false}});
-            }
-        }
-        Json json = {{"version", "1.0"},
-                     {"normalizer", nullptr},
-                     {"post_processor", nullptr},
-                     {"truncation", nullptr},
-                     {"padding", nullptr},
-                     {"pre_tokenizer", pretokenizer_config(pre)},
-                     {"decoder", byte_level_config(true)}};
+        Json json = {{"version", "1.0"},      {"normalizer", nullptr}, {"post_processor", nullptr},
+                     {"truncation", nullptr}, {"padding", nullptr},    {"decoder", {{"type", "ByteLevel"}}}};
         json["model"] = {{"type", "BPE"},
                          {"vocab", std::move(vocabulary)},
                          {"merges", merges},
@@ -525,8 +564,8 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
                          {"unk_token", nullptr},
                          {"continuing_subword_prefix", nullptr},
                          {"end_of_word_suffix", nullptr}};
-        json["added_tokens"] = std::move(added);
-        return Tokenizer(std::make_shared<Impl>(json));
+        json["added_tokens"] = Json::array();
+        return Tokenizer(std::make_shared<Impl>(json, pre, token_types));
     } catch (const Json::exception& e) {
         throw Error(ErrorCode::malformed, model.string() + ": " + e.what());
     } catch (const Error& e) {

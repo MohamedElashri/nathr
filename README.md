@@ -96,8 +96,17 @@ nathr run t5 "translate English to German: The sky is blue." --max-new-tokens 12
 
 ### Run chat in the terminal
 
+Run Qwen3-0.6B with its official Q8_0 GGUF checkpoint (about 640 MB). The run command downloads it on first use.
+
 ```sh
-chat_model=$(nathr pull smollm2)
+nathr run qwen3 "What is the capital of France?"
+nathr serve qwen3
+```
+
+Qwen3 chat uses plain text with thinking mode disabled. Pass a JSON message array for explicit conversation history.
+
+```sh
+chat_model=$(nathr pull qwen3)
 nathr generate "$chat_model" --messages - --greedy --max-new-tokens 16 --backend auto <<'JSON'
 [
   {"role":"user","content":"What is the capital of France?"},
@@ -198,6 +207,8 @@ print(reply.choices[0].message.content)
 
 Set `stream=true` for incremental output. Responses requests are stateless and text-only. Send conversation history in `input` for each turn on a chat checkpoint.
 
+For a Qwen3 logits row from `/infer`, start `nathr serve qwen3 --max-result-values 151936 --max-buffer-bytes 4194304`.
+
 ```sh
 nathr serve smollm2 --also minilm
 ```
@@ -229,6 +240,8 @@ From the source tree, run the checker after downloading the named checkpoints. I
 nathr pull gguf --models-dir models/cache
 nathr pull smollm2 --models-dir models/cache
 python3 tests/compatibility.py gguf instruct
+nathr pull qwen3 --models-dir models/cache
+python3 tests/compatibility.py qwen3
 python3 tests/compatibility.py gguf --measure --threads 2 --repetitions 3
 ```
 

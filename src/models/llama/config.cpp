@@ -8,16 +8,16 @@
 namespace nathr::detail {
 namespace {
 
-void validate_geometry(const ModelConfig& c, const std::string& path) {
+void validate_geometry(const ModelConfig& c, const std::string& path, bool independent_head_width = false) {
     if (!c.layers || c.layers > 56 || !c.hidden || !c.intermediate || !c.query_heads || !c.kv_heads ||
-        c.query_heads % c.kv_heads || c.hidden % c.query_heads || !c.context || !c.vocabulary ||
-        c.vocabulary > max_vocabulary) {
-        throw Error(ErrorCode::unsupported, path + ": unsupported Llama dimensions or head geometry");
+        c.query_heads % c.kv_heads || (!independent_head_width && c.hidden % c.query_heads) || !c.context ||
+        !c.vocabulary || c.vocabulary > max_vocabulary) {
+        throw Error(ErrorCode::unsupported, path + ": unsupported decoder dimensions or head geometry");
     }
 }
 
-void validate_config(const ModelConfig& c, const std::string& path) {
-    if (c.head_dim != c.hidden / c.query_heads || c.head_dim % 2)
+void validate_config(const ModelConfig& c, const std::string& path, bool independent_head_width = false) {
+    if (!c.head_dim || c.head_dim % 2 || (!independent_head_width && c.head_dim != c.hidden / c.query_heads))
         throw Error(ErrorCode::unsupported, path + ": unsupported rotary head width");
     if (!(c.rope_theta > 0) || !std::isfinite(c.rope_theta) || !(c.rms_epsilon > 0) ||
         !std::isfinite(c.rms_epsilon)) {
@@ -75,59 +75,59 @@ ModelConfig load_llama_config(const Json& json, const std::filesystem::path& con
     }
 }
 
-ModelConfig load_llama_config(const Gguf& file) {
+ModelConfig load_gguf_decoder_config(const Gguf& file) {
     const auto path = file.path().string();
     const auto& architecture = file.architecture();
     if (!file.split().empty())
         throw Error(ErrorCode::unsupported, path + ": split GGUF execution is unsupported");
-    if (!architecture.contains("general.architecture") || architecture.at("general.architecture") != "llama")
-        throw Error(ErrorCode::unsupported, path + ": expected a GGUF Llama architecture");
     try {
+        const auto name = architecture.value("general.architecture", std::string{});
+        const bool qwen3 = name == "qwen3";
+        if (!qwen3 && name != "llama")
+            throw Error(ErrorCode::unsupported, path + ": expected a GGUF Llama or Qwen3 architecture");
+        const auto prefix = name + ".";
         const auto field = [&](std::string_view key) {
-            return natural(architecture.at(key), path + ": " + std::string(key));
+            const auto qualified = prefix + std::string(key);
+            return natural(architecture.at(qualified), path + ": " + qualified);
         };
-        constexpr std::string_view supported[] = {"general.architecture",
-                                                  "llama.block_count",
-                                                  "llama.context_length",
-                                                  "llama.embedding_length",
-                                                  "llama.feed_forward_length",
-                                                  "llama.attention.head_count",
-                                                  "llama.attention.head_count_kv",
-                                                  "llama.attention.key_length",
-                                                  "llama.attention.value_length",
-                                                  "llama.rope.freq_base",
-                                                  "llama.attention.layer_norm_rms_epsilon",
-                                                  "llama.vocab_size",
-                                                  "llama.rope.dimension_count"};
+        const auto contains = [&](std::string_view key) {
+            return architecture.contains(prefix + std::string(key));
+        };
+        constexpr std::string_view supported[] = {"block_count",          "context_length",
+                                                  "embedding_length",     "feed_forward_length",
+                                                  "attention.head_count", "attention.head_count_kv",
+                                                  "attention.key_length", "attention.value_length",
+                                                  "rope.freq_base",       "attention.layer_norm_rms_epsilon",
+                                                  "vocab_size",           "rope.dimension_count"};
         for (const auto& [key, ignored] : architecture.items()) {
-            if (std::ranges::find(supported, key) == std::end(supported))
+            if (key == "general.architecture")
+                continue;
+            if (!key.starts_with(prefix) ||
+                std::ranges::find(supported, std::string_view(key).substr(prefix.size())) ==
+                    std::end(supported))
                 throw Error(ErrorCode::unsupported, path + ": unsupported architecture metadata " + key);
         }
         ModelConfig c{};
-        c.layers = field("llama.block_count");
-        c.hidden = field("llama.embedding_length");
-        c.intermediate = field("llama.feed_forward_length");
-        c.query_heads = field("llama.attention.head_count");
-        c.kv_heads = architecture.contains("llama.attention.head_count_kv")
-                         ? field("llama.attention.head_count_kv")
-                         : c.query_heads;
+        c.layers = field("block_count");
+        c.hidden = field("embedding_length");
+        c.intermediate = field("feed_forward_length");
+        c.query_heads = field("attention.head_count");
+        c.kv_heads = contains("attention.head_count_kv") ? field("attention.head_count_kv") : c.query_heads;
         const auto embedding = file.records().find("token_embd.weight");
         if (embedding == file.records().end() || embedding->second.view.desc.rank != 2)
             throw Error(ErrorCode::malformed, path + ": missing or invalid GGUF token embedding");
-        c.vocabulary = architecture.contains("llama.vocab_size") ? field("llama.vocab_size")
-                                                                 : embedding->second.view.desc.shape[0];
-        c.context = field("llama.context_length");
-        validate_geometry(c, path);
-        c.head_dim = architecture.contains("llama.rope.dimension_count") ? field("llama.rope.dimension_count")
-                                                                         : c.hidden / c.query_heads;
-        c.rope_theta = architecture.value("llama.rope.freq_base", 10000.0f);
-        c.rms_epsilon = architecture.at("llama.attention.layer_norm_rms_epsilon").get<float>();
+        c.vocabulary = contains("vocab_size") ? field("vocab_size") : embedding->second.view.desc.shape[0];
+        c.context = field("context_length");
+        validate_geometry(c, path, qwen3);
+        c.head_dim = contains("rope.dimension_count") ? field("rope.dimension_count")
+                     : qwen3                          ? field("attention.key_length")
+                                                      : c.hidden / c.query_heads;
+        c.rope_theta = architecture.value(prefix + "rope.freq_base", 10000.0f);
+        c.rms_epsilon = architecture.at(prefix + "attention.layer_norm_rms_epsilon").get<float>();
         c.tied_embeddings = !file.records().contains("output.weight");
-        validate_config(c, path);
-        if ((architecture.contains("llama.attention.key_length") &&
-             field("llama.attention.key_length") != c.head_dim) ||
-            (architecture.contains("llama.attention.value_length") &&
-             field("llama.attention.value_length") != c.head_dim)) {
+        validate_config(c, path, qwen3);
+        if ((contains("attention.key_length") && field("attention.key_length") != c.head_dim) ||
+            (contains("attention.value_length") && field("attention.value_length") != c.head_dim)) {
             throw Error(ErrorCode::unsupported, path + ": unsupported GGUF key or value head width");
         }
         const auto& tokenizer = file.tokenizer();

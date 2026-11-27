@@ -39,7 +39,7 @@ Use the logical weight shape `[output_width, input_width]`. A linear projection 
 | Feed-forward gate `Wgate`, up `Wup` | `[F, H]` each |
 | Feed-forward down `Wdown` | `[H, F]` |
 
-For SmolLM2-135M, `L = 30`, `H = 576`, `F = 1536`, `Hq = 9`, `Hkv = 3`, and `D = 64`. That gives 576 query coordinates and 192 each for keys and values. `V = 49152` and `T = 8192`. These numbers describe the example checkpoint. The same equations operate on any dimensions that satisfy the decoder's shape rules. [SmolLM2-135M configuration](https://huggingface.co/HuggingFaceTB/SmolLM2-135M/blob/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/config.json)
+For SmolLM2-135M, `L = 30`, `H = 576`, `F = 1536`, `Hq = 9`, `Hkv = 3`, and `D = 64`. That gives 576 query coordinates and 192 each for keys and values. `V = 49152` and `T = 8192`. These numbers describe the example checkpoint. Qwen3-0.6B has a residual width of 1,024 and 16 query heads of width 128, so its attention output projection maps 2,048 coordinates back to 1,024. It applies learned RMSNorm gains to each query and key head before RoPE. [SmolLM2-135M configuration](https://huggingface.co/HuggingFaceTB/SmolLM2-135M/blob/93efa2f097d58c2a74874c7e644dbc9b0cee75a2/config.json) · [Qwen3-0.6B GGUF](https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/blob/23749fefcc72300e3a2ad315e1317431b06b590a/Qwen3-0.6B-Q8_0.gguf)
 
 ## 2. Read the checkpoint into tensor views
 
@@ -49,7 +49,7 @@ Represent a tensor with its element encoding, dimensions, and a read-only view o
 
 **GGUF.** Check the file signature and version, read typed metadata and tensor descriptors, and locate the aligned tensor data section. Tensor offsets are relative to that section. GGUF puts the fastest-varying dimension first, so a matrix's serialized dimensions read `[input_width, output_width]`. For packed encodings, validate each row against the block width and count bytes by blocks. Nathr uses a read-only mapping and retains metadata for the architecture declared by the file. The architecture loader interprets those fields. [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) · [Nathr GGUF reader](../src/formats/gguf.cpp)
 
-Bind tensor names and storage conventions in the architecture code. In Nathr's example, a Hugging Face Llama checkpoint calls its first query matrix `model.layers.0.self_attn.q_proj.weight`. The corresponding GGUF name is `blk.0.attn_q.weight`. Nathr also maps GGUF query and key projection outputs to the split-half order its rotary kernel expects. The original weight bytes stay in place. If the model ties its embeddings, the output projection reuses the embedding view. [Nathr weight binding](../src/models/llama/model.cpp) · [Rotary row mapping](../src/formats/tensor.hpp)
+Bind tensor names and storage conventions in the architecture code. In Nathr's example, a Hugging Face Llama checkpoint calls its first query matrix `model.layers.0.self_attn.q_proj.weight`. The corresponding GGUF name is `blk.0.attn_q.weight`. For Llama, Nathr also maps GGUF query and key projection outputs to the split-half order its rotary kernel expects. Qwen3 GGUF stores the projections in split-half order. The original weight bytes stay in place. If the model ties its embeddings, the output projection reuses the embedding view. [Nathr weight binding](../src/models/llama/model.cpp) · [Rotary row mapping](../src/formats/tensor.hpp)
 
 ## 3. Implement a scalar forward pass
 
@@ -151,7 +151,7 @@ Byte-level byte pair encoding (BPE) is one worked example. The serialized vocabu
 
 For a toy piece `abc`, suppose the rules say `b + c → bc` at rank `0` and `a + b → ab` at rank `1`. The first merge produces `[a, bc]`. The `a + b` rule can no longer apply because `b` is part of another token. A simple implementation rescans all pairs after each merge. Nathr links the surviving nodes, queues candidates by rank, and updates only the neighbors of a merge. Queued candidates carry node versions so stale pairs can be skipped. [Byte-level BPE implementation](../src/tokenizer/tokenizer.cpp)
 
-Nathr loads the vocabulary and merge ranks from `tokenizer.json` or GGUF metadata. It supports ByteLevel on its own and individual-digit splitting followed by ByteLevel. For GGUF, control token types come from metadata alongside the token texts. If the caller supplies a matching `tokenizer.json`, called a sidecar, Nathr checks the complete vocabulary-to-ID mapping and ordered merges, and checks token types and pretokenizer behavior where it can compare them. A caller can also use an external tokenizer and pass its IDs to the decoder. [Nathr tokenizer loading](../src/tokenizer/tokenizer.cpp)
+Nathr loads the vocabulary and merge ranks from `tokenizer.json` or GGUF metadata. It supports ByteLevel, individual-digit splitting followed by ByteLevel, and the Qwen byte-level pretokenizer. For GGUF, control token types come from metadata alongside the token texts. If the caller supplies a matching `tokenizer.json`, called a sidecar, Nathr checks the complete vocabulary-to-ID mapping and ordered merges, and checks token types and pretokenizer behavior where it can compare them. A caller can also use an external tokenizer and pass its IDs to the decoder. [Nathr tokenizer loading](../src/tokenizer/tokenizer.cpp)
 
 Check the IDs directly on prompts with leading spaces, newlines, digits, non-ASCII text, and special tokens. Check boundary IDs such as beginning-of-sequence (BOS) and end-of-sequence (EOS) separately from the rule that decides when to insert or stop on those IDs.
 
@@ -249,7 +249,7 @@ Both Llama fixture calls return 23 logits and a greedy ID of `2`. Compare their 
 
 Once the numeric path agrees, try the CLI examples with full SmolLM2 and GPT-2 checkpoints. Reuse the prompt IDs returned by `tokenize` for reproducible forward comparisons. The `bench` command uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [CLI examples](../README.md#cli-examples)
 
-The compatibility checker verifies SHA-256 hashes, token IDs, sampled tensor values, and seeded generation across standalone and batched execution where supported. Transformers 4.57.6 supplies the dense tensor and two-turn chat reference values. The GGUF tensor values and seeded samples come from Nathr. The optional mixed-length GGUF benchmark reports short-request time to first token, p95 inter-token latency, output throughput, and KV memory for one and three active requests. [Run the compatibility checker](../README.md#check-model-compatibility) · [Reference values](../tests/checkpoints.json)
+The compatibility checker verifies SHA-256 hashes, token IDs, sampled tensor values, and seeded generation across standalone and batched execution where supported. Transformers 4.57.6 supplies the dense tensor and two-turn chat reference values. SmolLM2 GGUF tensor values and seeded samples come from Nathr. Qwen3 GGUF token IDs, sampled logits, and chat prompt IDs come from llama.cpp 1.1.0. The optional mixed-length GGUF benchmark reports short-request time to first token, p95 inter-token latency, output throughput, and KV memory for one and three active requests. [Run the compatibility checker](../README.md#check-model-compatibility) · [Reference values](../tests/checkpoints.json)
 
 ## 9. Bring up a second checkpoint
 
@@ -271,13 +271,14 @@ Use a tensor name and shape as the common inference contract. A checkpoint descr
 
 ## Checkpoint support and limits
 
-Nathr reads dimensions, attention head counts, context length, and boundary token IDs from the checkpoint. It loads single-file weights up to 1 GiB and supports vocabularies up to 65,536 tokens. Session capacity also depends on the KV cache budget. [Model limits](../src/core/limits.hpp) · [Session allocation](../src/runtime/session.cpp)
+Nathr reads dimensions, attention head counts, context length, and boundary token IDs from the checkpoint. It loads single-file weights up to 1 GiB and supports vocabularies up to 196,608 tokens. Session capacity also depends on the KV cache budget. [Model limits](../src/core/limits.hpp) · [Session allocation](../src/runtime/session.cpp)
 
 | Architecture | Supported configuration |
 | --- | --- |
 | Llama-style | GGUF v3 or Safetensors with RMSNorm, SwiGLU, unscaled full-width RoPE, and bias-free projections |
+| Qwen3 | Dense GGUF v3 with per-head query and key RMSNorm and unscaled, full-width RoPE. The pinned checkpoint is Qwen3-0.6B Q8_0 |
 | GPT-2 | Safetensors with learned positions, affine LayerNorm, and the GPT-2 GELU variant |
 | BERT | Safetensors with absolute position embeddings and GELU. Uses unpadded inputs and optional segment IDs. Outputs depend on the checkpoint's heads and pooling modules |
 | T5 | Safetensors for original ReLU T5. The decoder uses FP32 caches. The source and decoder are each limited to 512 positions or the checkpoint context, whichever is smaller |
 
-The built-in tokenizers cover byte-level BPE, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering supports the SmolLM2 ChatML template and reads its default system message from the checkpoint. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)
+The built-in tokenizers cover byte-level BPE, BERT WordPiece, and T5 SentencePiece Unigram. WordPiece can encode text pairs and segment IDs. Compatible GGUF files can embed the tokenizer. Raw token IDs let callers use an external tokenizer. Chat rendering supports SmolLM2 ChatML and the pinned Qwen3 template in plain-text, non-thinking mode. [Tokenizer loading](../src/tokenizer/tokenizer.cpp) · [WordPiece and Unigram](../src/tokenizer/subword.cpp) · [Chat rendering](../apps/requests.cpp)

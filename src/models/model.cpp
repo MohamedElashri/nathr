@@ -132,15 +132,20 @@ std::string_view architecture_name(Checkpoint checkpoint) {
 
 Model::Impl::Impl(const std::filesystem::path& path, Checkpoint checkpoint, ModelConfig native_config,
                   BackendOptions options, CpuFeatures features, const Json& json)
-    : config(native_config), tensors(checkpoint == Checkpoint::llama_gguf
+    : config(native_config), tensors(checkpoint == Checkpoint::decoder_gguf
                                          ? WeightFile(std::in_place_type<Gguf>, path)
                                          : WeightFile(std::in_place_type<SafeTensors>, weights_path(path))),
       backend(options, features), architecture(architecture_name(checkpoint)) {
     switch (checkpoint) {
-    case Checkpoint::llama_gguf: {
+    case Checkpoint::decoder_gguf: {
         auto& file = std::get<Gguf>(tensors);
-        config = load_llama_config(file);
-        execution = load_llama(file, path, config, backend);
+        config = load_gguf_decoder_config(file);
+        architecture = file.architecture().at("general.architecture") == "qwen3" ? "qwen3" : "llama";
+        const auto& tokenizer = file.tokenizer();
+        const auto format = tokenizer.find("tokenizer.chat_template");
+        if (format != tokenizer.end() && format->is_string())
+            chat_template = format->get_ref<const std::string&>();
+        execution = load_gguf_decoder(file, path, config, backend, architecture == "qwen3");
         break;
     }
     case Checkpoint::llama_safetensors:
@@ -174,7 +179,8 @@ Model Model::load(const std::filesystem::path& path, BackendOptions options) {
     if (options.policy == ExecutionPolicy::avx2 && !features.avx2)
         throw Error(ErrorCode::unsupported, "AVX2 was requested but CPU or OS AVX2 state is unavailable");
     if (!is_model_directory(path))
-        return Model(std::make_shared<Impl>(path, Checkpoint::llama_gguf, ModelConfig{}, options, features));
+        return Model(
+            std::make_shared<Impl>(path, Checkpoint::decoder_gguf, ModelConfig{}, options, features));
     const auto config_path = path / "config.json";
     const auto json = read_json(config_path, mib);
     const auto load = [&](Checkpoint checkpoint, ModelConfig config) {
@@ -202,6 +208,10 @@ ModelMemory Model::memory() const noexcept {
 
 std::string_view Model::architecture() const noexcept {
     return impl_->architecture;
+}
+
+std::string_view Model::embedded_chat_template() const noexcept {
+    return impl_->chat_template;
 }
 
 std::vector<OutputInfo> Model::outputs() const {
