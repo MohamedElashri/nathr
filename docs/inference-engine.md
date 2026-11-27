@@ -197,11 +197,11 @@ The scheduler gives active requests one decode token per step, then divides the 
 
 Admission reserves each request’s private KV capacity and charges shared prefix pages once across active readers. A shared page stays reserved until its last reader leaves. FIFO is the default. A configured bypass limit lets fitting requests pass a memory-blocked queue head. [Batch scheduler](../src/runtime/batch.cpp) · [KV page pool](../src/backend/cpu/scalar.hpp)
 
-The decoder scheduler indexes full prompt pages by their exact token IDs and the parent page's identity. Later requests can share those pages and skip their prefill rows. A fully cached prompt replays its final token with read-only KV access to obtain the first logits. Shared pages are immutable, with unreferenced leaves reclaimed under memory pressure. [Prefix cache](../src/runtime/batch.cpp) · [Serving benchmark](../README.md#benchmark-a-running-server)
+The decoder scheduler indexes full prompt pages by their exact token IDs and the parent page's identity. Later requests can share those pages and skip their prefill rows. A fully cached prompt replays its final token with read-only KV access to obtain the first logits. Shared pages are immutable, with unreferenced leaves reclaimed under memory pressure. [Prefix cache](../src/runtime/batch.cpp) · [Serving benchmark](usage.md#benchmark-inference)
 
 With speculative decoding enabled, the scheduler looks for the current three-token suffix in the last 2,048 prompt tokens. Unconstrained greedy decoding uses spare batch rows to verify up to eight draft tokens against target logits. On a mismatch, the target token becomes the next decode input and later draft rows remain outside the visible cache until overwritten. A scored request uses the target logits from each verified row to compute its token log probabilities. [Draft verification](../src/runtime/batch.cpp)
 
-The terminal and HTTP frontends send JSONL requests to one persistent worker per model. The terminal keeps chat history in the current session. The API routes by model ID and adapts generation and embeddings to the batch request format. It bounds client count, request bodies, and response buffering, and cancels a request between scheduler steps if a buffer fills or a client disconnects. [Frontends](../apps/serve.py) · [HTTP endpoints](../README.md#openai-compatible-api)
+The terminal and HTTP frontends send JSONL requests to one persistent worker per model. The terminal keeps chat history in the current session. The API routes by model ID and adapts generation and embeddings to the batch request format. It bounds client count, request bodies, and response buffering, and cancels a request between scheduler steps if a buffer fills or a client disconnects. [Frontends](../apps/serve.py) · [HTTP endpoints](usage.md#http-endpoints)
 
 ### Apply low-rank adapters per request
 
@@ -257,7 +257,7 @@ Both Llama fixture calls return 23 logits and a greedy ID of `2`. Compare their 
 
 Once the numeric path agrees, try the CLI examples with full SmolLM2 and GPT-2 checkpoints. Reuse the prompt IDs returned by `tokenize` for reproducible forward comparisons. The `bench` command uses synthetic IDs to measure prefill and decode without tokenization or sampling. Keep the checkpoint, backend, thread count, context, cache precision, and input lengths fixed when comparing implementations. [CLI examples](../README.md#cli-examples)
 
-The compatibility checker verifies SHA-256 hashes, token IDs, sampled tensor values, and seeded generation across standalone and batched execution where supported. Transformers 4.57.6 supplies the dense tensor and two-turn chat reference values. SmolLM2 GGUF tensor values and seeded samples come from Nathr. Qwen3 GGUF token IDs, sampled logits, and chat prompt IDs come from llama.cpp 1.1.0. The optional mixed-length GGUF benchmark reports short-request time to first token, p95 inter-token latency, output throughput, and KV memory for one and three active requests. [Run the compatibility checker](../README.md#check-model-compatibility) · [Reference values](../tests/checkpoints.json)
+The compatibility checker verifies SHA-256 hashes, token IDs, sampled tensor values, and seeded generation across standalone and batched execution where supported. Transformers 4.57.6 supplies the dense tensor and two-turn chat reference values. SmolLM2 GGUF tensor values and seeded samples come from Nathr. Qwen3 and TinyLlama GGUF token IDs, sampled logits, and chat prompt IDs come from llama.cpp 1.1.0. The optional mixed-length GGUF benchmark reports short-request time to first token, p95 inter-token latency, output throughput, and KV memory for one and three active requests. [Run the compatibility checker](usage.md#check-model-compatibility) · [Reference values](../tests/checkpoints.json)
 
 ## 9. Bring up a second checkpoint
 
@@ -275,7 +275,7 @@ T5's encoder also sees the full input. Its self-attention adds a learned bias ba
 
 ### Expose checkpoint outputs
 
-Use a tensor name and shape as the common inference contract. A checkpoint describes which outputs exist and how many input tokens they take. A BERT checkpoint can expose all hidden states or bind weights for its pooler and a classification head. Sentence Transformers checkpoints describe extra pooling and normalization in their module configuration. T5 logits are indexed by decoder position and can be compared using an explicit decoder prefix. Generation wraps logits with a sampling loop and request state. [Model inference API](../include/nathr/nathr.hpp) · [Output examples](../README.md#request-a-named-output)
+Use a tensor name and shape as the common inference contract. A checkpoint describes which outputs exist and how many input tokens they take. A BERT checkpoint can expose all hidden states or bind weights for its pooler and a classification head. Sentence Transformers checkpoints describe extra pooling and normalization in their module configuration. T5 logits are indexed by decoder position and can be compared using an explicit decoder prefix. Generation wraps logits with a sampling loop and request state. [Model inference API](../include/nathr/nathr.hpp) · [Output examples](../README.md#cli-examples)
 
 ## Checkpoint support and limits
 
