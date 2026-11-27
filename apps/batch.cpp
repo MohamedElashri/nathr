@@ -185,6 +185,7 @@ struct BatchOutput {
     std::optional<Tokenizer> tokenizer;
     std::shared_ptr<const StructuredVocabulary> structured;
     std::size_t output_tokens = 0;
+    std::size_t draft_tokens = 0, accepted_draft_tokens = 0;
     const BatchScheduler* live_stats = nullptr;
 
     void publish(const BatchEvent& event) {
@@ -207,6 +208,12 @@ struct BatchOutput {
                 value["inter_token_ms"] = *event.inter_token_ms;
         } else {
             value["event"] = "done";
+            if (event.draft_tokens) {
+                value["draft_tokens"] = event.draft_tokens;
+                value["accepted_draft_tokens"] = event.accepted_draft_tokens;
+                draft_tokens += event.draft_tokens;
+                accepted_draft_tokens += event.accepted_draft_tokens;
+            }
             if (live_stats) {
                 value["queue_ms"] = event.queue_ms;
                 value["kv"] = {{"peak_bytes", live_stats->peak_kv_bytes()},
@@ -433,6 +440,8 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
                       {"output_tokens", output.output_tokens},
                       {"elapsed_ms", 1000 * seconds},
                       {"output_tokens_s", seconds > 0 ? output.output_tokens / seconds : 0.0},
+                      {"draft_tokens", output.draft_tokens},
+                      {"accepted_draft_tokens", output.accepted_draft_tokens},
                       {"peak_kv_bytes", scheduler ? scheduler->peak_kv_bytes() : 0},
                       {"resident_kv_bytes", scheduler ? scheduler->resident_kv_bytes() : 0},
                       {"kv_page_reuses", scheduler ? scheduler->kv_page_reuses() : 0},

@@ -199,6 +199,8 @@ Admission reserves each request’s private KV capacity and charges shared prefi
 
 The decoder scheduler indexes full prompt pages by their exact token IDs and the parent page's identity. Later requests can share those pages and skip their prefill rows. A fully cached prompt replays its final token with read-only KV access to obtain the first logits. Shared pages are immutable, with unreferenced leaves reclaimed under memory pressure. [Prefix cache](../src/runtime/batch.cpp) · [Serving benchmark](../README.md#benchmark-a-running-server)
 
+With speculative decoding enabled, the scheduler looks for the current three-token suffix in the last 2,048 prompt tokens. Greedy decoding uses spare batch rows to verify up to eight draft tokens against target logits. On a mismatch, the target token becomes the next decode input and later draft rows remain outside the visible cache until overwritten. [Draft verification](../src/runtime/batch.cpp)
+
 The terminal and HTTP frontends send JSONL requests to one persistent worker per model. The terminal keeps chat history in the current session. The API routes by model ID and adapts generation and embeddings to the batch request format. It bounds client count, request bodies, and response buffering, and cancels a request between scheduler steps if a buffer fills or a client disconnects. [Frontends](../apps/serve.py) · [HTTP endpoints](../README.md#openai-compatible-api)
 
 ### Apply low-rank adapters per request

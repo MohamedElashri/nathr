@@ -15,6 +15,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 using detail::Cache;
 using detail::Evaluation;
+constexpr std::size_t max_draft_tokens = 8;
 
 double milliseconds(Clock::duration duration) {
     return std::chrono::duration<double, std::milli>(duration).count();
@@ -87,6 +88,57 @@ class PrefixCache {
     std::size_t next_id_ = 0;
 };
 
+struct Speculation {
+    static constexpr std::size_t ngram = 3;
+    static constexpr std::size_t lookup_window = 2048;
+
+    Speculation(std::span<const Token> prompt, Sampler& sampler, std::mt19937_64& rng,
+                std::optional<std::size_t> top_logprobs)
+        : verify([this, &sampler, &rng, top_logprobs](std::size_t position, std::span<const float> logits) {
+              if (!verifying)
+                  return;
+              const auto index = position - start;
+              predictions[index] = sampler.select(logits, rng);
+              if (top_logprobs)
+                  scores[index] = token_logprobs(logits, predictions[index], *top_logprobs);
+          }) {
+        std::ranges::copy(prompt.last(ngram), suffix.begin());
+    }
+    Speculation(const Speculation&) = delete;
+    Speculation& operator=(const Speculation&) = delete;
+
+    void advance(Token token) {
+        std::move(suffix.begin() + 1, suffix.end(), suffix.begin());
+        suffix.back() = token;
+    }
+
+    std::span<const Token> propose(std::span<const Token> prompt, std::size_t position, std::size_t limit) {
+        const auto first = prompt.size() - std::min(prompt.size(), lookup_window);
+        std::size_t continuation = 0;
+        for (auto end = prompt.size() - 1; end >= first + ngram; --end) {
+            if (!std::ranges::equal(prompt.subspan(end - ngram, ngram), suffix))
+                continue;
+            continuation = end;
+            if (prompt.size() - end >= limit)
+                break;
+        }
+        if (!continuation)
+            return {};
+        start = position;
+        const auto count = std::min(limit, prompt.size() - continuation);
+        inputs[0] = suffix.back();
+        std::ranges::copy(prompt.subspan(continuation, count), inputs.begin() + 1);
+        return std::span(inputs).first(1 + count);
+    }
+
+    std::array<Token, ngram> suffix;
+    std::array<Token, max_draft_tokens + 1> inputs, predictions;
+    std::array<std::optional<TokenLogprobs>, max_draft_tokens + 1> scores;
+    std::size_t start = 0;
+    bool verifying = false;
+    LogitsSink verify;
+};
+
 struct Request {
     Request(BatchRequest&& input, std::size_t capacity, std::size_t reservation,
             const detail::LoraWeights* lora)
@@ -108,10 +160,12 @@ struct Request {
     std::optional<Token> pending;
     std::optional<GenerationText> text;
     std::mt19937_64 rng{input.seed};
+    std::optional<Speculation> speculation;
     std::vector<float> logits;
     std::size_t emitted = 0, position = 0;
     PrefixCache::Entry* prefix = nullptr;
     std::size_t cached_prompt_tokens = 0, bypasses = 0;
+    std::size_t draft_tokens = 0, accepted_draft_tokens = 0;
 
     BatchEvent event(BatchEventKind kind, Clock::time_point now = Clock::now()) const {
         return {input.id,
@@ -124,7 +178,10 @@ struct Request {
                 {},
                 input.tokens.size(),
                 cached_prompt_tokens,
-                milliseconds(admitted.value_or(now) - arrival)};
+                milliseconds(admitted.value_or(now) - arrival),
+                {},
+                draft_tokens,
+                accepted_draft_tokens};
     }
 };
 
@@ -148,6 +205,8 @@ struct BatchScheduler::Impl {
             (options.session.kv_precision != KvPrecision::f32 &&
              options.session.kv_precision != KvPrecision::f16))
             throw Error(ErrorCode::invalid_argument, "invalid batch context, scheduling, or cache settings");
+        if (options.speculative_tokens > max_draft_tokens)
+            throw Error(ErrorCode::invalid_argument, "speculative tokens must be between 0 and 8");
         if (decoder) {
             scratch = decoder->workspace(options.context, options.step_tokens);
             if (options.prefix_cache)
@@ -219,6 +278,10 @@ struct BatchScheduler::Impl {
                     request.cache.emplace(model.config(), request.capacity, options.session.kv_precision,
                                           &pool);
                     request.logits.resize(model.config().vocabulary);
+                    if (options.speculative_tokens && request.input.sampling.greedy &&
+                        !request.input.constraint && request.input.tokens.size() > Speculation::ngram)
+                        request.speculation.emplace(request.input.tokens, *request.sampler, request.rng,
+                                                    request.input.top_logprobs);
                     reuse_prefix(request);
                 }
             } catch (const Error& error) {
@@ -255,23 +318,29 @@ struct BatchScheduler::Impl {
     }
 
     bool emit_token(Request& request, std::vector<BatchEvent>& events) {
+        const auto logits =
+            request.seq2seq ? request.seq2seq->logits() : std::span<const float>(request.logits);
         const auto [token, complete] =
             request.input.constraint
-                ? request.input.constraint(*request.sampler, request.logits, request.rng)
+                ? request.input.constraint(*request.sampler, logits, request.rng)
                 : ConstrainedToken{request.seq2seq ? request.seq2seq->sample(*request.sampler)
-                                                   : request.sampler->select(request.logits, request.rng),
+                                                   : request.sampler->select(logits, request.rng),
                                    false};
+        auto scores = request.input.top_logprobs
+                          ? std::optional(token_logprobs(logits, token, *request.input.top_logprobs))
+                          : std::nullopt;
+        return emit_token(request, token, complete, std::move(scores), events);
+    }
+
+    bool emit_token(Request& request, Token token, bool complete, std::optional<TokenLogprobs> scores,
+                    std::vector<BatchEvent>& events) {
         const auto now = Clock::now();
         const bool eos = token == model.config().eos;
         const bool stop_id = std::ranges::find(request.input.stop_ids, token) != request.input.stop_ids.end();
         ++request.emitted;
         auto event = request.event(BatchEventKind::token, now);
         event.token = token;
-        if (request.input.top_logprobs) {
-            const auto logits =
-                request.seq2seq ? request.seq2seq->logits() : std::span<const float>(request.logits);
-            event.logprobs = token_logprobs(logits, token, *request.input.top_logprobs);
-        }
+        event.logprobs = std::move(scores);
         if (request.last_token)
             event.inter_token_ms = milliseconds(now - *request.last_token);
         if (request.text)
@@ -289,10 +358,16 @@ struct BatchScheduler::Impl {
             return false;
         }
         request.pending = token;
+        if (request.speculation)
+            request.speculation->advance(token);
         return true;
     }
 
     void finish(Requests::iterator request, const Evaluation& eval, std::vector<BatchEvent>& events) {
+        if (eval.mode == LogitsMode::all_tokens) {
+            finish_verification(request, eval.tokens, events);
+            return;
+        }
         const auto previous_position = request->position;
         request->position += eval.tokens.size();
         if (options.prefix_cache && !request->pending && !eval.replay_cached) {
@@ -309,6 +384,60 @@ struct BatchScheduler::Impl {
         }
         if (eval.mode == LogitsMode::last_token && !emit_token(*request, events))
             remove_active(request);
+    }
+
+    void finish_verification(Requests::iterator request, std::span<const Token> inputs,
+                             std::vector<BatchEvent>& events) {
+        request->speculation->verifying = false;
+        request->draft_tokens += inputs.size() - 1;
+        for (std::size_t index = 0; index < inputs.size(); ++index) {
+            const auto token = request->speculation->predictions[index];
+            ++request->position;
+            const bool matches = index + 1 < inputs.size() && token == inputs[index + 1];
+            if (matches)
+                ++request->accepted_draft_tokens;
+            if (!emit_token(*request, token, false, std::move(request->speculation->scores[index]), events)) {
+                remove_active(request);
+                return;
+            }
+            // Leave rows after a mismatch outside the visible cache. Future steps overwrite them.
+            if (!matches)
+                return;
+        }
+    }
+
+    void extend_decodes(std::size_t decodes, std::size_t budget) {
+        const auto eligible = [](const Request& request) {
+            return request.speculation && request.input.max_new_tokens - request.emitted > 1;
+        };
+        auto ready = std::span(scheduled).first(decodes);
+        auto remaining = static_cast<std::size_t>(
+            std::ranges::count_if(ready, [&](auto request) { return eligible(*request); }));
+        for (std::size_t index = 0; index < decodes && budget; ++index) {
+            auto& request = *ready[index];
+            if (!eligible(request))
+                continue;
+            const auto share = budget / remaining + (budget % remaining != 0);
+            --remaining;
+            // Keep the final budget token as an output, without allocating a cache row for it.
+            const auto limit = std::min(
+                {share, options.speculative_tokens, request.input.max_new_tokens - request.emitted - 1});
+            const auto draft = request.speculation->propose(request.input.tokens, request.position, limit);
+            if (draft.empty())
+                continue;
+            try {
+                request.cache->ensure(request.position + draft.size());
+            } catch (const Error&) {
+                // The one-token evaluation already has the pages it needs.
+                continue;
+            }
+            auto& eval = evaluations[index];
+            eval.tokens = draft;
+            eval.mode = LogitsMode::all_tokens;
+            request.speculation->verifying = true;
+            eval.last_logits = {};
+            budget -= draft.size() - 1;
+        }
     }
 
     void fail(Requests::iterator request, const Error& error, std::vector<BatchEvent>& events) {
@@ -455,7 +584,8 @@ std::vector<BatchEvent> BatchScheduler::step() {
     const auto schedule = [&](Requests::iterator it, std::span<const Token> tokens, LogitsMode mode) {
         try {
             it->cache->ensure(it->position + tokens.size());
-            evaluations.push_back({tokens, it->position, &*it->cache, mode, sink, trace, it->logits,
+            const auto& logits_sink = it->speculation ? it->speculation->verify : sink;
+            evaluations.push_back({tokens, it->position, &*it->cache, mode, logits_sink, trace, it->logits,
                                    it->position < it->cached_prompt_tokens, it->lora});
             requests.push_back(it);
         } catch (const Error& error) {
@@ -473,6 +603,7 @@ std::vector<BatchEvent> BatchScheduler::step() {
             schedule(it, std::span(&*it->pending, 1), LogitsMode::last_token);
         }
     }
+    const auto decodes = evaluations.size();
     for (auto next = s.active.begin(); next != s.active.end();) {
         const auto it = next++;
         if (it->pending)
@@ -486,6 +617,8 @@ std::vector<BatchEvent> BatchScheduler::step() {
     }
     if (evaluations.empty())
         return events;
+    if (s.options.speculative_tokens && budget && decodes)
+        s.extend_decodes(decodes, budget);
     bool retry_individually = false;
     try {
         s.decoder->execute_batch(*s.scratch, {evaluations});
@@ -495,9 +628,18 @@ std::vector<BatchEvent> BatchScheduler::step() {
     }
     for (std::size_t i = 0; i < evaluations.size(); ++i) {
         try {
-            if (retry_individually)
-                s.decoder->execute(*s.scratch, evaluations[i]);
-            s.finish(requests[i], evaluations[i], events);
+            auto& eval = evaluations[i];
+            if (retry_individually) {
+                if (eval.mode == LogitsMode::all_tokens) {
+                    // A rejected speculative row may overflow or produce nonfinite logits.
+                    requests[i]->speculation->verifying = false;
+                    eval.tokens = eval.tokens.first(1);
+                    eval.mode = LogitsMode::last_token;
+                    eval.last_logits = requests[i]->logits;
+                }
+                s.decoder->execute(*s.scratch, eval);
+            }
+            s.finish(requests[i], eval, events);
         } catch (const Error& error) {
             s.fail(requests[i], error, events);
         }
