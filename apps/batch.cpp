@@ -198,6 +198,9 @@ struct BatchOutput {
             ++output_tokens;
             value["event"] = "token";
             value["token_id"] = *event.token;
+            if (event.logprobs)
+                value["logprobs"] =
+                    logprobs_json(*event.logprobs, tokenizer ? &*tokenizer : nullptr, event.emitted == 1);
             if (event.inter_token_ms)
                 value["inter_token_ms"] = *event.inter_token_ms;
         } else {
@@ -298,9 +301,9 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             throw Error(ErrorCode::invalid_argument, "duplicate request ID");
         constexpr std::string_view common[] = {"id", "prompt", "tokens", "lora"};
         constexpr std::string_view tensors[] = {"output", "text_pair", "token_type_ids", "decoder_tokens"};
-        constexpr std::string_view generation[] = {"max_new_tokens", "seed",  "greedy",   "temperature",
-                                                   "top_k",          "top_p", "messages", "stop",
-                                                   "stop_ids",       "decode"};
+        constexpr std::string_view generation[] = {"max_new_tokens", "seed",   "greedy",      "temperature",
+                                                   "top_k",          "top_p",  "messages",    "stop",
+                                                   "stop_ids",       "decode", "top_logprobs"};
         const auto extra = tensor != json.end() ? std::span<const std::string_view>(tensors)
                                                 : std::span<const std::string_view>(generation);
         for (const auto& [key, value] : json.items()) {
@@ -354,7 +357,10 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
              std::move(stops),
              decode ? output.tokenizer : std::optional<Tokenizer>{},
              json.contains("stop") ? stop_strings(json.at("stop")) : std::vector<std::string>{},
-             adapter ? std::optional(*adapter) : std::nullopt});
+             adapter ? std::optional(*adapter) : std::nullopt,
+             json.contains("top_logprobs")
+                 ? std::optional(detail::natural(json.at("top_logprobs"), "top_logprobs"))
+                 : std::nullopt});
     } catch (const std::exception& error) {
         const auto* typed = dynamic_cast<const Error*>(&error);
         const auto code =

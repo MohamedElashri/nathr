@@ -71,6 +71,13 @@ def completion_usage(event):
     return usage
 
 
+def chat_logprob(score):
+    def display(item):
+        return {key: item[key] for key in ("token", "bytes", "logprob")}
+
+    return dict(display(score), top_logprobs=[display(item) for item in score["top_logprobs"]])
+
+
 def response_message(value):
     if not isinstance(value, dict) or value.get("type", "message") != "message":
         raise RequestError("Responses input items must be text messages")
@@ -205,7 +212,8 @@ class Worker:
 
     def read(self):
         try:
-            cap = 64 * self.limits.max_result_values + 4096
+            # A scored token frame can include its own bytes and up to 20 alternatives.
+            cap = max(64 * self.limits.max_result_values + 4096, 256 * 1024)
             while line := self.stdout.readline(cap + 1):
                 if len(line) > cap or not line.endswith(b"\n"):
                     raise RuntimeError("worker response exceeds its frame limit")
@@ -491,7 +499,8 @@ class Handler(BaseHTTPRequestHandler):
         include_usage = False
         if kind != "infer":
             allowed = {"max_tokens", "temperature", "top_p", "stop", "seed", "n", "stream_options", "user"}
-            check_fields(value, allowed | ({"messages", "max_completion_tokens"} if kind == "chat" else {"prompt"}))
+            chat = {"messages", "max_completion_tokens", "logprobs", "top_logprobs"}
+            check_fields(value, allowed | (chat if kind == "chat" else {"prompt"}))
             value.pop("user", None)
             count = value.pop("n", None)
             if count is not None and (type(count) is not int or count != 1):
@@ -507,6 +516,14 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "chat":
                 if "messages" not in value or not metadata["chat"]:
                     raise RequestError("chat requires messages and a checkpoint with a supported chat template")
+                logprobs = value.pop("logprobs", None)
+                top = value.pop("top_logprobs", None)
+                if logprobs is not None and type(logprobs) is not bool:
+                    raise RequestError("logprobs must be a boolean")
+                if top is not None and (not logprobs or type(top) is not int or not 0 <= top <= 20):
+                    raise RequestError("top_logprobs requires logprobs=true and a value from 0 to 20")
+                if logprobs:
+                    value["top_logprobs"] = top if top is not None else 0
             else:
                 if not metadata["text"]:
                     raise RequestError("text completions require a tokenizer")
@@ -666,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.inference_reply(response)
 
-    def generation(self, first, request, deadline, kind, stream, include_usage):
+    def generation(self, first, request, deadline, kind, stream, include_usage, wants_logprobs):
         prefix = "chatcmpl" if kind == "chat" else "cmpl"
         identity = {"id": f"{prefix}-{uuid4().hex}", "created": int(time.time()), "model": self.model_id}
         object_type = "chat.completion.chunk" if kind == "chat" and stream else (
@@ -675,7 +692,7 @@ class Handler(BaseHTTPRequestHandler):
         def envelope(choices, **extra):
             return dict(identity, object=object_type, choices=choices, **extra)
 
-        token_ids, text = [], []
+        token_ids, text, scores = [], [], []
         collected = 0
         if stream:
             self.open_stream()
@@ -683,12 +700,18 @@ class Handler(BaseHTTPRequestHandler):
                 self.sse(envelope([{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
         for event in self.generation_events(first, request, deadline):
             piece = event.get("text", "")
+            score = event.get("logprobs")
+            if score is not None and kind == "chat":
+                score = chat_logprob(score)
             terminal = event["event"] == "done"
             reason = "length" if event.get("reason") == "length" else "stop"
             if stream:
                 if kind == "chat":
-                    if piece:
-                        self.sse(envelope([{"index": 0, "delta": {"content": piece}, "finish_reason": None}]))
+                    if piece or score is not None:
+                        chunk = {"index": 0, "delta": {"content": piece} if piece else {}, "finish_reason": None}
+                        if score is not None:
+                            chunk["logprobs"] = {"content": [score], "refusal": None}
+                        self.sse(envelope([chunk]))
                     if terminal:
                         self.sse(envelope([{"index": 0, "delta": {}, "finish_reason": reason}]))
                 elif kind == "completion":
@@ -698,6 +721,9 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.sse(event)
             else:
+                if score is not None:
+                    scores.append(score)
+                    collected += len(json_bytes(score)) + 1
                 if piece:
                     text.append(piece)
                     collected += len(json_bytes(piece)) - 2
@@ -712,11 +738,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             result = "".join(text)
             if kind == "infer":
-                self.inference_reply(dict(event, generated_ids=token_ids, text=result))
+                result = dict(event, generated_ids=token_ids, text=result)
+                if wants_logprobs:
+                    result["token_logprobs"] = scores
+                self.inference_reply(result)
                 return
             choice = {"index": 0, "finish_reason": reason}
             if kind == "chat":
                 choice["message"] = {"role": "assistant", "content": result}
+                if wants_logprobs:
+                    choice["logprobs"] = {"content": scores, "refusal": None}
             else:
                 choice.update(text=result, logprobs=None)
             self.inference_reply(envelope([choice], usage=completion_usage(event)))
@@ -825,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
             elif kind == "responses":
                 self.response_generation(first, request, deadline, stream, value)
             else:
-                self.generation(first, request, deadline, kind, stream, include_usage)
+                self.generation(first, request, deadline, kind, stream, include_usage, "top_logprobs" in payload)
         except RequestError as error:
             self.send_error_response(error)
         except TimeoutError:

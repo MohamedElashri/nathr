@@ -897,6 +897,16 @@ void tokenizer_and_sampling() {
     std::array logits{3.0f, 3.0f, -1.0f, 1.0f};
     Sampler greedy({}, 4);
     expect(greedy.select(logits, rng) == 0, "lowest greedy tie ID");
+    const std::array shifted{1000.f, 1000.f, 998.f, -1000.f};
+    const auto scores = token_logprobs(shifted, 2, 2);
+    const auto denominator = std::log(2 + std::exp(-2.0));
+    expect(scores.chosen.id == 2 && std::abs(scores.chosen.logprob + 2 + denominator) < 1e-12 &&
+               scores.alternatives.size() == 2 && scores.alternatives[0].id == 0 &&
+               scores.alternatives[1].id == 1 &&
+               std::abs(scores.alternatives[0].logprob + denominator) < 1e-12,
+           "stable raw log probabilities, including a chosen token outside the top set");
+    expect(token_logprobs(shifted, 3, 0).alternatives.empty(), "chosen-token-only scoring");
+    rejects([&] { (void)token_logprobs(shifted, 1, 21); }, ErrorCode::invalid_argument);
     Sampler top_k({false, 1, 1, 1}, 4);
     Sampler top_p({false, 1, 0, 0.1}, 4);
     for (int i = 0; i < 12; ++i) {

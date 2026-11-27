@@ -31,6 +31,22 @@ class Sampler {
     std::vector<Candidate> candidates_;
 };
 
+inline constexpr std::size_t max_top_logprobs = 20;
+
+struct TokenLogprob {
+    Token id;
+    double logprob;
+};
+
+struct TokenLogprobs {
+    TokenLogprob chosen;
+    std::vector<TokenLogprob> alternatives;
+};
+
+// Scores use the model distribution before sampling transforms.
+[[nodiscard]] TokenLogprobs token_logprobs(std::span<const float> logits, Token chosen,
+                                           std::size_t top_count);
+
 struct GenerationResult {
     std::size_t emitted{}, consumed{};
     bool stopped_at_eos{};

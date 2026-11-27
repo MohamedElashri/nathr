@@ -118,6 +118,8 @@ JSON
 
 Use `--messages FILE` to read the same JSON array from disk. Messages can begin with a system message, then alternate user and assistant turns and end with a user message. The checkpoint must have a supported chat template.
 
+Add `--logprobs` to include sampled-token log probabilities in the JSON output, or `--top-logprobs N` to include up to 20 alternatives. Scores come from the raw model distribution before sampling filters.
+
 ### Request a named output
 
 ```sh
@@ -204,6 +206,8 @@ reply = client.chat.completions.create(
 )
 print(reply.choices[0].message.content)
 ```
+
+Chat Completions accepts `logprobs=True` and `top_logprobs=0` through `20`. Scores are supported in streamed and non-streamed replies.
 
 | Endpoint | Use |
 | --- | --- |

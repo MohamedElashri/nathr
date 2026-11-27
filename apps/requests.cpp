@@ -195,4 +195,32 @@ RequestDefaults request_defaults(const std::filesystem::path& path, const Model&
     return result;
 }
 
+detail::Json logprobs_json(const TokenLogprobs& scores, const Tokenizer* tokenizer, bool first) {
+    const auto record = [&](const TokenLogprob& score) {
+        Json value{
+            {"token_id", score.id}, {"logprob", score.logprob}, {"token", nullptr}, {"bytes", nullptr}};
+        if (tokenizer && score.id < tokenizer->vocabulary()) {
+            const auto piece = tokenizer->decode_piece(score.id, first, false);
+            Utf8Stream utf8;
+            auto text = utf8.push(piece);
+            text += utf8.finish();
+            value["token"] = std::move(text);
+            if (!tokenizer->token_bytes(score.id, true).empty()) {
+                std::vector<unsigned> bytes;
+                bytes.reserve(piece.size());
+                for (unsigned char byte : piece)
+                    bytes.push_back(byte);
+                value["bytes"] = std::move(bytes);
+            }
+        }
+        return value;
+    };
+    auto result = record(scores.chosen);
+    auto alternatives = Json::array();
+    for (const auto& alternative : scores.alternatives)
+        alternatives.push_back(record(alternative));
+    result["top_logprobs"] = std::move(alternatives);
+    return result;
+}
+
 } // namespace nathr::cli
