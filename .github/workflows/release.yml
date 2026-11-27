@@ -46,7 +46,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          cat > build/packages/release-notes.md <<EOF
+          The package targets Ubuntu 24.04 on x86-64. See the [quick start](https://github.com/$GITHUB_REPOSITORY/blob/$GITHUB_REF_NAME/README.md#quick-start) for installation.
+
+          Nathr is licensed under GPL-3.0-or-later. [Corresponding source](https://github.com/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz)
+          EOF
           gh release create "$GITHUB_REF_NAME" --verify-tag --latest --title "Nathr $GITHUB_REF_NAME" \
-            --notes "Run the installer, then use nathr run to chat in the terminal or nathr serve for the local OpenAI-compatible API. The package targets Ubuntu 24.04 x86-64 and includes the CLI and C++ library. See the README for installation." \
+            --notes-file build/packages/release-notes.md \
             build/packages/install.sh build/packages/nathr-linux-x86_64.tar.gz \
             build/packages/nathr-linux-x86_64.tar.gz.sha256

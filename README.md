@@ -60,3 +60,9 @@ Press Ctrl+C in the server terminal to stop it.
 - [Serving multiple models](docs/usage.md#serve-multiple-models)
 - [Inference statistics and tuning](docs/usage.md#inference-statistics)
 - [Build from source and use the C++ library](docs/usage.md#build-and-verify)
+
+## License
+
+Nathr is licensed under the GNU General Public License, version 3 or later (`GPL-3.0-or-later`). See [LICENSE](LICENSE).
+
+Bundled third-party components retain their license notices. Model checkpoints use the licenses set by their publishers.

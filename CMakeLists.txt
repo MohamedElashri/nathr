@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(nathr VERSION 0.10.0 LANGUAGES CXX)
+project(nathr VERSION 0.10.1 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
     message(FATAL_ERROR "Nathr requires x86-64 Linux")
@@ -118,6 +118,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/nathrConfig.cmake"
               "${CMAKE_CURRENT_BINARY_DIR}/nathrConfigVersion.cmake" DESTINATION ${NATHR_PACKAGE_DIR})
 install(FILES third_party/json/LICENSE.MIT src/tokenizer/LICENSE.unicode src/quantization/LICENSE.ggml
     DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses")
+install(FILES LICENSE DESTINATION "${CMAKE_INSTALL_DOCDIR}")
 install(PROGRAMS setup.sh DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
 install(FILES ${NATHR_FRONTEND_FILES} DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
 install(FILES models/manifest.json DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr/models")
@@ -153,6 +154,7 @@ if(BUILD_TESTING)
             -DNATHR_PYTHON=${Python3_EXECUTABLE} -DNATHR_VERSION=${PROJECT_VERSION}
             -DNATHR_BINDIR=${CMAKE_INSTALL_BINDIR}
             -DNATHR_DATADIR=${CMAKE_INSTALL_DATADIR}
+            -DNATHR_DOCDIR=${CMAKE_INSTALL_DOCDIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/install.cmake)
         set_tests_properties(nathr-install PROPERTIES LABELS packaging)
     endif()

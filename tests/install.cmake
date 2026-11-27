@@ -30,6 +30,8 @@ if(NOT EXISTS "${model_data}/model_store.py")
 endif()
 execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${model_data}/models/manifest.json"
     "${NATHR_SOURCE_DIR}/models/manifest.json" COMMAND_ERROR_IS_FATAL ANY)
+execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${prefix}/${NATHR_DOCDIR}/LICENSE"
+    "${NATHR_SOURCE_DIR}/LICENSE" COMMAND_ERROR_IS_FATAL ANY)
 if(NATHR_PYTHON AND NATHR_BINDIR STREQUAL "bin")
     execute_process(COMMAND "${NATHR_PYTHON}" -B "${NATHR_SOURCE_DIR}/tests/update.py"
         "${prefix}" "${model_data}" "${stage}" "${NATHR_SOURCE_DIR}/tests/fixtures/t5"
