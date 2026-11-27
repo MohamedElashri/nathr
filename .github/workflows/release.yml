@@ -47,6 +47,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" --verify-tag --latest --title "Nathr $GITHUB_REF_NAME" \
-            --notes "Run the installer, then use nathr run to open the local browser app with a pinned chat model. The package targets Ubuntu 24.04 x86-64 and includes the CLI and C++ library. See the README for installation." \
+            --notes "Run the installer, then use nathr run to chat in the terminal or nathr serve for the local OpenAI-compatible API. The package targets Ubuntu 24.04 x86-64 and includes the CLI and C++ library. See the README for installation." \
             build/packages/install.sh build/packages/nathr-linux-x86_64.tar.gz \
             build/packages/nathr-linux-x86_64.tar.gz.sha256

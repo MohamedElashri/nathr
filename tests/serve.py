@@ -54,6 +54,15 @@ def request(port, path, value=None, status=200):
         assert response.status == status, (path, response.status, raw)
         content_type = response.getheader("Content-Type")
         if content_type == "text/event-stream":
+            if path == "/v1/responses":
+                events = []
+                for frame in raw.rstrip(b"\n").split(b"\n\n"):
+                    name, data = frame.split(b"\n")
+                    event = json.loads(data.removeprefix(b"data: "))
+                    assert name == b"event: " + event["type"].encode()
+                    assert event["sequence_number"] == len(events)
+                    events.append(event)
+                return events
             lines = [line for line in raw.splitlines() if line]
             assert lines[-1] == b"data: [DONE]", lines
             return [json.loads(line.removeprefix(b"data: ")) for line in lines[:-1]]
@@ -120,6 +129,23 @@ def http_checks(binary, checkpoint, encoder):
         assert with_usage[-1]["choices"] == [] and with_usage[-1]["usage"] == complete["usage"]
         request(port, chat_path, dict(chat, model="other"), 404)
         request(port, chat_path, dict(chat, messages=[dict(role="assistant", content="b")]), 400)
+
+        responses = "/v1/responses"
+        payload = dict(model="test", input="b", temperature=0, max_output_tokens=4, store=False)
+        response = request(port, responses, payload)
+        part = response["output"][0]["content"][0]
+        assert response["object"] == "response" and response["status"] == "incomplete"
+        assert response["incomplete_details"] == {"reason": "max_output_tokens"}
+        assert part["type"] == "output_text" and part["text"] == complete["choices"][0]["message"]["content"]
+        assert response["usage"]["input_tokens"] == 15 and response["usage"]["output_tokens"] == 4
+        messages = [dict(role="user", content=[dict(type="input_text", text="b")])]
+        events = request(port, responses, dict(payload, input=messages, stream=True))
+        assert events[0]["type"] == "response.created"
+        assert "".join(event["delta"] for event in events if event["type"] == "response.output_text.delta") == part["text"]
+        assert events[-1]["type"] == "response.incomplete" and events[-1]["response"]["usage"] == response["usage"]
+        request(port, responses, dict(payload, previous_response_id=response["id"]), 400)
+        request(port, responses, dict(payload, store=True), 400)
+        request(port, responses, dict(payload, input=[dict(role="user", content=[dict(type="input_image")])]), 400)
         request(port, "/infer", dict(prompt="b" * 16400), 413)
         request(port, "/infer", dict(tokens=[4] * 6101, max_new_tokens=1), 429)
         assert request(port, "/infer", dict(tokens=[1, 7], output="logits"))["shape"] == [2, 23]
@@ -224,17 +250,26 @@ def chat_stdin(binary, checkpoint):
     assert len(result["prompt_ids"]) == 15 and result["emitted"] == 1
 
 
-def user_commands(binary, checkpoint, directory):
+def user_commands(binary, checkpoint, encoder, directory):
     output = subprocess.check_output([binary, "models", "--models-dir", directory], text=True, timeout=10)
     assert "smollm2" in output and "available" in output and "(default)" in output
     result = subprocess.run([binary, "pull", "unknown", "--models-dir", directory],
                             text=True, capture_output=True, timeout=10)
     assert result.returncode != 0 and "nathr models" in result.stderr
-    reply = subprocess.check_output([binary, "run", checkpoint, "bbbb", "--max-new-tokens", "4"],
-                                    text=True, timeout=10)
-    expected = subprocess.check_output([binary, "generate", checkpoint, "--messages", "-", "--max-new-tokens", "4"],
-                                       input=json.dumps([{"role": "user", "content": "bbbb"}]), text=True, timeout=10)
+    limit = ["--max-new-tokens", "4"]
+    messages = [{"role": "user", "content": "bbbb"}]
+    generate = [binary, "generate", checkpoint, "--messages", "-", *limit]
+    reply = subprocess.check_output([binary, "run", checkpoint, "bbbb", *limit], text=True, timeout=10)
+    expected = subprocess.check_output(generate, input=json.dumps(messages), text=True, timeout=10)
     assert reply == expected
+    terminal = [binary, "run", checkpoint, *limit, "--context", "36"]
+    result = subprocess.run(terminal, input="bbbb\nbbbb\n", text=True, capture_output=True, timeout=10)
+    assert result.returncode != 0 and "exceed context" in result.stderr and result.stdout == expected
+    reply = subprocess.check_output(terminal, input="bbbb\n/reset\nbbbb\n", text=True, timeout=10)
+    assert reply == expected + expected
+    output = subprocess.check_output([binary, "run", encoder], input="The sky is blue.\n/exit\n",
+                                     text=True, timeout=10)
+    assert json.loads(output)["shape"] == [12]
 
 
 if __name__ == "__main__":
@@ -247,5 +282,5 @@ if __name__ == "__main__":
         http_checks(executable, checkpoint, fixtures / "bert")
         stalled_consumer(executable, checkpoint)
         chat_stdin(executable, checkpoint)
-        user_commands(executable, checkpoint, checkpoint / "empty cache")
+        user_commands(executable, checkpoint, fixtures / "bert", checkpoint / "empty cache")
         checkpoint_defaults(executable, checkpoint)

@@ -1,11 +1,12 @@
 # Nathr
 
-Nathr runs small text Transformers locally. Chat, continue a prompt, or inspect model outputs in the browser. The same runtime is available from the CLI and as a C++ library.
+Nathr runs small text Transformers locally. Chat, continue a prompt, and inspect model outputs from the terminal. The same runtime is available through an OpenAI-compatible local API and as a C++ library.
+
 ## Quick start
 
 The prebuilt release targets Ubuntu 24.04 on x86-64. Have Bash, Python 3.10+, `ca-certificates`, `libicu74`, `libstdc++6`, `coreutils`, `tar`, and `flock` from `util-linux` available. Use `curl` or `wget` to fetch the installer. If you install the v0.6.0 release, have `curl` available for model downloads.
 
-Run the installer as your regular user. It verifies the release and downloads the default chat model (about 270 MB). Have `$HOME/.local/bin` on PATH so you can run `nathr` in the same terminal. If needed, run `export PATH="$HOME/.local/bin:$PATH"` first. 
+Run the installer as your regular user. It verifies the release and downloads the default chat model (about 270 MB). Have `$HOME/.local/bin` on PATH so you can run `nathr` in the same terminal. If needed, run `export PATH="$HOME/.local/bin:$PATH"` first.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/MohamedElashri/nathr/main/install.sh | bash
@@ -17,13 +18,13 @@ Or fetch the same script with `wget`.
 wget -qO- https://raw.githubusercontent.com/MohamedElashri/nathr/main/install.sh | bash
 ```
 
-Then start Nathr from the same terminal.
+Try a prompt from the same terminal.
 
 ```sh
-nathr run
+nathr run smollm2 "What is the capital of France?"
 ```
 
-`nathr run` opens the app when a desktop browser is available. You can also open the local URL printed in the terminal. Press Ctrl+C to stop the app.
+The current source build also supports an interactive session with `nathr run`.
 
 To update, rerun the install command. Nathr reuses cached checkpoints. Append `-s -- --no-model` after `bash` to defer downloading the model until `nathr run`. To install offline, download the archive and its checksum and pass the archive to `bash install.sh --archive FILE`.
 
@@ -31,12 +32,12 @@ To update, rerun the install command. Nathr reuses cached checkpoints. Append `-
 
 ```sh
 nathr models
-nathr run smollm2 "What is the capital of France?"
-nathr run minilm
+nathr run
+nathr run minilm "The sky is blue."
 nathr run ./model.gguf
 ```
 
-`run` with a prompt prints generated text in the terminal. Without a prompt, it opens the browser app for the selected checkpoint, including encoder models such as MiniLM. Use `--no-open` to print the browser address without launching it. The `serve` command starts the same app and HTTP API on port 8000 by default.
+Type one prompt per line in an interactive session. Chat models retain the conversation until you type `/reset`. Type `/exit` or press Ctrl+D to leave. A prompt on the command line runs once. Encoder checkpoints print a JSON tensor per prompt. Use `--output NAME` to select an output or `--max-new-tokens N` to limit a generated reply.
 
 Named checkpoints download on first use and share a cache at `${XDG_CACHE_HOME:-$HOME/.cache}/nathr`. Use `NATHR_MODELS` or `--models-dir` to choose another cache. Use `nathr pull NAME` to prefetch a checkpoint and print its local path.
 
@@ -52,7 +53,7 @@ nathr help serve
 
 | Command | Use |
 | --- | --- |
-| `run [MODEL] [PROMPT]` | Open the browser app or run one prompt. Uses `smollm2` by default. |
+| `run [MODEL] [PROMPT]` | Start a terminal session or run one prompt. Uses `smollm2` by default. |
 | `models` | List pinned checkpoint names and show which are cached. |
 | `pull MODEL` | Download a pinned checkpoint and print its path. |
 | `inspect MODEL --summary` | See checkpoint capabilities and output names. The default output is JSON. |
@@ -60,7 +61,7 @@ nathr help serve
 | `infer MODEL PROMPT --output NAME` | Return a named tensor as JSON. Accepts plain text from `--stdin` or raw IDs from `--tokens IDS`. |
 | `tokenize MODEL PROMPT` | Return token IDs. Use `--tokens IDS` to decode or `--stdin` to read one JSON string per line. |
 | `batch MODEL` | Run JSONL generation and tensor requests with one loaded checkpoint. |
-| `serve [MODEL]` | Start the browser interface and HTTP API on loopback. |
+| `serve [MODEL]` | Start the OpenAI-compatible API on loopback. |
 | `bench MODEL` | Measure decoder-only prefill and decode. |
 | `encode MODEL PROMPT` | Return BERT hidden states as JSON rows. |
 | `forward MODEL --tokens IDS` | Inspect decoder-only logits and intermediate activations. |
@@ -139,21 +140,38 @@ nathr bench "$model" --prompt-length 16 --decode-length 4 --warmups 1 --repetiti
 
 The JSON report includes prefill and decode throughput, inter-token timings, and KV memory.
 
-## Serve over HTTP
+## OpenAI-compatible API
 
-Start the server for a known API address.
+Start the local server with the default `smollm2` model.
 
 ```sh
 nathr serve
 ```
 
-Send a request from another terminal.
+Set your client's base URL to `http://127.0.0.1:8000/v1` and its model to `smollm2`. The server runs locally and accepts requests without credentials. If the client requires an API key, use a placeholder such as `local`.
+
+From another terminal, list models and send a chat request.
 
 ```sh
-curl -fsS http://127.0.0.1:8000/model
+curl -fsS http://127.0.0.1:8000/v1/models
 curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"What is the capital of France?"}],"temperature":0,"max_tokens":16}'
+  -d '{"model":"smollm2","messages":[{"role":"user","content":"What is the capital of France?"}],"temperature":0,"max_tokens":16}'
+```
+
+With the OpenAI Python SDK, use the same endpoint.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="local")
+reply = client.chat.completions.create(
+    model="smollm2",
+    messages=[{"role": "user", "content": "What is the capital of France?"}],
+    temperature=0,
+    max_tokens=16,
+)
+print(reply.choices[0].message.content)
 ```
 
 | Endpoint | Use |
@@ -164,9 +182,10 @@ curl -fsS http://127.0.0.1:8000/v1/chat/completions \
 | `POST /infer` | A batch-style request without an ID, for generation or a named tensor |
 | `POST /v1/completions` | Generate from one prompt or token array |
 | `POST /v1/chat/completions` | Generate from text messages |
+| `POST /v1/responses` | Generate from text or message history in the current source build |
 | `POST /v1/embeddings` | Embed text or token arrays with a checkpoint that exposes `sentence_embedding` |
 
-Set `"stream":true` on a generation request for server-sent events. Embeddings accept up to 16 inputs and return fixed-width vectors as floats or base64. The server loads one checkpoint per process. Use `serve --help` to change the port, scheduler settings, or HTTP limits.
+Set `stream=true` for incremental output. Responses requests are stateless and text-only. Send conversation history in `input` for each turn on a chat checkpoint. For embeddings, start `nathr serve minilm` and use the model ID `minilm`. Embedding requests accept up to 16 inputs. Each server loads one checkpoint. See `nathr serve --help` for ports and limits.
 
 ## Build from source
 

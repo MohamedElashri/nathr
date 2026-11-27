@@ -1,4 +1,4 @@
-"""Loopback HTTP frontend for one persistent Nathr JSONL worker."""
+"""Terminal and loopback HTTP frontends for the Nathr JSONL worker."""
 
 import argparse
 import base64
@@ -7,10 +7,8 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
-import os
 from pathlib import Path
 import select
-import shutil
 import signal
 import socket
 import struct
@@ -19,6 +17,7 @@ import sys
 import threading
 import time
 from urllib.parse import unquote
+from uuid import uuid4
 
 
 class RequestError(Exception):
@@ -66,6 +65,22 @@ def prompt_input(value):
 def completion_usage(event):
     prompt, generated = event["prompt_tokens"], event["emitted"]
     return {"prompt_tokens": prompt, "completion_tokens": generated, "total_tokens": prompt + generated}
+
+
+def response_message(value):
+    if not isinstance(value, dict) or value.get("type", "message") != "message":
+        raise RequestError("Responses input items must be text messages")
+    role, content = value.get("role"), value.get("content")
+    if role not in ("system", "developer", "user", "assistant"):
+        raise RequestError("unsupported message role")
+    if isinstance(content, list) and content:
+        if not all(isinstance(part, dict) and part.get("type") in ("input_text", "output_text") and
+                   isinstance(part.get("text"), str) for part in content):
+            raise RequestError("Responses content must contain text parts")
+        content = "".join(part["text"] for part in content)
+    if not isinstance(content, str):
+        raise RequestError("message content must be text")
+    return {"role": "system" if role == "developer" else role, "content": content}
 
 
 @dataclass
@@ -286,6 +301,7 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
         self.connection.settimeout(self.server.options.io_timeout)
         self.started_stream = False
+        self.response_sequence = None
 
     def log_message(self, *args):
         pass
@@ -317,7 +333,9 @@ class Handler(BaseHTTPRequestHandler):
     def send_error_response(self, error):
         response = {"error": {"message": str(error), "type": "request_error", "code": error.status}}
         try:
-            if self.started_stream:
+            if self.response_sequence is not None:
+                self.response_event("error", message=str(error), code=str(error.status), param=None, **response)
+            elif self.started_stream:
                 self.sse(response)
                 self.sse("[DONE]")
             else:
@@ -443,6 +461,33 @@ class Handler(BaseHTTPRequestHandler):
                 raise RequestError("max_new_tokens exceeds the server limit")
         return stream, tensor, include_usage
 
+    def response_input(self, value):
+        check_fields(value, {"input", "instructions", "max_output_tokens", "temperature", "top_p", "stream", "store"})
+        if value.get("store", False) is not False:
+            raise RequestError("Responses are stateless. Use store=false")
+        text = value.get("input")
+        instructions = value.get("instructions")
+        if instructions is not None and not isinstance(instructions, str):
+            raise RequestError("instructions must be text")
+        if isinstance(text, str) and text:
+            messages = [{"role": "user", "content": text}]
+        elif isinstance(text, list) and text:
+            messages = [response_message(item) for item in text]
+        else:
+            raise RequestError("input must be nonempty text or a list of text messages")
+        payload = {key: value[key] for key in ("temperature", "top_p", "stream") if key in value}
+        if value.get("max_output_tokens") is not None:
+            payload["max_tokens"] = value["max_output_tokens"]
+        if self.server.capabilities["chat"]:
+            if instructions is not None:
+                if messages[0]["role"] == "system":
+                    raise RequestError("pass instructions or a system message")
+                messages.insert(0, {"role": "system", "content": instructions})
+            return dict(payload, messages=messages), "chat"
+        if instructions is not None or len(messages) != 1 or messages[0]["role"] != "user":
+            raise RequestError("this checkpoint requires a single user prompt")
+        return dict(payload, prompt=messages[0]["content"]), "completion"
+
     def check_peer(self):
         if select.select([self.connection], [], [], 0)[0]:
             if not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT):
@@ -467,10 +512,71 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.started_stream = True
 
-    def sse(self, value):
+    def sse(self, value, name=None):
         data = b"[DONE]" if value == "[DONE]" else json_bytes(value)
-        self.wfile.write(b"data: " + data + b"\n\n")
+        event = b"" if name is None else b"event: " + name.encode("ascii") + b"\n"
+        self.wfile.write(event + b"data: " + data + b"\n\n")
         self.wfile.flush()
+
+    def response_event(self, kind, **fields):
+        self.sse(dict(fields, type=kind, sequence_number=self.response_sequence), kind)
+        self.response_sequence += 1
+
+    def generation_events(self, event, request, deadline):
+        yield event
+        while event["event"] != "done":
+            event = self.waiting(request, deadline)
+            yield event
+
+    def response_generation(self, first, request, deadline, stream, value):
+        identifier = uuid4().hex
+        item = {"id": f"msg_{identifier}", "type": "message", "role": "assistant",
+                "status": "in_progress", "content": []}
+        part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
+        position = {"item_id": item["id"], "output_index": 0, "content_index": 0}
+        response = {"id": f"resp_{identifier}", "object": "response", "created_at": int(time.time()),
+                    "model": self.server.model["id"], "status": "in_progress", "output": [], "usage": None,
+                    "error": None, "incomplete_details": None, "store": False, "parallel_tool_calls": False,
+                    "tool_choice": "none", "tools": [], "text": {"format": {"type": "text"}},
+                    "instructions": value.get("instructions"), "max_output_tokens": value.get("max_output_tokens"),
+                    "temperature": value.get("temperature"), "top_p": value.get("top_p")}
+        if stream:
+            self.open_stream()
+            self.response_sequence = 0
+            self.response_event("response.created", response=response)
+            self.response_event("response.in_progress", response=response)
+            self.response_event("response.output_item.added", output_index=0, item=item)
+            self.response_event("response.content_part.added", **position, part=part)
+        text, collected = [], 0
+        for event in self.generation_events(first, request, deadline):
+            if piece := event.get("text"):
+                collected += len(json_bytes(piece)) - 2
+                if collected > self.server.options.max_buffer_bytes:
+                    raise RequestError("response buffer limit reached", 429)
+                text.append(piece)
+                if stream:
+                    self.response_event("response.output_text.delta", **position, delta=piece, logprobs=[])
+        part["text"] = "".join(text)
+        complete = event["reason"] != "length"
+        status = "completed" if complete else "incomplete"
+        input_tokens, output_tokens = event["prompt_tokens"], event["emitted"]
+        item.update(status=status, content=[part])
+        response.update(status=status, output=[item], usage={
+            "input_tokens": input_tokens, "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": output_tokens, "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": input_tokens + output_tokens,
+        })
+        if complete:
+            response["completed_at"] = int(time.time())
+        else:
+            response["incomplete_details"] = {"reason": "max_output_tokens"}
+        if stream:
+            self.response_event("response.output_text.done", **position, text=part["text"], logprobs=[])
+            self.response_event("response.content_part.done", **position, part=part)
+            self.response_event("response.output_item.done", output_index=0, item=item)
+            self.response_event(f"response.{status}", response=response)
+        else:
+            self.reply(response)
 
     def generation(self, first, request, deadline, kind, stream, include_usage):
         prefix = "chatcmpl" if kind == "chat" else "cmpl"
@@ -484,12 +590,11 @@ class Handler(BaseHTTPRequestHandler):
 
         token_ids, text = [], []
         collected = 0
-        event = first
         if stream:
             self.open_stream()
             if kind == "chat":
                 self.sse(envelope([{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
-        while True:
+        for event in self.generation_events(first, request, deadline):
             piece = event.get("text", "")
             terminal = event["event"] == "done"
             reason = "length" if event.get("reason") == "length" else "stop"
@@ -514,9 +619,6 @@ class Handler(BaseHTTPRequestHandler):
                     raise RequestError("response buffer limit reached", 429)
                 if piece:
                     text.append(piece)
-            if terminal:
-                break
-            event = self.waiting(request, deadline)
         if stream:
             if include_usage:
                 self.sse(envelope([], usage=completion_usage(event)))
@@ -582,7 +684,7 @@ class Handler(BaseHTTPRequestHandler):
             self.check_host()
             if (origin := self.headers.get("Origin")) is not None and origin != f"http://{self.headers['Host']}":
                 raise RequestError("expected a same-origin browser request", 403)
-            kind = {"/infer": "infer", "/v1/chat/completions": "chat",
+            kind = {"/infer": "infer", "/v1/chat/completions": "chat", "/v1/responses": "responses",
                     "/v1/completions": "completion", "/v1/embeddings": "embeddings"}.get(self.path)
             if kind is None:
                 raise RequestError("endpoint not found", 404)
@@ -593,11 +695,14 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "embeddings":
                 self.embeddings(value, deadline)
                 return
-            stream, tensor, include_usage = self.normalize(value, kind)
-            request = self.server.worker.submit(value)
+            payload, input_kind = self.response_input(value) if kind == "responses" else (value, kind)
+            stream, tensor, include_usage = self.normalize(payload, input_kind)
+            request = self.server.worker.submit(payload)
             first = self.waiting(request, deadline)
             if tensor:
                 self.reply(first)
+            elif kind == "responses":
+                self.response_generation(first, request, deadline, stream, value)
             else:
                 self.generation(first, request, deadline, kind, stream, include_usage)
         except RequestError as error:
@@ -624,23 +729,10 @@ def bounded(low, high):
     return parse
 
 
-def run_prompt(worker, options):
-    metadata = worker.metadata
-    if not metadata["generation"]:
-        raise RequestError("this checkpoint returns named tensors. Run without a prompt to use the browser")
-    if not metadata["text"]:
-        raise RequestError("this checkpoint needs a tokenizer for text input")
-    maximum = min(metadata["max_new_tokens"], options.max_output_tokens)
-    count = options.max_new_tokens if options.max_new_tokens is not None else maximum
-    if count > options.max_output_tokens:
-        raise RequestError("--max-new-tokens exceeds --max-output-tokens")
-    value = {"max_new_tokens": count}
-    if metadata["chat"]:
-        value["messages"] = [{"role": "user", "content": options.prompt}]
-    else:
-        value["prompt"] = options.prompt
+def terminal_input(worker, value, timeout):
     request = worker.submit(value)
-    deadline = time.monotonic() + options.request_timeout
+    deadline = time.monotonic() + timeout
+    text = []
     try:
         while (remaining := deadline - time.monotonic()) > 0:
             event = worker.take(request, remaining)
@@ -648,24 +740,85 @@ def run_prompt(worker, options):
                 break
             if event["event"] == "error" or event.get("reason") == "error":
                 raise RequestError(event.get("message", "inference failed"))
-            if text := event.get("text"):
-                print(text, end="", flush=True)
-            if event["event"] == "done":
-                print()
+            if event["event"] == "result":
+                print(json_bytes({key: item for key, item in event.items() if key not in ("event", "id")}).decode(),
+                      flush=True)
                 return
+            if piece := event.get("text"):
+                text.append(piece)
+                print(piece, end="", flush=True)
+            if event["event"] == "done":
+                print(flush=True)
+                return "".join(text)
         raise RequestError("inference deadline exceeded")
+    except (RequestError, KeyboardInterrupt):
+        if text:
+            print(flush=True)
+        raise
     finally:
         worker.cancel(request)
 
 
-def start_browser(url):
-    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
-        if launcher := shutil.which("xdg-open"):
-            try:
-                subprocess.Popen([launcher, url], start_new_session=True, stdin=subprocess.DEVNULL,
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except OSError as error:
-                print(f"Could not open the browser: {error}", file=sys.stderr)
+def run_terminal(worker, options):
+    metadata = worker.metadata
+    if not metadata["text"]:
+        raise RequestError("this checkpoint needs a tokenizer for text input. Use token IDs with nathr infer or generate")
+    outputs = [item["name"] for item in metadata["outputs"]]
+    output = options.output
+    if output is None and not metadata["generation"]:
+        output = next((name for name in ("sentence_embedding", "logits", *outputs) if name in outputs), None)
+        if output is None:
+            raise RequestError("checkpoint has no available text outputs")
+    if output is not None and output not in outputs:
+        raise RequestError(f"unknown output {output!r}. Available outputs: {', '.join(outputs)}")
+    if output is not None and options.max_new_tokens is not None:
+        raise RequestError("--max-new-tokens requires text generation")
+    count = options.max_new_tokens
+    if count is None:
+        count = min(metadata["max_new_tokens"], options.max_output_tokens)
+    if count > options.max_output_tokens:
+        raise RequestError("--max-new-tokens exceeds --max-output-tokens")
+
+    history = []
+    chat = output is None and metadata["chat"]
+
+    def turn(prompt):
+        if output is not None:
+            value = {"prompt": prompt, "output": output}
+        elif chat:
+            messages = [*history, {"role": "user", "content": prompt}]
+            value = {"messages": messages, "max_new_tokens": count}
+        else:
+            value = {"prompt": prompt, "max_new_tokens": count}
+        reply = terminal_input(worker, value, options.request_timeout)
+        if chat:
+            history.extend((messages[-1], {"role": "assistant", "content": reply}))
+
+    if options.prompt is not None:
+        turn(options.prompt)
+        return
+    interactive = sys.stdin.isatty()
+    if interactive:
+        commands = "/reset to clear the conversation. /exit to quit." if chat else "/exit to quit."
+        print(f"{options.model_id}. {commands}", file=sys.stderr)
+    while True:
+        try:
+            line = input(">>> " if interactive else "")
+        except EOFError:
+            break
+        if not line.strip():
+            continue
+        if line == "/exit":
+            break
+        if chat and line == "/reset":
+            history.clear()
+            continue
+        try:
+            turn(line)
+        except RequestError as error:
+            if not interactive or worker.error:
+                raise
+            print(f"nathr: {error}", file=sys.stderr)
 
 
 def main(executable, directory, mode, args):
@@ -677,8 +830,8 @@ def main(executable, directory, mode, args):
         return
     run = mode == "run"
     parser = argparse.ArgumentParser(prog=f"nathr {mode}",
-                                     description=("Open the local browser app or run one prompt." if run else
-                                                  "Start the browser interface and HTTP API on 127.0.0.1."),
+                                     description=("Start a terminal session or run one prompt." if run else
+                                                  "Serve the OpenAI-compatible API on 127.0.0.1."),
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter, allow_abbrev=False)
     model = parser.add_mutually_exclusive_group()
     model.add_argument("model", nargs="?", metavar="MODEL",
@@ -687,12 +840,13 @@ def main(executable, directory, mode, args):
     parser.add_argument("--models-dir", help="cache directory for named checkpoints (overrides NATHR_MODELS)")
     if run:
         parser.add_argument("prompt", nargs="?", help="one prompt to run in the terminal")
-        parser.add_argument("--prompt", dest="prompt_text", help="run a prompt with the default model")
-        parser.add_argument("--no-open", action="store_true", help="print the browser address without opening it")
-        parser.add_argument("--max-new-tokens", type=bounded(0, 8192), help="limit tokens for a terminal prompt")
-    parser.add_argument("--model-id", help="API model ID, otherwise the checkpoint filename or directory name")
+        parser.add_argument("--prompt", dest="prompt_text", help="run one prompt")
+        parser.add_argument("--no-open", action="store_true", help=argparse.SUPPRESS)
+        parser.add_argument("--max-new-tokens", type=bounded(0, 8192), help="limit generated tokens per turn")
+        parser.add_argument("--output", help="return a named tensor as JSON")
+    parser.add_argument("--model-id", help=argparse.SUPPRESS if run else "API model ID, otherwise the checkpoint name")
     parser.add_argument("--port", type=bounded(0, 65535), default=0 if run else 8000,
-                        help="HTTP port, or 0 for an available port")
+                        help=argparse.SUPPRESS if run else "HTTP port, or 0 for an available port")
     parser.add_argument("--backend", choices=("scalar", "auto", "avx2"), default="auto", help="CPU kernels")
     parser.add_argument("--threads", type=bounded(1, 64), default=1, help="CPU threads")
     parser.add_argument("--tokenizer", help="matching GGUF tokenizer sidecar")
@@ -707,14 +861,17 @@ def main(executable, directory, mode, args):
     scheduler.add_argument("--kv-budget-mib", type=bounded(1, 4096), default=512, help="KV cache budget in MiB")
     scheduler.add_argument("--kv-cache", choices=("f32", "f16"), default="f32", help="KV cache precision")
 
-    limits = parser.add_argument_group("HTTP limits")
-    limits.add_argument("--max-clients", type=bounded(1, 128), default=16, help="simultaneous clients")
-    limits.add_argument("--max-body-bytes", type=bounded(1, 262144), default=65536, help="request body size in bytes")
+    limits = parser.add_argument_group("request limits" if run else "HTTP limits")
+    limits.add_argument("--max-clients", type=bounded(1, 128), default=16,
+                        help=argparse.SUPPRESS if run else "simultaneous clients")
+    limits.add_argument("--max-body-bytes", type=bounded(1, 262144), default=65536,
+                        help=argparse.SUPPRESS if run else "request body size in bytes")
     limits.add_argument("--max-output-tokens", type=bounded(1, 8192), default=256, help="generated tokens per request")
     limits.add_argument("--max-result-values", type=bounded(1, 131072), default=65536, help="values per named tensor")
     limits.add_argument("--max-buffer-bytes", type=bounded(128, 8388608), default=2097152,
                         help="buffer size per response in bytes")
-    limits.add_argument("--io-timeout", type=bounded(1, 60), default=5, help="socket I/O timeout in seconds")
+    limits.add_argument("--io-timeout", type=bounded(1, 60), default=5,
+                        help=argparse.SUPPRESS if run else "socket I/O timeout in seconds")
     limits.add_argument("--request-timeout", type=bounded(1, 600), default=120, help="inference timeout in seconds")
     options = parser.parse_args(args)
     if run:
@@ -722,8 +879,8 @@ def main(executable, directory, mode, args):
             parser.error("pass one prompt")
         if options.prompt_text is not None:
             options.prompt = options.prompt_text
-        if options.max_new_tokens is not None and options.prompt is None:
-            parser.error("--max-new-tokens requires a terminal prompt")
+        if options.no_open and options.prompt is None and (options.max_new_tokens is not None or options.output):
+            parser.error("terminal options cannot be used with --no-open")
     if options.max_active > options.step_tokens:
         parser.error("--step-tokens must cover all active slots")
     model_path, model_id = ModelStore(options.models_dir).resolve(options.model or options.model_path)
@@ -736,14 +893,12 @@ def main(executable, directory, mode, args):
     worker = Worker(command, options)
     try:
         worker.start()
-        if run and options.prompt is not None:
-            run_prompt(worker, options)
+        if run and (not options.no_open or options.prompt is not None):
+            run_terminal(worker, options)
             return
         with Server(worker, options) as server:
             url = f"http://127.0.0.1:{server.server_address[1]}"
             print(f"Listening on {url}", flush=True)
-            if run and not options.no_open:
-                start_browser(url)
             server.serve_forever()
     finally:
         worker.close()

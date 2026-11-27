@@ -46,7 +46,7 @@ main() (
         exit 1
     fi
     if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null; then
-        printf 'Nathr requires Python 3.10 or newer for the browser and model downloads.\n' >&2
+        printf 'Nathr requires Python 3.10 or newer.\n' >&2
         exit 1
     fi
 
@@ -151,9 +151,9 @@ main() (
 
     printf 'Installed Nathr %s at %s\n' "$actual_version" "$launcher"
     if [[ :$PATH: == *":$bin_dir:"* ]]; then
-        printf 'Run nathr run to open the app.\n'
+        printf 'Try nathr run smollm2 "Say hello."\n'
     else
-        printf 'Add the command directory to PATH, or run %q run.\n' "$launcher"
+        printf 'Add the command directory to PATH, or try %q run smollm2 "Say hello."\n' "$launcher"
         printf "  export PATH=%q:\"\$PATH\"\n" "$bin_dir"
     fi
 )

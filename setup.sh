@@ -134,7 +134,7 @@ done
 printf '\nReady. Run from the repository root:\n'
 for model in "${models[@]}"; do
     if [[ $selection == instruct || $selection == smollm2 ]]; then
-        printf ' %q' "$bin" serve "$model"
+        printf ' %q' "$bin" run "$model"
         printf '\n'
         continue
     fi

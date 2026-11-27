@@ -197,7 +197,7 @@ The scheduler gives active requests one decode token per step, then divides the 
 
 Admission reserves enough KV capacity for a request’s token budget. The engine allocates pages as needed and returns them to a budgeted pool when a request finishes or is cancelled. It reuses matching pages and discards idle pages when a new allocation needs their space. Check seeded output against standalone execution and measure latency under mixed prompt lengths. [KV page pool](../src/backend/cpu/scalar.hpp) · [Batch CLI](../README.md#batch-requests)
 
-The HTTP frontend sends JSONL requests to one persistent worker for the loaded model. The server adapts completions, chat, and embeddings to the same request format used by the batch CLI. Its model endpoint uses the same capability descriptions as `inspect`, and the browser interface uses those capabilities to select which modes to show. The frontend bounds client count, request bodies, and response buffering. It drains results into per-request buffers and sends a cancellation between scheduler steps when a buffer fills or a client disconnects. [HTTP frontend](../apps/serve.py) · [Browser interface](../apps/web) · [HTTP endpoints](../README.md#serve-over-http)
+The terminal and HTTP frontends send JSONL requests to a persistent worker. The terminal keeps chat history in the current session. The API adapts text generation and embeddings to the batch request format and exposes the same model capabilities as `inspect`. It bounds client count, request bodies, and response buffering, and cancels a request between scheduler steps if a buffer fills or a client disconnects. [Frontends](../apps/serve.py) · [HTTP endpoints](../README.md#openai-compatible-api)
 
 ## 7. Execute packed weights and make the CPU path faster
 

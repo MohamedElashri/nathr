@@ -838,7 +838,7 @@ struct CommandHelp {
 };
 
 constexpr CommandHelp commands[] = {
-    {"run", "Run a named or local model in the browser or terminal", "run [MODEL] [PROMPT]", ""},
+    {"run", "Start a terminal session or run one prompt", "run [MODEL] [PROMPT]", ""},
     {"models", "List pinned checkpoint names and cache status", "models", ""},
     {"pull", "Download and verify a named checkpoint", "pull MODEL", ""},
     {"generate", "Continue a prompt or run chat messages",
@@ -883,7 +883,7 @@ constexpr CommandHelp commands[] = {
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
      "  --stats                       Emit timings and KV stats after the batch drains.\n"},
-    {"serve", "Start the browser interface and local HTTP API", "serve [MODEL]", ""},
+    {"serve", "Start the local OpenAI-compatible API", "serve [MODEL]", ""},
     {"bench", "Measure decoder-only prefill and decode", "bench MODEL",
      "  --prompt-length N             Set the synthetic prompt length (default 128).\n"
      "  --decode-length N             Set the decode length (default 32).\n"
