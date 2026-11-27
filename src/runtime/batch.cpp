@@ -200,6 +200,9 @@ struct BatchScheduler::Impl {
 
     void reuse_prefix(Request& request) {
         const auto tokens = std::span(request.input.tokens);
+        if (tokens.size() < Cache::page_tokens)
+            return;
+        ++prefix_lookups;
         while (tokens.size() - request.position >= Cache::page_tokens) {
             auto* page = prefixes.find(request.prefix, tokens.subspan(request.position));
             if (!page)
@@ -209,6 +212,8 @@ struct BatchScheduler::Impl {
             request.position += Cache::page_tokens;
         }
         request.cached_prompt_tokens = request.position;
+        cached_prompt_tokens += request.position;
+        prefix_hits += request.position > 0;
         // Replay the last token for its logits while reading the already complete page.
         if (request.position == tokens.size())
             --request.position;
@@ -307,6 +312,7 @@ struct BatchScheduler::Impl {
     std::vector<Evaluation> evaluations;
     std::vector<Requests::iterator> scheduled;
     std::size_t reserved = 0, queued_tokens = 0, queue_bypasses = 0;
+    std::size_t prefix_lookups = 0, prefix_hits = 0, cached_prompt_tokens = 0;
 };
 
 BatchScheduler::BatchScheduler(const Model& model, BatchOptions options)
@@ -458,5 +464,12 @@ std::size_t BatchScheduler::kv_page_reuses() const noexcept {
 
 std::size_t BatchScheduler::queue_bypasses() const noexcept {
     return impl_->queue_bypasses;
+}
+
+BatchMetrics BatchScheduler::metrics() const noexcept {
+    const auto& s = *impl_;
+    return {s.active.size(),     s.queued.size(),         s.queued_tokens,
+            s.pool.used_bytes(), s.pool.resident_bytes(), s.options.kv_budget_bytes,
+            s.prefix_lookups,    s.prefix_hits,           s.cached_prompt_tokens};
 }
 } // namespace nathr

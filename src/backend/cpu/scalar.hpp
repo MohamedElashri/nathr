@@ -62,6 +62,7 @@ class CachePagePool {
     }
 
     [[nodiscard]] std::size_t peak_bytes() const noexcept { return peak_; }
+    [[nodiscard]] std::size_t used_bytes() const noexcept { return in_use_; }
     [[nodiscard]] std::size_t resident_bytes() const noexcept { return resident_; }
     [[nodiscard]] std::size_t reuses() const noexcept { return reuses_; }
 

@@ -72,9 +72,11 @@ set(NATHR_TEST_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
 add_executable(nathr apps/nathr.cpp apps/batch.cpp apps/requests.cpp)
 file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-serve.py" INPUT "${CMAKE_CURRENT_SOURCE_DIR}/apps/serve.py")
-foreach(module IN ITEMS model_store.py bench_serve.py)
+set(NATHR_FRONTEND_MODULES apps/model_store.py apps/bench_serve.py apps/serving_metrics.py)
+foreach(source IN LISTS NATHR_FRONTEND_MODULES)
+    get_filename_component(module "${source}" NAME)
     file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-data/${module}"
-        INPUT "${CMAKE_CURRENT_SOURCE_DIR}/apps/${module}")
+        INPUT "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
 endforeach()
 file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-data/models/manifest.json"
     INPUT "${CMAKE_CURRENT_SOURCE_DIR}/models/manifest.json")
@@ -113,7 +115,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/nathrConfig.cmake"
 install(FILES third_party/json/LICENSE.MIT src/tokenizer/LICENSE.unicode src/quantization/LICENSE.ggml
     DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses")
 install(PROGRAMS setup.sh DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
-install(FILES apps/model_store.py apps/bench_serve.py DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
+install(FILES ${NATHR_FRONTEND_MODULES} DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
 install(FILES models/manifest.json DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr/models")
 
 set(CPACK_GENERATOR TGZ)

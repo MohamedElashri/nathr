@@ -67,7 +67,10 @@ def request(port, path, value=None, status=200):
             assert lines[-1] == b"data: [DONE]", lines
             return [json.loads(line.removeprefix(b"data: ")) for line in lines[:-1]]
         if content_type.startswith("text/"):
-            assert response.getheader("Content-Security-Policy")
+            if path.partition("?")[0] == "/metrics":
+                assert content_type.startswith("text/plain; version=0.0.4")
+            else:
+                assert response.getheader("Content-Security-Policy")
             return raw.decode()
         return json.loads(raw)
     finally:
@@ -284,6 +287,11 @@ def user_commands(binary, checkpoint, encoder, directory):
     assert json.loads(output)["shape"] == [12]
 
 
+def metric_value(metrics, name, model):
+    prefix = f'nathr_{name}{{model="{model}"}} '
+    return float(next(line[len(prefix):] for line in metrics.splitlines() if line.startswith(prefix)))
+
+
 def multi_model_benchmark(binary, checkpoint, encoder):
     with server(binary, checkpoint, "--model-id", "chat", "--also", encoder, "--context", "128") as port:
         models = request(port, "/v1/models")["data"]
@@ -294,6 +302,12 @@ def multi_model_benchmark(binary, checkpoint, encoder):
         assert set(request(port, "/health")["models"]) == {"chat", "bert"}
         request(port, "/health?model=missing", status=404)
         assert request(port, "/health?model=chat")["kv"]["peak_bytes"] == 0
+        metrics = request(port, "/metrics")
+        assert metric_value(metrics, "worker_up", "chat") == metric_value(metrics, "worker_up", "bert") == 1
+        assert metric_value(metrics, "kv_budget_bytes", "chat") > 0
+        assert metric_value(metrics, "kv_budget_bytes", "bert") == 0
+        assert "# TYPE nathr_time_to_first_token_seconds histogram" in metrics
+        request(port, "/metrics?model=missing", status=404)
         assert request(port, "/v1/responses", dict(input="b", max_output_tokens=1))["model"] == "chat"
         embedding = request(port, "/v1/embeddings", dict(model="bert", input="The sky is blue."))
         assert embedding["model"] == "bert" and len(embedding["data"][0]["embedding"]) == 12
@@ -312,6 +326,20 @@ def multi_model_benchmark(binary, checkpoint, encoder):
                                         text=True, timeout=15)
         result = json.loads(mixed)
         assert result["short"]["requests"] == 3 and result["long"]["requests"] == 1
+
+        metrics = request(port, "/metrics?model=chat")
+        assert 'model="bert"' not in metrics
+        assert metric_value(metrics, "requests_active", "chat") == metric_value(metrics, "requests_queued", "chat") == 0
+        assert metric_value(metrics, "kv_used_bytes", "chat") > 0
+        assert 0 < metric_value(metrics, "prefix_cache_hits_total", "chat") <= metric_value(
+            metrics, "prefix_cache_lookups_total", "chat")
+        assert metric_value(metrics, "prefix_cache_tokens_total", "chat") >= 64
+        assert metric_value(metrics, "time_to_first_token_seconds_count", "chat") == 10
+        assert metric_value(metrics, "request_queue_time_seconds_count", "chat") == 10
+        assert 'nathr_time_to_first_token_seconds_bucket{model="chat",le="+Inf"} 10' in metrics.splitlines()
+        metrics = request(port, "/metrics?model=bert")
+        assert metric_value(metrics, "request_duration_seconds_count", "bert") == 1
+        assert metric_value(metrics, "time_to_first_token_seconds_count", "bert") == 0
 
 
 if __name__ == "__main__":

@@ -682,7 +682,7 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
         "batch KV budget");
     batch_options.session = session_options(args);
     const cli::BatchIoOptions io{args.flag("--stats"), args.flag("--ready"),
-                                 number(args, "--max-result-values", std::size_t{0})};
+                                 number(args, "--max-result-values", std::size_t{0}), args.flag("--metrics")};
     const auto tokenizer = args.option("--tokenizer").value_or("");
     args.finish();
     cli::run_batch(Model::load(path, options), path, tokenizer, batch_options, io);

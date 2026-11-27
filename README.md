@@ -188,6 +188,7 @@ print(reply.choices[0].message.content)
 | Endpoint | Use |
 | --- | --- |
 | `GET /health` | Worker status, request counts, and KV memory |
+| `GET /metrics` | Per-model Prometheus metrics for scheduler load, KV usage, cache hits, and latency |
 | `GET /model` | Checkpoint capabilities, output shapes, and request limits |
 | `GET /v1/models`, `GET /v1/models/{id}` | List and retrieve model IDs for OpenAI-compatible clients |
 | `POST /infer` | A batch-style request without an ID, for generation or a named tensor |
@@ -203,6 +204,8 @@ nathr serve smollm2 --also minilm
 ```
 
 Use `smollm2` for generation and `minilm` for embedding up to 16 inputs per request. Repeat `--also` to load more checkpoints. The first model handles requests without a model ID. Each model has its own worker and KV budget. Use `/model?model=minilm` or `/health?model=minilm` to inspect one worker.
+
+Scrape `http://127.0.0.1:8000/metrics` for all models or add `?model=smollm2` for one model. Queue and KV gauges reflect the last scheduler boundary. Latency histograms use seconds and measure worker activity.
 
 ## Build from source
 

@@ -354,8 +354,13 @@ void batch_scheduler() {
     BatchScheduler scheduler(model, options);
     scheduler.submit(long_prompt);
     scheduler.submit(short_prompt);
+    const auto waiting = scheduler.metrics();
+    expect(waiting.queued_requests == 2 && waiting.queued_tokens == 39 && waiting.active_requests == 0,
+           "scheduler metrics report the queued prompts");
     rejects([&] { scheduler.submit(short_prompt); }, ErrorCode::invalid_argument);
     record(scheduler.step());
+    expect(scheduler.metrics().active_requests > 0 && scheduler.metrics().queued_requests == 0,
+           "scheduler metrics track admission");
     expect(observed[1].empty() && observed[2].size() == 1, "short prompt progresses before long prefill");
     scheduler.submit({3, std::vector<Token>(22, 8), 4, 0, {}});
     record(scheduler.step());

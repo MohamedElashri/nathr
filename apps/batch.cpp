@@ -269,6 +269,27 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
         output.live_stats = &*scheduler;
     BatchInput input;
     const auto defaults = request_defaults(path, model, true);
+    std::optional<BatchMetrics> last_metrics;
+    const auto publish_metrics = [&] {
+        if (!io.metrics || !scheduler)
+            return;
+        const auto values = scheduler->metrics();
+        if (last_metrics == values)
+            return;
+        last_metrics = values;
+        write_output({{"event", "metrics"},
+                      {"values",
+                       {{"requests_active", values.active_requests},
+                        {"requests_queued", values.queued_requests},
+                        {"queued_tokens", values.queued_tokens},
+                        {"kv_used_bytes", values.kv_used_bytes},
+                        {"kv_resident_bytes", values.kv_resident_bytes},
+                        {"kv_budget_bytes", values.kv_budget_bytes},
+                        {"prefix_cache_lookups_total", values.prefix_lookups},
+                        {"prefix_cache_hits_total", values.prefix_hits},
+                        {"prefix_cache_tokens_total", values.cached_prompt_tokens}}}});
+    };
+    publish_metrics();
     if (io.ready) {
         try {
             output.tokenizer = load_tokenizer(model, path, sidecar);
@@ -288,10 +309,14 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
     const auto start = Clock::now();
     const auto empty = [&] { return !scheduler || scheduler->empty(); };
     while (!input.done() || !empty()) {
-        if (auto line = input.next(empty()))
+        if (auto line = input.next(empty())) {
             command(*line, model, scheduler, output, path, sidecar, defaults, io.max_result_values);
+            publish_metrics();
+        }
         if (!empty()) {
-            for (const auto& event : scheduler->step())
+            const auto events = scheduler->step();
+            publish_metrics();
+            for (const auto& event : events)
                 output.publish(event);
         }
     }

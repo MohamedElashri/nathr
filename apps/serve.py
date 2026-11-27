@@ -108,11 +108,13 @@ class Request:
     cancelled: bool = False
     cancel_sent: bool = False
     error: RequestError | None = None
+    submitted_at: float = field(default_factory=time.monotonic)
 
 
 class Worker:
-    def __init__(self, command, limits):
+    def __init__(self, command, limits, metrics=None):
         self.limits = limits
+        self.metrics = metrics
         self.changed = threading.Condition()
         self.pending = {}
         self.next_id = 0
@@ -213,10 +215,17 @@ class Worker:
                         self.outputs = {item["name"] for item in event["outputs"]}
                         self.changed.notify_all()
                         continue
+                    if event["event"] == "metrics":
+                        if self.metrics is not None:
+                            self.metrics.scheduler = event["values"]
+                        continue
                     request = self.pending.get(event.get("id"))
                     if request is None:
                         continue
                     terminal = event["event"] in {"done", "error", "result"}
+                    if self.metrics is not None:
+                        duration = time.monotonic() - request.submitted_at if terminal else None
+                        self.metrics.observe(event, duration)
                     if terminal:
                         if "kv" in event:
                             self.kv = event["kv"]
@@ -277,6 +286,10 @@ class Worker:
                 kv=self.kv,
             )
 
+    def metrics_snapshot(self):
+        with self.changed:
+            return self.metrics.snapshot(up=self.error is None, pending=len(self.pending), cancelled=self.cancelled)
+
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
@@ -307,6 +320,12 @@ class Server(ThreadingHTTPServer):
         healthy = sum(snapshot["status"] == "ok" for snapshot in models.values())
         status = "unavailable" if not healthy else "ok" if healthy == len(models) else "degraded"
         return {"status": status, "models": models}
+
+    def metrics_body(self, model_id):
+        from serving_metrics import render_metrics
+
+        workers = self.workers if model_id is None else {model_id: self.worker_for(model_id)}
+        return render_metrics({name: worker.metrics_snapshot() for name, worker in workers.items()})
 
     def process_request(self, request, client_address):
         if self.slots.acquire(blocking=False):
@@ -407,6 +426,8 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/health":
                 health = self.server.health(model_id)
                 self.reply(health, 503 if health["status"] == "unavailable" else 200)
+            elif path == "/metrics":
+                self.send_body(self.server.metrics_body(model_id), "text/plain; version=0.0.4; charset=utf-8")
             elif path == "/v1/models":
                 self.reply({"object": "list", "data": [model_card(name) for name in self.server.workers]})
             elif path.startswith("/v1/models/"):
@@ -894,6 +915,7 @@ def main(executable, directory, mode, args):
         benchmark(args)
         return
     from model_store import ModelStore, command as model_command
+    from serving_metrics import ModelMetrics
 
     if mode in ("models", "pull"):
         model_command(mode, args)
@@ -959,6 +981,7 @@ def main(executable, directory, mode, args):
             parser.error("terminal options cannot be used with --no-open")
     if options.max_active > options.step_tokens:
         parser.error("--step-tokens must cover all active slots")
+    serving = not run or (options.no_open and options.prompt is None)
     store = ModelStore(options.models_dir)
     model_path, model_id = store.resolve(options.model or options.model_path)
     options.model_id = options.model_id or model_id
@@ -975,20 +998,22 @@ def main(executable, directory, mode, args):
             worker_args.extend(("--" + name.replace("_", "-"), str(value)))
     if options.no_prefix_cache:
         worker_args.append("--no-prefix-cache")
+    if serving:
+        worker_args.append("--metrics")
     with ExitStack() as cleanup:
         workers = {}
         for model_id, path in checkpoints.items():
             command = [executable, "batch", "--model", str(path), "--ready", *worker_args]
             if options.tokenizer and model_id == options.model_id:
                 command.extend(("--tokenizer", options.tokenizer))
-            worker = Worker(command, options)
+            worker = Worker(command, options, ModelMetrics() if serving else None)
             cleanup.callback(worker.close)
             try:
                 worker.start()
             except (RequestError, RuntimeError) as error:
                 raise RequestError(f"{model_id}: {error}") from error
             workers[model_id] = worker
-        if run and (not options.no_open or options.prompt is not None):
+        if not serving:
             run_terminal(workers[options.model_id], options)
             return
         with Server(workers, options) as server:
