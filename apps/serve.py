@@ -3,7 +3,7 @@
 import argparse
 import base64
 from collections import deque
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -287,7 +287,10 @@ class Worker:
             if len(self.pending) >= self.limits.max_clients:
                 raise RequestError("request limit reached", 429)
             self.next_id += 1
-            request = Request(self.next_id, json_bytes(dict(value, id=self.next_id)) + b"\n")
+            payload = json_bytes(dict(value, id=self.next_id))
+            if len(payload) > 1024 * 1024:
+                raise RequestError("request exceeds the worker's input limit", 413)
+            request = Request(self.next_id, payload + b"\n")
             self.pending[request.id] = request
             self.changed.notify_all()
             return request
@@ -886,10 +889,34 @@ class Handler(BaseHTTPRequestHandler):
                 choice.update(text=result, logprobs=None)
             self.inference_reply(envelope([choice], usage=completion_usage(event)))
 
+    def encoder_results(self, output, width, inputs, deadline):
+        # Leave room for a burst of raw JSON floats even when the HTTP reply uses base64.
+        frame_bytes = 32 * width + 256
+        count = max(1, (self.server.options.max_buffer_bytes - 128) // frame_bytes)
+        for start in range(0, len(inputs), count):
+            group = inputs[start:start + count]
+            multiple = len(group) > 1
+            payload = {"output": output, "inputs": group} if multiple else dict(group[0], output=output)
+            self.check_peer()
+            if time.monotonic() >= deadline:
+                raise RequestError("inference deadline exceeded", 504)
+            request = self.worker.submit(payload)
+            event = "tensor" if multiple else "result"
+            try:
+                for index in range(len(group)):
+                    result = self.waiting(request, deadline)
+                    if result["event"] != event or (multiple and result.get("index") != index):
+                        raise RequestError("invalid encoder worker response", 502)
+                    yield result
+                if multiple and self.waiting(request, deadline).get("reason") != "result":
+                    raise RequestError("missing encoder worker result", 502)
+            finally:
+                self.worker.cancel(request)
+
     def embeddings(self, value, deadline):
         check_fields(value, {"input", "encoding_format", "dimensions", "user"})
         output_name = "sentence_embedding"
-        if output_name not in self.worker.outputs:
+        if output_name not in self.worker.outputs or not self.worker.metadata.get("encoder_batch"):
             raise RequestError("checkpoint does not expose sentence_embedding")
         encoding = value.get("encoding_format", "float")
         if encoding not in ("float", "base64"):
@@ -905,28 +932,20 @@ class Handler(BaseHTTPRequestHandler):
         elif not (isinstance(inputs, list) and 1 <= len(inputs) <= 16 and
                   (all(isinstance(item, str) for item in inputs) or all(token_input(item) for item in inputs))):
             raise RequestError("expected text, tokens, or a batch of up to 16 inputs of the same type")
-        payloads = [dict(prompt_input(item), output=output_name) for item in inputs]
+        payloads = [prompt_input(item) for item in inputs]
         data = bytearray(b'{"object":"list","model":' + json_bytes(self.model_id) + b',"data":[')
         prompt_tokens = 0
-        worker = self.worker
-        for index, payload in enumerate(payloads):
-            self.check_peer()
-            if time.monotonic() >= deadline:
-                raise RequestError("inference deadline exceeded", 504)
-            request = worker.submit(payload)
-            try:
-                result = self.waiting(request, deadline)
-            finally:
-                worker.cancel(request)
-            vector = result["values"]
-            if encoding == "base64":
-                vector = base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
-            entry = json_bytes({"object": "embedding", "index": index, "embedding": vector})
-            self.check_response_size(len(data) + bool(index) + len(entry))
-            if index:
-                data.extend(b",")
-            data.extend(entry)
-            prompt_tokens += result["prompt_tokens"]
+        with closing(self.encoder_results(output_name, output["width"], payloads, deadline)) as results:
+            for index, result in enumerate(results):
+                vector = result["values"]
+                if encoding == "base64":
+                    vector = base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
+                entry = json_bytes({"object": "embedding", "index": index, "embedding": vector})
+                self.check_response_size(len(data) + bool(index) + len(entry))
+                if index:
+                    data.extend(b",")
+                data.extend(entry)
+                prompt_tokens += result["prompt_tokens"]
         data.extend(b'],"usage":' + json_bytes({"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}) + b"}")
         self.inference_body(data)
 
@@ -957,6 +976,41 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.worker.cancel(request)
 
+    def rerank(self, value, deadline):
+        check_fields(value, {"query", "documents", "top_n", "user"})
+        metadata = self.worker.metadata
+        if (not metadata.get("encoder_batch") or not metadata["text"] or
+                "token_type_ids" not in metadata["inputs"] or
+                not any(output["name"] == "logits" and output["width"] == 1 and not output["sequence"]
+                        for output in metadata["outputs"])):
+            raise RequestError("reranking requires a text-pair checkpoint with one logit")
+        query, documents = value.get("query"), value.get("documents")
+        if not isinstance(query, str) or not query:
+            raise RequestError("query must be a nonempty string")
+        if isinstance(documents, str):
+            documents = [documents]
+        if (not isinstance(documents, list) or not 1 <= len(documents) <= 16 or
+                not all(isinstance(document, str) and document for document in documents)):
+            raise RequestError("documents must contain 1 to 16 nonempty strings")
+        top_n = value.get("top_n", 0)
+        if type(top_n) is not int or top_n < 0:
+            raise RequestError("top_n must be a nonnegative integer")
+        payloads = [{"prompt": query, "text_pair": document} for document in documents]
+        ranked = []
+        total_tokens = 0
+        with closing(self.encoder_results("logits", 1, payloads, deadline)) as results:
+            for index, result in enumerate(results):
+                ranked.append((index, result["values"][0]))
+                total_tokens += result["prompt_tokens"]
+        ranked.sort(key=lambda pair: pair[1], reverse=True)
+        results = []
+        for index, logit in ranked[:top_n or len(ranked)]:
+            exp = math.exp(-abs(logit))
+            score = 1 / (1 + exp) if logit >= 0 else exp / (1 + exp)
+            results.append({"index": index, "document": {"text": documents[index]}, "relevance_score": score})
+        self.inference_reply({"id": f"rerank-{uuid4().hex}", "model": self.model_id,
+                              "usage": {"total_tokens": total_tokens}, "results": results})
+
     def do_POST(self):
         request = None
         try:
@@ -967,7 +1021,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.change_lora(self.path == "/v1/load_lora_adapter")
                 return
             kind = {"/infer": "infer", "/v1/chat/completions": "chat", "/v1/responses": "responses",
-                    "/v1/completions": "completion", "/v1/embeddings": "embeddings"}.get(self.path)
+                    "/v1/completions": "completion", "/v1/embeddings": "embeddings",
+                    "/rerank": "rerank", "/v1/rerank": "rerank", "/v2/rerank": "rerank"}.get(self.path)
             if kind is None:
                 raise RequestError("endpoint not found", 404)
             value = self.body()
@@ -978,6 +1033,9 @@ class Handler(BaseHTTPRequestHandler):
             deadline = time.monotonic() + self.server.options.request_timeout
             if kind == "embeddings":
                 self.embeddings(value, deadline)
+                return
+            if kind == "rerank":
+                self.rerank(value, deadline)
                 return
             structured, schema, tool_name = False, None, None
             if kind == "chat":

@@ -301,6 +301,27 @@ TensorResult Model::infer(InferenceInput input, std::string_view output, const L
     return result;
 }
 
+std::vector<TensorResult> Model::infer_batch(std::span<const InferenceInput> inputs,
+                                             std::string_view output) const {
+    if (const auto* bert = std::get_if<std::unique_ptr<Bert>>(&impl_->execution)) {
+        const auto available = outputs();
+        const auto info = std::ranges::find(available, output, &OutputInfo::name);
+        if (info == available.end())
+            throw Error(ErrorCode::unsupported, "checkpoint has no output named " + std::string(output));
+        for (const auto& input : inputs) {
+            validate_tokens(input.tokens, config(), info->input_limit);
+            if (!input.decoder_tokens.empty())
+                throw Error(ErrorCode::invalid_argument, "BERT input has no decoder tokens");
+        }
+        return (*bert)->infer_batch(inputs, *info);
+    }
+    std::vector<TensorResult> results;
+    results.reserve(inputs.size());
+    for (const auto& input : inputs)
+        results.push_back(infer(input, output));
+    return results;
+}
+
 std::string_view Model::backend() const noexcept {
     return impl_->backend.name();
 }

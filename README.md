@@ -221,6 +221,7 @@ Chat Completions accepts `logprobs=True` and `top_logprobs=0` through `20`. Scor
 | `POST /v1/chat/completions` | Generate from text messages |
 | `POST /v1/responses` | Generate from text or message history in the current source build |
 | `POST /v1/embeddings` | Embed text or token arrays with a checkpoint that exposes `sentence_embedding` |
+| `POST /v1/rerank` | Rank documents with a text-pair checkpoint that returns one logit |
 
 Set `stream=true` for incremental output. Responses requests are stateless and text-only. Send conversation history in `input` for each turn on a chat checkpoint.
 
@@ -232,7 +233,19 @@ nathr serve smollm2 --also minilm
 
 Use `smollm2` for generation and `minilm` for embedding up to 16 inputs per request. Repeat `--also` to load more checkpoints. The first model handles requests without a model ID. Each model has its own worker and KV budget. Use `/model?model=minilm` or `/health?model=minilm` to inspect one worker.
 
+Encoder workers group similar token lengths into bounded batches. To rerank, add `--also tinybert`
+and send a query and up to 16 documents.
+
+```sh
+curl -fsS http://127.0.0.1:8000/v1/rerank \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tinybert","query":"Capital of France?","documents":["Paris","Berlin"],"top_n":1}'
+```
+
+Results include original document indices and sigmoid relevance scores in descending order.
+
 Add `--lora-root ./adapters` to enable loading and unloading without restarting. `POST /v1/load_lora_adapter` accepts `{"lora_name":"tuned","lora_path":"my-adapter"}`, where the path resolves beneath that directory. `POST /v1/unload_lora_adapter` accepts `{"lora_name":"tuned"}` once the adapter's active and queued requests finish. The primary worker holds up to 16 adapters and 256 MiB of decoded adapter weights.
+
 ### Structured outputs and function calls
 
 Use `response_format` with Chat Completions or `text.format` with Responses. Both accept `json_object` and `json_schema` on decoder-only checkpoints with a byte-level tokenizer. The inference worker masks tokens before sampling and stops when the object is complete.

@@ -1,6 +1,7 @@
 #include "models/bert/model.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <numeric>
 
@@ -150,14 +151,29 @@ struct BertWorkspace final : Workspace {
                   {&scores, count}});
     }
     std::span<float> query, key, value, attended, projected, ff;
+
+    static std::size_t row_limit(const ModelConfig& c) {
+        constexpr auto capacity = max_workspace_bytes / sizeof(float);
+        const auto packed = batch_tile * std::max(c.hidden, c.intermediate);
+        return packed >= capacity ? 0 : (capacity - packed) / (5 * c.hidden + c.intermediate + 1);
+    }
 };
 } // namespace
 
 std::vector<float> Bert::encode(std::span<const Token> tokens, std::span<const Token> token_types) const {
-    const auto h = config_.hidden, count = tokens.size();
-    if ((!token_types.empty() && token_types.size() != count) ||
-        std::ranges::any_of(token_types, [&](Token id) { return id >= segments_count_; }))
-        throw Error(ErrorCode::invalid_argument, "invalid token_type_ids");
+    const InferenceInput input{tokens, token_types};
+    return encode(std::span(&input, 1));
+}
+
+std::vector<float> Bert::encode(std::span<const InferenceInput> inputs) const {
+    const auto h = config_.hidden;
+    std::size_t count = 0;
+    for (const auto& [tokens, types, _] : inputs) {
+        if ((!types.empty() && types.size() != tokens.size()) ||
+            std::ranges::any_of(types, [&](Token id) { return id >= segments_count_; }))
+            throw Error(ErrorCode::invalid_argument, "invalid token_type_ids");
+        count += tokens.size();
+    }
     BertWorkspace w(config_, count);
     std::vector<float> hidden(w.query.size());
     const auto add_bias = [&](std::span<float> output, TensorView bias) {
@@ -173,15 +189,19 @@ std::vector<float> Bert::encode(std::span<const Token> tokens, std::span<const T
         Scalar::layer_norm(norm.weight, norm.bias, input, input, config_.rms_epsilon);
     };
     const auto segment = w.attended.first(h);
-    for (std::size_t i = 0; i < count; ++i) {
-        auto activation = row(hidden, h, i);
-        auto position = w.projected.first(h);
-        Scalar::embedding(tokens_, tokens[i], activation);
-        Scalar::embedding(positions_, i, position);
-        Scalar::embedding(segments_, token_types.empty() ? 0 : token_types[i], segment);
-        Scalar::add(activation, segment);
-        Scalar::add(activation, position);
-        normalize(embedding_norm_, activation);
+    std::size_t start = 0;
+    for (const auto& [tokens, types, _] : inputs) {
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+            auto activation = row(hidden, h, start + i);
+            auto position = w.projected.first(h);
+            Scalar::embedding(tokens_, tokens[i], activation);
+            Scalar::embedding(positions_, i, position);
+            Scalar::embedding(segments_, types.empty() ? 0 : types[i], segment);
+            Scalar::add(activation, segment);
+            Scalar::add(activation, position);
+            normalize(embedding_norm_, activation);
+        }
+        start += tokens.size();
     }
     const auto scale = 1.0 / std::sqrt(static_cast<double>(config_.head_dim));
     for (const auto& layer : layers_) {
@@ -191,9 +211,17 @@ std::vector<float> Bert::encode(std::span<const Token> tokens, std::span<const T
         add_bias(w.query, layer.query.bias);
         add_bias(w.key, layer.key.bias);
         add_bias(w.value, layer.value.bias);
-        for (std::size_t i = 0; i < count; ++i)
-            Scalar::attention_range(config_, 0, nullptr, w.key, w.value, row(w.query, h, i),
-                                    row(w.attended, h, i), w.scores, scale);
+        start = 0;
+        for (const auto& input : inputs) {
+            const auto length = input.tokens.size();
+            const auto keys = w.key.subspan(start * h, length * h);
+            const auto values = w.value.subspan(start * h, length * h);
+            const auto scores = w.scores.first(length);
+            for (std::size_t i = start; i < start + length; ++i)
+                Scalar::attention_range(config_, 0, nullptr, keys, values, row(w.query, h, i),
+                                        row(w.attended, h, i), scores, scale);
+            start += length;
+        }
         affine(layer.attention, w.attended, w.projected);
         Scalar::add(hidden, w.projected);
         for (std::size_t i = 0; i < count; ++i)
@@ -224,10 +252,14 @@ std::vector<OutputInfo> Bert::outputs() const {
 
 TensorResult Bert::infer(InferenceInput input, const OutputInfo& output) const {
     auto hidden = encode(input.tokens, input.token_type_ids);
-    const auto width = config_.hidden;
     if (output.name == "hidden_states")
-        return {{input.tokens.size(), width}, std::move(hidden)};
+        return {{input.tokens.size(), config_.hidden}, std::move(hidden)};
+    return project_output(hidden, input.tokens.size(), output);
+}
 
+TensorResult Bert::project_output(std::span<const float> hidden, std::size_t count,
+                                  const OutputInfo& output) const {
+    const auto width = config_.hidden;
     std::vector<float> result(output.width);
     if (output.name == "sentence_embedding") {
         for (std::size_t d = 0; d < width; ++d) {
@@ -237,12 +269,12 @@ TensorResult Bert::infer(InferenceInput input, const OutputInfo& output) const {
             }
             double sum = 0;
             float max = hidden[d];
-            for (std::size_t i = 0; i < input.tokens.size(); ++i) {
+            for (std::size_t i = 0; i < count; ++i) {
                 const auto value = hidden[i * width + d];
                 sum += value;
                 max = std::max(max, value);
             }
-            result[d] = pooling_ == Pooling::mean ? static_cast<float>(sum / input.tokens.size()) : max;
+            result[d] = pooling_ == Pooling::mean ? static_cast<float>(sum / count) : max;
         }
         if (normalize_embedding_) {
             const auto norm = std::max(
@@ -252,7 +284,7 @@ TensorResult Bert::infer(InferenceInput input, const OutputInfo& output) const {
         }
     } else {
         std::vector<float> pooled(width);
-        backend_.project(pooler_->weight, std::span(hidden).first(width), pooled, 1, {});
+        backend_.project(pooler_->weight, hidden.first(width), pooled, 1, {});
         Scalar::add_bias(pooled, pooler_->bias);
         for (auto& value : pooled)
             value = std::tanh(value);
@@ -266,6 +298,45 @@ TensorResult Bert::infer(InferenceInput input, const OutputInfo& output) const {
     if (!std::ranges::all_of(result, [](float value) { return std::isfinite(value); }))
         throw Error(ErrorCode::backend, "BERT output contains non-finite values");
     return {{output.width}, std::move(result)};
+}
+
+std::vector<TensorResult> Bert::infer_batch(std::span<const InferenceInput> inputs,
+                                            const OutputInfo& output) const {
+    std::vector<std::size_t> order(inputs.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::ranges::sort(order, {}, [&](std::size_t index) { return inputs[index].tokens.size(); });
+    std::vector<TensorResult> results(inputs.size());
+    const auto limit = std::min<std::size_t>(1024, BertWorkspace::row_limit(config_));
+    for (std::size_t start = 0; start < order.size();) {
+        std::array<InferenceInput, 16> group;
+        const auto bucket = std::bit_width(inputs[order[start]].tokens.size());
+        std::size_t count = 0, tokens = 0;
+        do {
+            group[count] = inputs[order[start + count]];
+            tokens += group[count++].tokens.size();
+            if (count == group.size() || start + count == order.size() || tokens >= limit)
+                break;
+            const auto next = inputs[order[start + count]].tokens.size();
+            if (std::bit_width(next) != bucket || next > limit - tokens)
+                break;
+        } while (true);
+        if (count == 1) {
+            results[order[start++]] = infer(group.front(), output);
+            continue;
+        }
+        const auto hidden = encode(std::span(group).first(count));
+        std::size_t offset = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const auto length = group[i].tokens.size();
+            const auto slice = std::span(hidden).subspan(offset, length * config_.hidden);
+            offset += slice.size();
+            results[order[start + i]] =
+                output.sequence ? TensorResult{{length, config_.hidden}, {slice.begin(), slice.end()}}
+                                : project_output(slice, length, output);
+        }
+        start += count;
+    }
+    return results;
 }
 
 } // namespace nathr::detail

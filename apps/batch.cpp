@@ -29,7 +29,7 @@ struct Line {
 // for more input while an admitted request continues generating.
 class BatchInput {
   public:
-    std::optional<Line> next(bool wait) {
+    std::optional<Line> next(bool wait, int timeout_ms = 0) {
         bool read_buffer = false;
         while (!eof_) {
             while (cursor_ < end_) {
@@ -50,7 +50,7 @@ class BatchInput {
             if (!wait && read_buffer)
                 return {};
             pollfd input{STDIN_FILENO, POLLIN, 0};
-            const auto ready = poll(&input, 1, wait ? -1 : 0);
+            const auto ready = poll(&input, 1, wait ? -1 : timeout_ms);
             if (ready == 0)
                 return {};
             if (ready < 0 && errno == EINTR)
@@ -267,9 +267,89 @@ TokenizedInput input_tokens(const Json& json, BatchOutput& output, const Model& 
     return {output.tokenizer->encode(text), {}};
 }
 
+struct TensorRequest {
+    RequestId id;
+    std::string name;
+    std::vector<TokenizedInput> inputs;
+    bool multiple;
+};
+
+void publish_error(std::optional<RequestId> id, const std::exception& error) {
+    const auto* typed = dynamic_cast<const Error*>(&error);
+    const auto code =
+        typed && typed->code() == ErrorCode::resource_limit ? "resource_limit" : "invalid_request";
+    write_output({{"event", "error"},
+                  {"id", id ? Json(*id) : Json(nullptr)},
+                  {"message", error.what()},
+                  {"code", code}});
+}
+
+void publish_tensor(RequestId id, std::string_view name, TensorResult result, std::size_t tokens,
+                    std::optional<std::size_t> index = {}) {
+    Json value = {{"event", index ? "tensor" : "result"},
+                  {"id", id},
+                  {"output", name},
+                  {"prompt_tokens", tokens},
+                  {"shape", std::move(result.shape)},
+                  {"values", std::move(result.values)}};
+    if (index)
+        value["index"] = *index;
+    write_output(value);
+}
+
+void publish_group(const TensorRequest& request, std::span<TensorResult> results) {
+    for (std::size_t i = 0; i < results.size(); ++i)
+        publish_tensor(request.id, request.name, std::move(results[i]), request.inputs[i].ids.size(),
+                       request.multiple ? std::optional{i} : std::nullopt);
+    if (request.multiple)
+        write_output({{"event", "done"}, {"id", request.id}, {"reason", "result"}});
+}
+
+void flush_tensors(const Model& model, std::vector<TensorRequest>& pending) {
+    std::ranges::stable_sort(pending, {}, &TensorRequest::name);
+    std::vector<InferenceInput> inputs;
+    const auto append = [&](const TensorRequest& request) {
+        for (const auto& item : request.inputs)
+            inputs.emplace_back(item.ids, item.token_type_ids);
+    };
+    for (auto first = pending.begin(); first != pending.end();) {
+        const auto last = std::find_if(std::next(first), pending.end(),
+                                       [&](const auto& request) { return request.name != first->name; });
+        inputs.clear();
+        for (auto it = first; it != last; ++it)
+            append(*it);
+        std::vector<TensorResult> results;
+        try {
+            results = model.infer_batch(inputs, first->name);
+        } catch (const Error&) {
+            // Retry independent requests so a bad input cannot fail another client's batch.
+            for (auto it = first; it != last; ++it) {
+                inputs.clear();
+                append(*it);
+                try {
+                    auto individual = model.infer_batch(inputs, it->name);
+                    publish_group(*it, individual);
+                } catch (const Error& error) {
+                    publish_error(it->id, error);
+                }
+            }
+            first = last;
+            continue;
+        }
+        auto remaining = std::span(results);
+        for (auto it = first; it != last; ++it) {
+            publish_group(*it, remaining.first(it->inputs.size()));
+            remaining = remaining.subspan(it->inputs.size());
+        }
+        first = last;
+    }
+    pending.clear();
+}
+
 void command(const Line& line, const Model& model, std::optional<BatchScheduler>& scheduler,
              BatchOutput& output, const std::filesystem::path& path, const std::filesystem::path& sidecar,
-             const RequestDefaults& defaults, std::size_t max_result_values, LoraRegistry& lora) {
+             const RequestDefaults& defaults, std::size_t max_result_values, LoraRegistry& lora,
+             std::vector<TensorRequest>* pending) {
     std::optional<RequestId> id;
     try {
         if (line.too_long)
@@ -281,6 +361,14 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             id = detail::natural(json.at("cancel"), "cancel");
             if (json.size() != 1)
                 throw Error(ErrorCode::invalid_argument, "a cancel command takes only a request ID");
+            if (pending) {
+                const auto found = std::ranges::find(*pending, *id, &TensorRequest::id);
+                if (found != pending->end()) {
+                    pending->erase(found);
+                    write_output({{"event", "done"}, {"id", *id}, {"reason", "cancelled"}});
+                    return;
+                }
+            }
             const auto cancellation = scheduler ? scheduler->cancel(*id) : std::optional<BatchEvent>{};
             if (!cancellation)
                 throw Error(ErrorCode::invalid_argument, "request ID is not pending");
@@ -306,8 +394,34 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
         }
         const auto* adapter = lora.get(json);
         const auto tensor = json.find("output");
-        if (tensor != json.end() && scheduler && scheduler->contains(*id))
+        const auto group = json.find("inputs");
+        if ((tensor != json.end() && scheduler && scheduler->contains(*id)) ||
+            (pending && std::ranges::find(*pending, *id, &TensorRequest::id) != pending->end()))
             throw Error(ErrorCode::invalid_argument, "duplicate request ID");
+        if (group != json.end()) {
+            if (!pending || tensor == json.end() || json.size() != 3 || !group->is_array() ||
+                group->empty() || group->size() > 16)
+                throw Error(ErrorCode::invalid_argument, "expected a BERT output and 1 to 16 encoder inputs");
+            auto name = tensor->get<std::string>();
+            const auto outputs = model.outputs();
+            const auto info = std::ranges::find(outputs, name, &OutputInfo::name);
+            if (info == outputs.end() || info->sequence)
+                throw Error(ErrorCode::unsupported, "batched encoder inputs require a vector output");
+            if (max_result_values && info->width > max_result_values)
+                throw Error(ErrorCode::resource_limit, "named tensor exceeds response limit");
+            TensorRequest request{*id, std::move(name), {}, true};
+            request.inputs.reserve(group->size());
+            for (const auto& item : *group) {
+                if (!item.is_object())
+                    throw Error(ErrorCode::invalid_argument, "invalid grouped encoder input");
+                for (const auto& [key, value] : item.items())
+                    if (key != "prompt" && key != "tokens" && key != "text_pair" && key != "token_type_ids")
+                        throw Error(ErrorCode::invalid_argument, "invalid grouped encoder input");
+                request.inputs.push_back(input_tokens(item, output, model, path, sidecar, defaults, false));
+            }
+            pending->push_back(std::move(request));
+            return;
+        }
         constexpr std::string_view common[] = {"id", "prompt", "tokens", "lora"};
         constexpr std::string_view tensors[] = {"output", "text_pair", "token_type_ids", "decoder_tokens"};
         constexpr std::string_view generation[] = {"max_new_tokens", "seed", "greedy", "temperature",
@@ -325,28 +439,29 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
                              json.contains("json_schema") || json.value("decode", false));
         auto input = input_tokens(json, output, model, path, sidecar, defaults, decode);
         if (tensor != json.end()) {
-            const auto name = tensor->get<std::string>();
+            auto name = tensor->get<std::string>();
             const auto prefix = json.contains("decoder_tokens")
                                     ? token_array(json.at("decoder_tokens"), "decoder_tokens")
                                     : std::vector<Token>{};
-            if (max_result_values) {
-                const auto outputs = model.outputs();
-                const auto shape = std::ranges::find(outputs, name, &OutputInfo::name);
-                if (shape != outputs.end()) {
+            const auto outputs = model.outputs();
+            const auto shape = std::ranges::find(outputs, name, &OutputInfo::name);
+            if (shape != outputs.end()) {
+                if (max_result_values) {
                     const auto rows = !shape->sequence               ? 1
                                       : model.architecture() == "t5" ? std::max<std::size_t>(1, prefix.size())
                                                                      : input.ids.size();
                     if (rows > max_result_values / shape->width)
                         throw Error(ErrorCode::resource_limit, "named tensor exceeds response limit");
                 }
+                if (pending && !shape->sequence && prefix.empty()) {
+                    TensorRequest request{*id, std::move(name), {}, false};
+                    request.inputs.push_back(std::move(input));
+                    pending->push_back(std::move(request));
+                    return;
+                }
             }
             auto result = model.infer({input.ids, input.token_type_ids, prefix}, name, adapter);
-            write_output({{"event", "result"},
-                          {"id", *id},
-                          {"output", name},
-                          {"prompt_tokens", input.ids.size()},
-                          {"shape", std::move(result.shape)},
-                          {"values", std::move(result.values)}});
+            publish_tensor(*id, name, std::move(result), input.ids.size());
             return;
         }
         if (!scheduler)
@@ -381,13 +496,7 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
                  : std::nullopt,
              std::move(constraint)});
     } catch (const std::exception& error) {
-        const auto* typed = dynamic_cast<const Error*>(&error);
-        const auto code =
-            typed && typed->code() == ErrorCode::resource_limit ? "resource_limit" : "invalid_request";
-        write_output({{"event", "error"},
-                      {"id", id ? Json(*id) : Json(nullptr)},
-                      {"message", error.what()},
-                      {"code", code}});
+        publish_error(id, error);
     }
 }
 } // namespace
@@ -422,13 +531,32 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
             ready["structured_outputs"].get<bool>() && defaults.chat && !defaults.chat->qwen3;
         if (scheduler)
             ready["generation_context"] = scheduler->context();
+        if (model.architecture() == "bert")
+            ready["encoder_batch"] = true;
         write_output(ready);
     }
     const auto start = Clock::now();
+    std::vector<TensorRequest> tensors;
+    auto* pending = model.architecture() == "bert" ? &tensors : nullptr;
+    const auto process = [&](const Line& line) {
+        command(line, model, scheduler, output, path, sidecar, defaults, io.max_result_values, lora, pending);
+    };
     const auto empty = [&] { return !scheduler || scheduler->empty(); };
     while (!input.done() || !empty()) {
         if (auto line = input.next(empty()))
-            command(*line, model, scheduler, output, path, sidecar, defaults, io.max_result_values, lora);
+            process(*line);
+        if (!tensors.empty()) {
+            if (io.ready) {
+                // Wait at most one millisecond to coalesce concurrent encoder requests.
+                for (int i = 0; i < 7; ++i) {
+                    const auto line = input.next(false, i == 0 ? 1 : 0);
+                    if (!line)
+                        break;
+                    process(*line);
+                }
+            }
+            flush_tensors(model, tensors);
+        }
         if (!empty()) {
             for (const auto& event : scheduler->step())
                 output.publish(event);
