@@ -73,11 +73,11 @@ set(NATHR_TEST_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
 add_executable(nathr apps/nathr.cpp apps/batch.cpp apps/requests.cpp apps/structured.cpp)
 file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-serve.py" INPUT "${CMAKE_CURRENT_SOURCE_DIR}/apps/serve.py")
-set(NATHR_FRONTEND_MODULES apps/model_store.py apps/bench_serve.py apps/serving_metrics.py)
+set(NATHR_FRONTEND_FILES apps/model_store.py apps/bench_serve.py apps/serving_metrics.py apps/update.py install.sh)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    apps/serve.py ${NATHR_FRONTEND_MODULES} models/manifest.json
+    apps/serve.py ${NATHR_FRONTEND_FILES} models/manifest.json
     apps/web/index.html apps/web/app.css apps/web/app.js)
-foreach(source IN LISTS NATHR_FRONTEND_MODULES)
+foreach(source IN LISTS NATHR_FRONTEND_FILES)
     get_filename_component(module "${source}" NAME)
     file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-data/${module}"
         INPUT "${CMAKE_CURRENT_SOURCE_DIR}/${source}")
@@ -119,7 +119,7 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/nathrConfig.cmake"
 install(FILES third_party/json/LICENSE.MIT src/tokenizer/LICENSE.unicode src/quantization/LICENSE.ggml
     DESTINATION "${CMAKE_INSTALL_DOCDIR}/licenses")
 install(PROGRAMS setup.sh DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
-install(FILES ${NATHR_FRONTEND_MODULES} DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
+install(FILES ${NATHR_FRONTEND_FILES} DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr")
 install(FILES models/manifest.json DESTINATION "${CMAKE_INSTALL_DATADIR}/nathr/models")
 
 set(CPACK_GENERATOR TGZ)
@@ -150,6 +150,7 @@ if(BUILD_TESTING)
         add_test(NAME nathr-install COMMAND ${CMAKE_COMMAND}
             -DNATHR_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR} -DNATHR_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
             -DNATHR_CXX=${CMAKE_CXX_COMPILER} -DNATHR_CONFIG=$<CONFIG>
+            -DNATHR_PYTHON=${Python3_EXECUTABLE} -DNATHR_VERSION=${PROJECT_VERSION}
             -DNATHR_BINDIR=${CMAKE_INSTALL_BINDIR}
             -DNATHR_DATADIR=${CMAKE_INSTALL_DATADIR}
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/install.cmake)

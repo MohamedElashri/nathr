@@ -16,7 +16,7 @@ nathr run
 
 Type a prompt and press Enter. Nathr keeps the conversation until you type `/reset`. Type `/exit` or press Ctrl+D to quit. Add the `export` line to your shell startup file to keep `nathr` on PATH in new terminals.
 
-Rerun the installer to update. See the [installation options](docs/usage.md#installation-options) for wget, deferred downloads, and offline installation.
+Use `nathr update` to upgrade or `nathr update --check` to check manually. Older versions can rerun the installer. See the [installation and update options](docs/usage.md#installation-options).
 
 ## Run a model
 
@@ -67,6 +67,7 @@ Run `nathr --help` for the command list and `nathr COMMAND --help` for that comm
 | --- | --- |
 | `run [MODEL] [PROMPT]` | Chat, complete text, or return a named tensor in the terminal. |
 | `models`, `pull MODEL` | List pinned checkpoints or download one. |
+| `update [--check]` | Install the latest release or check availability. |
 | `inspect MODEL --summary` | See checkpoint capabilities and output names. |
 | `generate MODEL PROMPT` | Generate text with explicit sampling and stopping options. |
 | `infer MODEL PROMPT --output NAME` | Return a named tensor as JSON. |

@@ -1485,8 +1485,12 @@ def run_terminal(worker, options):
             print(f"nathr: {error}", file=sys.stderr)
 
 
-def main(executable, directory, mode, args):
+def main(executable, directory, mode, invoked, version, args):
     sys.path.insert(0, directory)
+    if mode == "update":
+        from update import command
+        command(executable, directory, invoked, version, args)
+        return
     if mode == "bench-serve":
         from bench_serve import benchmark
         benchmark(args)
@@ -1599,6 +1603,9 @@ def main(executable, directory, mode, args):
             parser.error(f"duplicate or reserved LoRA adapter name: {name}")
         configured_adapters[name] = path
     checkpoints[options.model_id].adapters = {name: (path, False) for name, path in configured_adapters.items()}
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        from update import startup_notice
+        startup_notice(executable, version)
     worker_args = []
     for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens",
                  "speculative_tokens", "max_queued",
@@ -1632,7 +1639,7 @@ if __name__ == "__main__":
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
     try:
-        main(*sys.argv[1:4], sys.argv[4:])
+        main(*sys.argv[1:6], sys.argv[6:])
     except KeyboardInterrupt:
         pass
     except (OSError, RuntimeError, ValueError, RequestError) as error:

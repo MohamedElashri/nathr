@@ -733,7 +733,7 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
     cli::run_batch(Model::load(path, options), path, tokenizer, batch_options, io);
 }
 
-void launch_frontend(std::string_view action, std::span<char*> options, bool help) {
+void launch_frontend(std::string_view action, const char* invoked, std::span<char*> options, bool help) {
     const auto executable = std::filesystem::read_symlink("/proc/self/exe");
     const auto bin = executable.parent_path();
     const auto script = bin / "nathr-serve.py";
@@ -743,7 +743,8 @@ void launch_frontend(std::string_view action, std::span<char*> options, bool hel
     if (!std::filesystem::is_directory(data))
         data = bin / NATHR_BIN_TO_DATA;
     std::vector<std::string> arguments{
-        "python3", "-I", "-B", script.string(), executable.string(), data.string(), std::string(action)};
+        "python3",           "-I",    "-B",         script.string(), executable.string(), data.string(),
+        std::string(action), invoked, NATHR_VERSION};
     if (help)
         arguments.emplace_back("--help");
     else
@@ -888,6 +889,7 @@ constexpr CommandHelp commands[] = {
     {"run", "Start a terminal session or run one prompt", "run [MODEL] [PROMPT]", ""},
     {"models", "List pinned checkpoint names and cache status", "models", ""},
     {"pull", "Download and verify a named checkpoint", "pull MODEL", ""},
+    {"update", "Check for or install the latest release", "update [--check]", ""},
     {"generate", "Continue a prompt or run chat messages",
      "generate MODEL (PROMPT | --stdin | --tokens IDS | --messages FILE)",
      "  --stdin                       Read one plain-text prompt through EOF.\n"
@@ -1030,7 +1032,7 @@ int main(int argc, char** argv) try {
     }
     const auto arguments = std::span(argv + 2, static_cast<std::size_t>(argc - 2));
     if (command == "bench" && !arguments.empty() && std::string_view(arguments.front()) == "--serve")
-        launch_frontend("bench-serve", arguments.subspan(1), false);
+        launch_frontend("bench-serve", argv[0], arguments.subspan(1), false);
     bool help = command == "help";
     if (help) {
         if (arguments.empty()) {
@@ -1053,8 +1055,9 @@ int main(int argc, char** argv) try {
     const auto* info = find_command(command);
     if (!info)
         invalid("unknown command: " + std::string(command));
-    if (command == "serve" || command == "run" || command == "models" || command == "pull")
-        launch_frontend(command, arguments, help);
+    if (command == "serve" || command == "run" || command == "models" || command == "pull" ||
+        command == "update")
+        launch_frontend(command, argv[0], arguments, help);
     if (help) {
         usage(info);
         return 0;

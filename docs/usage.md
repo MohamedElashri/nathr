@@ -13,6 +13,12 @@ curl -fsSL https://raw.githubusercontent.com/MohamedElashri/nathr/main/install.s
 
 For an offline install, download `install.sh`, `nathr-linux-x86_64.tar.gz`, and its `.sha256` file from the same [release](https://github.com/MohamedElashri/nathr/releases). Keep the files together and run `bash install.sh --archive nathr-linux-x86_64.tar.gz`. Use a cached checkpoint or pass a local checkpoint path.
 
+### Updates
+
+`nathr update` verifies the new release and upgrades installer-managed copies in place, keeping cached models. For a source build, update the checkout and rebuild.
+
+Installed releases check for updates at most once a day when `run` or `serve` starts in a terminal. Set `NATHR_NO_UPDATE_CHECK=1` to disable startup checks.
+
 ## CLI input and output
 
 `run` and `serve` select available CPU kernels by default. The lower-level commands default to scalar execution. Use `--backend auto` to select available kernels or `--backend avx2` to require AVX2 support.

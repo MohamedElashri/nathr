@@ -3,13 +3,14 @@ usage() {
     cat <<'HELP'
 Install Nathr for the current user on x86-64 Linux.
 
-Usage: bash install.sh [--no-model] [--archive FILE]
+Usage: bash install.sh [--no-model] [--archive FILE] [--update]
 
 The default installs the latest GitHub Release and fetches its chat model.
 Use --no-model to defer downloading the model until nathr run.
 NATHR_VERSION selects a release tag.
 NATHR_INSTALL_DIR and NATHR_BIN_DIR override the application and command directories.
 For an offline installation, place FILE.sha256 beside FILE. --archive skips the model download.
+--update upgrades an existing installation to NATHR_VERSION and skips model downloads.
 HELP
 }
 
@@ -18,10 +19,12 @@ main() (
 
     archive_file=
     prefetch=true
+    updating=false
     while (( $# )); do
         case "$1" in
             -h|--help) usage; exit 0 ;;
             --no-model) prefetch=false ;;
+            --update) updating=true; prefetch=false ;;
             --archive)
                 if (( $# < 2 )) || [[ -n $archive_file || ! -f $2 || ! -f $2.sha256 ]]; then
                     printf 'Pass one archive with its adjacent .sha256 file.\n' >&2
@@ -75,16 +78,34 @@ main() (
     else
         release="$start_url/latest/download"
     fi
+    if "$updating" && [[ -z $version ]]; then
+        printf 'Set NATHR_VERSION when using --update.\n' >&2
+        exit 2
+    fi
 
     mkdir -p -- "$releases" "$bin_dir"
     exec 9>"$install_dir/.install.lock"
     flock 9
 
+    target=
     if [[ -e $launcher || -L $launcher ]]; then
         target=$(readlink -- "$launcher" || true)
         if [[ $target != "$releases"/nathr-*/bin/nathr ]]; then
             printf 'A different installation already uses %s. Set NATHR_BIN_DIR to a different directory.\n' "$launcher" >&2
             exit 1
+        fi
+    fi
+    if "$updating"; then
+        current_version=${target#"$releases/nathr-"}
+        current_version=${current_version%/bin/nathr}
+        if [[ ! $current_version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! -x $launcher ||
+              ! -f ${target%/bin/nathr}/.archive-sha256 ]]; then
+            printf 'Nathr update needs an existing installation managed by install.sh.\n' >&2
+            exit 1
+        fi
+        if [[ $(printf '%s\n' "$version" "$current_version" | sort -V | tail -n 1) == "$current_version" ]]; then
+            printf 'Nathr %s is up to date.\n' "$current_version"
+            exit 0
         fi
     fi
 

@@ -1,8 +1,10 @@
 string(RANDOM LENGTH 12 ALPHABET 0123456789abcdef unique)
 set(stage "${NATHR_BUILD_DIR}/install-test-${unique}")
-set(prefix "${stage}/relocated package")
+set(releases "${stage}/relocated package/releases")
+set(prefix "${releases}/nathr-${NATHR_VERSION}")
 execute_process(COMMAND "${CMAKE_COMMAND}" --install "${NATHR_BUILD_DIR}" --config "${NATHR_CONFIG}"
     --prefix "${stage}/prefix" COMMAND_ERROR_IS_FATAL ANY)
+file(MAKE_DIRECTORY "${releases}")
 file(RENAME "${stage}/prefix" "${prefix}")
 
 execute_process(COMMAND "${CMAKE_COMMAND}" -S "${NATHR_SOURCE_DIR}/tests/consumer"
@@ -28,4 +30,9 @@ if(NOT EXISTS "${model_data}/model_store.py")
 endif()
 execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${model_data}/models/manifest.json"
     "${NATHR_SOURCE_DIR}/models/manifest.json" COMMAND_ERROR_IS_FATAL ANY)
+if(NATHR_PYTHON AND NATHR_BINDIR STREQUAL "bin")
+    execute_process(COMMAND "${NATHR_PYTHON}" -B "${NATHR_SOURCE_DIR}/tests/update.py"
+        "${prefix}" "${model_data}" "${stage}" "${NATHR_SOURCE_DIR}/tests/fixtures/t5"
+        COMMAND_ERROR_IS_FATAL ANY)
+endif()
 file(REMOVE_RECURSE "${stage}")
