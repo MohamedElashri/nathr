@@ -205,7 +205,7 @@ nathr serve smollm2 --also minilm
 
 Use `smollm2` for generation and `minilm` for embedding up to 16 inputs per request. Repeat `--also` to load more checkpoints. The first model handles requests without a model ID. Each model has its own worker and KV budget. Use `/model?model=minilm` or `/health?model=minilm` to inspect one worker.
 
-Scrape `http://127.0.0.1:8000/metrics` for all models or add `?model=smollm2` for one model. Queue and KV gauges reflect the last scheduler boundary. Latency histograms use seconds and measure worker activity.
+Scrape `http://127.0.0.1:8000/metrics` for all models or add `?model=smollm2` for one model. Queue and KV gauges reflect the last scheduler boundary. Latency histograms use seconds and measure worker activity. The server keeps a spare connection slot for scrapes when inference slots are full.
 
 ## Build from source
 

@@ -305,7 +305,8 @@ class Server(ThreadingHTTPServer):
         self.workers = workers
         self.default_model = next(iter(workers))
         self.options = options
-        self.slots = threading.BoundedSemaphore(options.max_clients)
+        self.connections = threading.BoundedSemaphore(options.max_clients + 1)
+        self.inference_slots = threading.BoundedSemaphore(options.max_clients)
 
     def worker_for(self, model_id):
         if not isinstance(model_id, str) or model_id not in self.workers:
@@ -328,11 +329,11 @@ class Server(ThreadingHTTPServer):
         return render_metrics({name: worker.metrics_snapshot() for name, worker in workers.items()})
 
     def process_request(self, request, client_address):
-        if self.slots.acquire(blocking=False):
+        if self.connections.acquire(blocking=False):
             try:
                 super().process_request(request, client_address)
             except Exception:
-                self.slots.release()
+                self.connections.release()
                 self.shutdown_request(request)
                 raise
         else:
@@ -347,7 +348,7 @@ class Server(ThreadingHTTPServer):
         try:
             super().process_request_thread(request, client_address)
         finally:
-            self.slots.release()
+            self.connections.release()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -768,7 +769,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request = None
+        admitted = self.server.inference_slots.acquire(blocking=False)
         try:
+            if not admitted:
+                raise RequestError("request limit reached", 429)
             self.check_host()
             if (origin := self.headers.get("Origin")) is not None and origin != f"http://{self.headers['Host']}":
                 raise RequestError("expected a same-origin browser request", 403)
@@ -806,6 +810,8 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             if request is not None:
                 self.worker.cancel(request)
+            if admitted:
+                self.server.inference_slots.release()
 
 
 def bounded(low, high):
@@ -961,7 +967,7 @@ def main(executable, directory, mode, args):
 
     limits = parser.add_argument_group("request limits" if run else "HTTP limits")
     limits.add_argument("--max-clients", type=bounded(1, 128), default=16,
-                        help=argparse.SUPPRESS if run else "simultaneous clients")
+                        help=argparse.SUPPRESS if run else "simultaneous inference clients")
     limits.add_argument("--max-body-bytes", type=bounded(1, 262144), default=65536,
                         help=argparse.SUPPRESS if run else "request body size in bytes")
     limits.add_argument("--max-output-tokens", type=bounded(1, 8192), default=256, help="generated tokens per request")

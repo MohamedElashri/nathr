@@ -292,6 +292,18 @@ def metric_value(metrics, name, model):
     return float(next(line[len(prefix):] for line in metrics.splitlines() if line.startswith(prefix)))
 
 
+def metrics_under_load(binary, checkpoint):
+    with server(binary, checkpoint, "--model-id", "chat", "--max-clients", "1", "--context", "8192",
+                "--max-queued-tokens", "8192", "--max-active", "1", "--step-tokens", "2") as port:
+        payload = json.dumps(dict(tokens=[4] * 6000, max_new_tokens=100, stream=True), separators=(",", ":"))
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+            client.sendall((f"POST /infer HTTP/1.1\r\nHost: localhost:{port}\r\n"
+                            f"Content-Length: {len(payload)}\r\n\r\n{payload}").encode())
+            until(lambda: metric_value(request(port, "/metrics"), "requests_active", "chat") == 1,
+                  "metrics did not report active generation under load")
+            request(port, "/infer", dict(tokens=[4], max_new_tokens=1), status=429)
+
+
 def multi_model_benchmark(binary, checkpoint, encoder):
     with server(binary, checkpoint, "--model-id", "chat", "--also", encoder, "--context", "128") as port:
         models = request(port, "/v1/models")["data"]
@@ -354,4 +366,5 @@ if __name__ == "__main__":
         chat_stdin(executable, checkpoint)
         user_commands(executable, checkpoint, fixtures / "bert", checkpoint / "empty cache")
         multi_model_benchmark(executable, checkpoint, fixtures / "bert")
+        metrics_under_load(executable, checkpoint)
         checkpoint_defaults(executable, checkpoint)
