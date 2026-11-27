@@ -5,7 +5,7 @@ Nathr runs small text Transformers locally. Chat, continue a prompt, or inspect 
 
 The prebuilt release targets Ubuntu 24.04 on x86-64. Have Bash, Python 3.10+, `ca-certificates`, `libicu74`, `libstdc++6`, `coreutils`, `tar`, and `flock` from `util-linux` available. Use `curl` or `wget` to fetch the installer. If you install the v0.6.0 release, have `curl` available for model downloads.
 
-Run the installer as your regular user. It verifies the release and downloads the default chat model (about 270 MB). Have `$HOME/.local/bin` on PATH so you can run `nathr` in the same terminal. If needed, run `export PATH="$HOME/.local/bin:$PATH"` first. [GitHub Releases](https://github.com/MohamedElashri/nathr/releases/latest)
+Run the installer as your regular user. It verifies the release and downloads the default chat model (about 270 MB). Have `$HOME/.local/bin` on PATH so you can run `nathr` in the same terminal. If needed, run `export PATH="$HOME/.local/bin:$PATH"` first. 
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/MohamedElashri/nathr/main/install.sh | bash
