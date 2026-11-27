@@ -9,6 +9,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
 from pathlib import Path
+import re
 import select
 import signal
 import socket
@@ -85,6 +86,113 @@ def response_message(value):
     if not isinstance(content, str):
         raise RequestError("message content must be text")
     return {"role": "system" if role == "developer" else role, "content": content}
+
+
+def function_name(value):
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value):
+        raise RequestError("invalid function name")
+    return value
+
+
+def structured_format(value, responses=False):
+    if value is None:
+        return False, None
+    if not isinstance(value, dict):
+        raise RequestError("output format must be an object")
+    kind = value.get("type")
+    if kind in ("text", "json_object"):
+        check_fields(value, {"type"})
+        return kind == "json_object", None
+    if kind != "json_schema":
+        raise RequestError("unsupported output format")
+    spec = value if responses else value.get("json_schema")
+    if not responses:
+        check_fields(value, {"type", "json_schema"})
+    if not isinstance(spec, dict) or not isinstance(spec.get("schema"), dict):
+        raise RequestError("json_schema requires a schema object")
+    check_fields(spec, {"name", "schema", "description", "strict"} | ({"type"} if responses else set()))
+    function_name(spec.get("name"))
+    return True, spec["schema"]
+
+
+def tool_history(messages):
+    if not isinstance(messages, list):
+        return messages
+    mapped, pending = [], None
+    for message in messages:
+        if not isinstance(message, dict):
+            raise RequestError("chat messages must be objects")
+        role, content = message.get("role"), message.get("content")
+        if pending is not None:
+            call_id, name = pending
+            if role != "tool" or message.get("tool_call_id") != call_id or not isinstance(content, str):
+                raise RequestError("expected a text tool result with the matching tool_call_id")
+            mapped.append({"role": "user", "content": f"Function result for {name}:\n{content}"})
+            pending = None
+        elif role == "tool":
+            raise RequestError("tool result has no matching assistant tool call")
+        elif role == "assistant" and message.get("tool_calls") not in (None, []):
+            calls = message["tool_calls"]
+            if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], dict):
+                raise RequestError("one assistant function call per turn is supported")
+            call = calls[0]
+            call_id, function = call.get("id"), call.get("function")
+            if (call.get("type") != "function" or not isinstance(function, dict) or
+                    not isinstance(call_id, str) or not 1 <= len(call_id) <= 128 or content not in (None, "")):
+                raise RequestError("invalid assistant function call")
+            name, arguments = function_name(function.get("name")), function.get("arguments")
+            if not isinstance(arguments, str):
+                raise RequestError("function arguments must be a JSON object string")
+            try:
+                arguments = read_json(arguments.encode())
+            except (ValueError, RecursionError) as error:
+                raise RequestError("invalid JSON function arguments") from error
+            if not isinstance(arguments, dict):
+                raise RequestError("function arguments must be a JSON object string")
+            call_text = json_bytes({"name": name, "arguments": arguments}).decode()
+            mapped.append({"role": "assistant", "content": f"Function call:\n{call_text}"})
+            pending = (call_id, name)
+        else:
+            mapped.append(message)
+    if pending is not None:
+        raise RequestError("assistant function call requires a matching tool result")
+    return mapped
+
+
+def chat_tool(value):
+    tools = value.pop("tools", None)
+    choice = value.pop("tool_choice", None)
+    parallel = value.pop("parallel_tool_calls", None)
+    if parallel is not None and parallel is not False:
+        raise RequestError("parallel tool calls are unsupported")
+    if tools is None and choice is None:
+        return None
+    if choice == "none":
+        return None
+    if not isinstance(tools, list) or not 1 <= len(tools) <= 16:
+        raise RequestError("tools must contain between one and 16 function definitions")
+    functions = {}
+    for tool in tools:
+        if not isinstance(tool, dict) or tool.get("type") != "function" or not isinstance(tool.get("function"), dict):
+            raise RequestError("tools must be function definitions")
+        check_fields(tool, {"type", "function"})
+        function = tool["function"]
+        check_fields(function, {"name", "description", "parameters", "strict"})
+        name = function_name(function.get("name"))
+        if name in functions:
+            raise RequestError("duplicate function name")
+        functions[name] = function
+    if choice == "required" and len(functions) == 1:
+        selected = next(iter(functions))
+    elif isinstance(choice, dict) and choice.get("type") == "function" and isinstance(choice.get("function"), dict):
+        check_fields(choice, {"type", "function"})
+        check_fields(choice["function"], {"name"})
+        selected = function_name(choice["function"].get("name"))
+    else:
+        raise RequestError("select a named function using tool_choice")
+    if selected not in functions:
+        raise RequestError("tool_choice must select a declared function")
+    return functions[selected]
 
 
 def model_card(model_id):
@@ -527,7 +635,8 @@ class Handler(BaseHTTPRequestHandler):
         return stream, tensor, include_usage
 
     def response_input(self, value):
-        check_fields(value, {"input", "instructions", "max_output_tokens", "temperature", "top_p", "stream", "store"})
+        check_fields(value, {"input", "instructions", "max_output_tokens", "temperature", "top_p", "stream", "store",
+                             "text"})
         store = value.get("store")
         if store is not None and store is not False:
             raise RequestError("Responses are stateless. Use store=false")
@@ -553,6 +662,13 @@ class Handler(BaseHTTPRequestHandler):
         if instructions is not None or len(messages) != 1 or messages[0]["role"] != "user":
             raise RequestError("this checkpoint requires a single user prompt")
         return dict(payload, prompt=messages[0]["content"]), "completion"
+
+    def apply_schema(self, value, schema):
+        if not self.worker.metadata.get("structured_outputs"):
+            raise RequestError("checkpoint does not support structured output")
+        if "stop" in value:
+            raise RequestError("stop strings cannot be combined with structured output")
+        value["json_schema"] = schema
 
     def check_peer(self):
         if select.select([self.connection], [], [], 0)[0]:
@@ -605,7 +721,8 @@ class Handler(BaseHTTPRequestHandler):
         response = {"id": f"resp_{identifier}", "object": "response", "created_at": int(time.time()),
                     "model": self.model_id, "status": "in_progress", "output": [], "usage": None,
                     "error": None, "incomplete_details": None, "store": False, "parallel_tool_calls": False,
-                    "tool_choice": "none", "tools": [], "text": {"format": {"type": "text"}},
+                    "tool_choice": "none", "tools": [],
+                    "text": {"format": (value.get("text") or {}).get("format") or {"type": "text"}},
                     "instructions": value.get("instructions"), "max_output_tokens": value.get("max_output_tokens"),
                     "temperature": value.get("temperature"), "top_p": value.get("top_p")}
         if stream:
@@ -646,7 +763,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.inference_reply(response)
 
-    def generation(self, first, request, deadline, kind, stream, include_usage):
+    def generation(self, first, request, deadline, kind, stream, include_usage, tool_name=None):
         prefix = "chatcmpl" if kind == "chat" else "cmpl"
         identity = {"id": f"{prefix}-{uuid4().hex}", "created": int(time.time()), "model": self.model_id}
         object_type = "chat.completion.chunk" if kind == "chat" and stream else (
@@ -655,20 +772,32 @@ class Handler(BaseHTTPRequestHandler):
         def envelope(choices, **extra):
             return dict(identity, object=object_type, choices=choices, **extra)
 
+        call_id = f"call_{uuid4().hex}" if tool_name is not None else None
+
+        def tool_call(arguments):
+            return {"id": call_id, "type": "function", "function": {"name": tool_name, "arguments": arguments}}
+
         token_ids, text = [], []
         collected = 0
         if stream:
             self.open_stream()
             if kind == "chat":
-                self.sse(envelope([{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]))
+                delta = {"role": "assistant"}
+                if tool_name is not None:
+                    delta["tool_calls"] = [dict(tool_call(""), index=0)]
+                self.sse(envelope([{"index": 0, "delta": delta, "finish_reason": None}]))
         for event in self.generation_events(first, request, deadline):
             piece = event.get("text", "")
             terminal = event["event"] == "done"
             reason = "length" if event.get("reason") == "length" else "stop"
+            if terminal and tool_name is not None and reason == "stop":
+                reason = "tool_calls"
             if stream:
                 if kind == "chat":
                     if piece:
-                        self.sse(envelope([{"index": 0, "delta": {"content": piece}, "finish_reason": None}]))
+                        delta = ({"content": piece} if tool_name is None else
+                                 {"tool_calls": [{"index": 0, "function": {"arguments": piece}}]})
+                        self.sse(envelope([{"index": 0, "delta": delta, "finish_reason": None}]))
                     if terminal:
                         self.sse(envelope([{"index": 0, "delta": {}, "finish_reason": reason}]))
                 elif kind == "completion":
@@ -696,7 +825,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             choice = {"index": 0, "finish_reason": reason}
             if kind == "chat":
-                choice["message"] = {"role": "assistant", "content": result}
+                message = {"role": "assistant", "content": result}
+                if reason == "tool_calls":
+                    message.update(content=None, tool_calls=[tool_call(result)])
+                choice["message"] = message
             else:
                 choice.update(text=result, logprobs=None)
             self.inference_reply(envelope([choice], usage=completion_usage(event)))
@@ -762,8 +894,36 @@ class Handler(BaseHTTPRequestHandler):
             if kind == "embeddings":
                 self.embeddings(value, deadline)
                 return
+            structured, schema, tool_name = False, None, None
+            if kind == "chat":
+                structured, schema = structured_format(value.pop("response_format", None))
+                function = chat_tool(value)
+                if "messages" in value:
+                    value["messages"] = tool_history(value["messages"])
+                if function is not None:
+                    if structured:
+                        raise RequestError("choose either response_format or tool calling")
+                    messages = value.get("messages")
+                    if (not isinstance(messages, list) or not messages or messages[-1].get("role") != "user" or
+                            not isinstance(messages[-1].get("content"), str)):
+                        raise RequestError("function calls require a final user message or tool result")
+                    tool_name = function["name"]
+                    schema = function.get("parameters", {"type": "object", "additionalProperties": False})
+                    if not isinstance(schema, dict):
+                        raise RequestError("function parameters must be a JSON Schema object")
+                    structured = True
+                    declaration = json_bytes(function).decode()
+                    messages[-1] = dict(messages[-1], content=messages[-1]["content"] +
+                                        "\n\nReturn the JSON arguments for this function:\n" + declaration)
+            elif kind == "responses" and (text := value.get("text")) is not None:
+                if not isinstance(text, dict):
+                    raise RequestError("text must be an object")
+                check_fields(text, {"format"})
+                structured, schema = structured_format(text.get("format"), responses=True)
             payload, input_kind = self.response_input(value) if kind == "responses" else (value, kind)
             stream, tensor, include_usage = self.normalize(payload, input_kind)
+            if structured:
+                self.apply_schema(payload, schema)
             request = self.worker.submit(payload)
             first = self.waiting(request, deadline)
             if tensor:
@@ -771,7 +931,7 @@ class Handler(BaseHTTPRequestHandler):
             elif kind == "responses":
                 self.response_generation(first, request, deadline, stream, value)
             else:
-                self.generation(first, request, deadline, kind, stream, include_usage)
+                self.generation(first, request, deadline, kind, stream, include_usage, tool_name)
         except RequestError as error:
             self.send_error_response(error)
         except TimeoutError:

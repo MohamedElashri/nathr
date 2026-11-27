@@ -27,6 +27,7 @@ struct BatchRequest {
     std::vector<Token> stop_ids{};
     std::optional<Tokenizer> tokenizer{};
     std::vector<std::string> stop_strings{};
+    TokenConstraint constraint{};
 };
 
 enum class BatchEventKind { token, eos, stop, length, cancelled, error };

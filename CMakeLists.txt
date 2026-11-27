@@ -70,7 +70,7 @@ nathr_compile(nathr_lib)
 include(CTest)
 set(NATHR_TEST_FIXTURES "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures")
 
-add_executable(nathr apps/nathr.cpp apps/batch.cpp apps/requests.cpp)
+add_executable(nathr apps/nathr.cpp apps/batch.cpp apps/requests.cpp apps/structured.cpp)
 file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-serve.py" INPUT "${CMAKE_CURRENT_SOURCE_DIR}/apps/serve.py")
 foreach(module IN ITEMS model_store.py bench_serve.py)
     file(GENERATE OUTPUT "$<TARGET_FILE_DIR:nathr>/nathr-data/${module}"

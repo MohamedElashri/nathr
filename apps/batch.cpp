@@ -2,6 +2,7 @@
 
 #include "core/input.hpp"
 #include "requests.hpp"
+#include "structured.hpp"
 
 #include <nathr/tokenizer.hpp>
 
@@ -92,6 +93,7 @@ std::size_t integer(const Json& value, std::string_view key, std::size_t fallbac
 
 struct BatchOutput {
     std::optional<Tokenizer> tokenizer;
+    std::shared_ptr<const StructuredVocabulary> structured;
     std::size_t output_tokens = 0;
     const BatchScheduler* live_stats = nullptr;
 
@@ -191,9 +193,9 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             throw Error(ErrorCode::invalid_argument, "duplicate request ID");
         constexpr std::string_view common[] = {"id", "prompt", "tokens"};
         constexpr std::string_view tensors[] = {"output", "text_pair", "token_type_ids", "decoder_tokens"};
-        constexpr std::string_view generation[] = {"max_new_tokens", "seed",  "greedy",   "temperature",
-                                                   "top_k",          "top_p", "messages", "stop",
-                                                   "stop_ids",       "decode"};
+        constexpr std::string_view generation[] = {"max_new_tokens", "seed",   "greedy",     "temperature",
+                                                   "top_k",          "top_p",  "messages",   "stop",
+                                                   "stop_ids",       "decode", "json_schema"};
         const auto extra = tensor != json.end() ? std::span<const std::string_view>(tensors)
                                                 : std::span<const std::string_view>(generation);
         for (const auto& [key, value] : json.items()) {
@@ -201,8 +203,9 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
                 std::ranges::find(extra, key) == extra.end())
                 throw Error(ErrorCode::invalid_argument, "unknown batch request field: " + key);
         }
-        const bool decode = tensor == json.end() && (json.contains("prompt") || json.contains("messages") ||
-                                                     json.contains("stop") || json.value("decode", false));
+        const bool decode = tensor == json.end() &&
+                            (json.contains("prompt") || json.contains("messages") || json.contains("stop") ||
+                             json.contains("json_schema") || json.value("decode", false));
         auto input = input_tokens(json, output, model, path, sidecar, defaults, decode);
         if (tensor != json.end()) {
             const auto name = tensor->get<std::string>();
@@ -236,6 +239,14 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             const auto ids = token_array(*field, "stop_ids");
             stops.insert(stops.end(), ids.begin(), ids.end());
         }
+        TokenConstraint constraint;
+        if (const auto schema = json.find("json_schema"); schema != json.end()) {
+            if (!model.supports_fused_batch())
+                throw Error(ErrorCode::unsupported, "structured output requires a decoder-only checkpoint");
+            if (!output.structured)
+                output.structured = structured_vocabulary(*output.tokenizer);
+            constraint = structured_output(*schema, output.structured, stops, model.config().eos);
+        }
         scheduler->submit(
             {*id,
              std::move(input.ids),
@@ -246,7 +257,8 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
               integer(json, "top_k", defaults.sampling.top_k), json.value("top_p", defaults.sampling.top_p)},
              std::move(stops),
              decode ? output.tokenizer : std::optional<Tokenizer>{},
-             json.contains("stop") ? stop_strings(json.at("stop")) : std::vector<std::string>{}});
+             json.contains("stop") ? stop_strings(json.at("stop")) : std::vector<std::string>{},
+             std::move(constraint)});
     } catch (const std::exception& error) {
         const auto* typed = dynamic_cast<const Error*>(&error);
         const auto code =
@@ -281,6 +293,8 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
             {"chat", model.supports_generation() && defaults.chat_system.has_value() && output.tokenizer},
             {"max_new_tokens", defaults.max_new_tokens}};
         add_capabilities(ready, model);
+        ready["structured_outputs"] =
+            model.supports_fused_batch() && output.tokenizer && output.tokenizer->byte_level();
         if (scheduler)
             ready["generation_context"] = scheduler->context();
         write_output(ready);

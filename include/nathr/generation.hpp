@@ -20,6 +20,8 @@ class Sampler {
   public:
     Sampler(SamplingOptions options, std::size_t vocabulary);
     Token select(std::span<const float> logits, std::mt19937_64& generator);
+    Token select_masked(std::span<const float> logits, std::mt19937_64& generator,
+                        std::span<const std::uint8_t> allowed);
 
   private:
     struct Candidate {
@@ -30,6 +32,14 @@ class Sampler {
     std::size_t vocabulary_;
     std::vector<Candidate> candidates_;
 };
+
+struct ConstrainedToken {
+    Token id;
+    bool complete;
+};
+
+// Advances the constraint state for one request. Complete stops generation after this token.
+using TokenConstraint = std::function<ConstrainedToken(Sampler&, std::span<const float>, std::mt19937_64&)>;
 
 struct GenerationResult {
     std::size_t emitted{}, consumed{};

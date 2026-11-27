@@ -18,6 +18,7 @@ class Tokenizer {
     static Tokenizer load_model(const std::filesystem::path& model,
                                 const std::filesystem::path& sidecar = {});
     [[nodiscard]] std::size_t vocabulary() const noexcept;
+    [[nodiscard]] bool byte_level() const noexcept;
     [[nodiscard]] std::vector<Token> encode(std::string_view text) const;
     [[nodiscard]] TokenizedInput encode_pair(std::string_view text, std::string_view second) const;
     // Returns the pretokenized pieces with added tokens treated as ordinary text.
