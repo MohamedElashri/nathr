@@ -1,6 +1,8 @@
 #include "batch.hpp"
 
+#include "backend/cpu/scalar.hpp"
 #include "core/input.hpp"
+#include "models/t5/model.hpp"
 #include "requests.hpp"
 #include "structured.hpp"
 
@@ -92,6 +94,8 @@ std::size_t integer(const Json& value, std::string_view key, std::size_t fallbac
     return found == value.end() ? fallback : detail::natural(*found, key);
 }
 
+constexpr auto lora_budget_bytes = 256 * detail::mib;
+
 class LoraRegistry {
   public:
     LoraRegistry(const Model& model, const BatchIoOptions& io)
@@ -116,7 +120,7 @@ class LoraRegistry {
         check_root(directory);
         for (const auto filename : {"adapter_config.json", "adapter_model.safetensors"})
             check_root(std::filesystem::canonical(directory / filename));
-        load(std::move(name), directory);
+        load(std::move(name), directory, path);
     }
 
     void unload(const std::string& name, const BatchScheduler& scheduler) {
@@ -124,9 +128,9 @@ class LoraRegistry {
         const auto found = adapters_.find(name);
         if (found == adapters_.end())
             throw Error(ErrorCode::invalid_argument, "LoRA adapter is not loaded");
-        if (scheduler.uses_lora(found->second))
+        if (scheduler.uses_lora(found->second.adapter))
             throw Error(ErrorCode::resource_limit, "LoRA adapter is in use");
-        bytes_ -= found->second.memory_bytes();
+        bytes_ -= found->second.adapter.memory_bytes();
         adapters_.erase(found);
     }
 
@@ -137,7 +141,7 @@ class LoraRegistry {
         const auto found = adapters_.find(choice->get<std::string>());
         if (found == adapters_.end())
             throw Error(ErrorCode::invalid_argument, "LoRA adapter is not loaded");
-        return &found->second;
+        return &found->second.adapter;
     }
 
     [[nodiscard]] Json names() const {
@@ -147,7 +151,20 @@ class LoraRegistry {
         return names;
     }
 
+    [[nodiscard]] Json runtime_paths() const {
+        auto paths = Json::object();
+        for (const auto& [name, entry] : adapters_)
+            if (entry.runtime_path)
+                paths[name] = entry.runtime_path->string();
+        return paths;
+    }
+
   private:
+    struct Entry {
+        LoraAdapter adapter;
+        std::optional<std::filesystem::path> runtime_path;
+    };
+
     void require_root() const {
         if (root_.empty())
             throw Error(ErrorCode::unsupported, "loading or unloading adapters requires --lora-root");
@@ -159,7 +176,8 @@ class LoraRegistry {
             throw Error(ErrorCode::invalid_argument, "LoRA directory and files must be inside --lora-root");
     }
 
-    void load(std::string name, const std::filesystem::path& directory) {
+    void load(std::string name, const std::filesystem::path& directory,
+              std::optional<std::filesystem::path> runtime_path = {}) {
         if (name.empty() || name.size() > 128 || !std::ranges::all_of(name, [](char ch) {
                 return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
                        ch == '_' || ch == '-' || ch == '.';
@@ -169,15 +187,15 @@ class LoraRegistry {
             throw Error(ErrorCode::invalid_argument, "LoRA adapter name is already loaded");
         if (adapters_.size() == 16)
             throw Error(ErrorCode::resource_limit, "LoRA adapter count limit reached");
-        auto adapter = model_.load_lora(directory, 256 * detail::mib - bytes_);
+        auto adapter = model_.load_lora(directory, lora_budget_bytes - bytes_);
         const auto size = adapter.memory_bytes();
-        adapters_.emplace(std::move(name), std::move(adapter));
+        adapters_.emplace(std::move(name), Entry{std::move(adapter), std::move(runtime_path)});
         bytes_ += size;
     }
 
     const Model& model_;
     const std::filesystem::path root_;
-    std::map<std::string, LoraAdapter, std::less<>> adapters_;
+    std::map<std::string, Entry, std::less<>> adapters_;
     std::size_t bytes_ = 0;
 };
 
@@ -389,7 +407,8 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             } else {
                 lora.unload(unload_lora->get<std::string>(), *scheduler);
             }
-            write_output({{"event", "result"}, {"id", *id}, {"lora_adapters", lora.names()}});
+            write_output({{"event", "result"}, {"id", *id}, {"lora_adapters", lora.names()},
+                          {"lora_runtime_paths", lora.runtime_paths()}});
             return;
         }
         const auto* adapter = lora.get(json);
@@ -501,6 +520,55 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
 }
 } // namespace
 
+void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions options, BatchIoOptions io) {
+    const bool directory = detail::is_model_directory(path);
+    const auto weights_path = directory ? path / "model.safetensors" : path;
+    const auto file_bytes = std::filesystem::file_size(weights_path);
+    if (file_bytes > detail::max_checkpoint_bytes)
+        throw Error(ErrorCode::resource_limit, "checkpoint exceeds 1 GiB");
+    const auto weights = static_cast<std::size_t>(file_bytes);
+
+    // A decoder worker can have generation scratch and a transient tensor inference.
+    // BERT's hidden-state buffer can be as large as its scratch.
+    std::size_t workspaces = 2;
+    auto kv = options.kv_budget_bytes;
+    std::size_t result_count = 1;
+    if (directory) {
+        const auto config_path = path / "config.json";
+        const auto config = detail::read_json(config_path, detail::mib);
+        const auto type = config.find("model_type");
+        if (type != config.end() && *type == "bert") {
+            kv = 0;
+            result_count = 16;
+        } else if (type != config.end() && *type == "t5") {
+            const auto c = detail::t5_config(config, config_path);
+            // Active decoder scratch, a separate tensor decoder, and one encoder at a time.
+            workspaces = detail::sum(options.max_active, 2, "T5 workspaces");
+            const auto tensor_kv = detail::Cache::required_bytes(c, 2 * c.context, KvPrecision::f32);
+            kv = detail::sum(kv, std::min(tensor_kv, detail::max_kv_cache_bytes), "worker KV capacity");
+        }
+    }
+    auto workspace = detail::product({workspaces, detail::max_workspace_bytes}, "worker workspaces");
+    if (kv) {
+        // Cover retained logits and sampler candidates for each active request.
+        const auto sampling =
+            detail::product({options.max_active, detail::max_vocabulary, 32}, "worker sampling buffers");
+        workspace = detail::sum(workspace, sampling, "worker workspace total");
+    }
+    workspace =
+        detail::sum(workspace, detail::product({result_count, io.max_result_values, sizeof(float)}, "tensor results"),
+                    "worker workspace total");
+    const auto lora = io.lora_adapters.empty() && io.lora_root.empty() ? 0 : lora_budget_bytes;
+    const auto total = detail::sum(
+        detail::sum(weights, workspace, "worker memory"), detail::sum(kv, lora, "worker memory"),
+        "worker memory");
+    write_output({{"weights_bytes", weights},
+                  {"workspace_bytes", workspace},
+                  {"kv_bytes", kv},
+                  {"lora_bytes", lora},
+                  {"total_bytes", total}});
+}
+
 void run_batch(const Model& model, const std::filesystem::path& path, const std::filesystem::path& sidecar,
                BatchOptions options, BatchIoOptions io) {
     LoraRegistry lora(model, io);
@@ -529,6 +597,7 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
             model.supports_fused_batch() && output.tokenizer && output.tokenizer->byte_level();
         ready["function_calls"] =
             ready["structured_outputs"].get<bool>() && defaults.chat && !defaults.chat->qwen3;
+        ready["weight_bytes"] = model.memory().file_bytes;
         if (scheduler)
             ready["generation_context"] = scheduler->context();
         if (model.architecture() == "bert")

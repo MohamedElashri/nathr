@@ -11,6 +11,7 @@ struct BatchIoOptions {
     std::filesystem::path lora_root{};
 };
 
+void print_batch_memory_plan(const std::filesystem::path& path, BatchOptions options, BatchIoOptions io);
 void run_batch(const Model& model, const std::filesystem::path& path, const std::filesystem::path& sidecar,
                BatchOptions options, BatchIoOptions io);
 

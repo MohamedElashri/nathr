@@ -99,17 +99,23 @@ class ModelStore:
                     download(path, item["sha256"], f"{base}/{filename}?download=true")
         return model
 
-    def resolve(self, selection):
-        if selection is None:
-            return self.pull(self.default), self.default
+    def locate(self, selection):
+        explicit = selection is not None
+        selection = selection if explicit else self.default
         path = Path(selection).expanduser()
-        if path.exists():
-            return path.absolute(), path.resolve().name
+        if explicit and path.exists():
+            return path.absolute(), path.resolve().name, None
         if selection in self.names:
-            return self.pull(selection), self.names[selection]["name"]
+            profile = self.names[selection]
+            model, _, _, _ = self.files(profile)
+            return model, profile["name"], selection
         if "/" in selection or path.suffix:
             raise RuntimeError(f"checkpoint path does not exist: {path}")
         raise RuntimeError(f"unknown checkpoint {selection!r}. Run nathr models to see available names")
+
+    def resolve(self, selection):
+        path, name, source = self.locate(selection)
+        return self.pull(source) if source else path, name
 
     def list(self):
         print(f"{'MODEL':<14} {'CACHE':<11} CHECKPOINT")

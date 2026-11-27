@@ -1,10 +1,12 @@
 """Exercise the HTTP frontend and a stalled output consumer with tiny model fixtures."""
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import http.client
 import json
 import math
+import os
 from pathlib import Path
 import runpy
 import select
@@ -505,6 +507,88 @@ def rerank_checks(binary, encoder, target):
         request(port, "/v1/rerank", dict(value, top_n=-1), status=400)
 
 
+def memory_budget(binary, checkpoint, encoder, gpt2):
+    options = ("--model-id", "chat", "--kv-budget-mib", "1")
+    api = "/v1/embeddings"
+    query = dict(model="bert", input="The sky is blue.")
+    with server(binary, checkpoint, *options, "--also", encoder, "--memory-budget-mib", "80",
+                "--context", "8192", "--max-active", "1", "--step-tokens", "2", "--max-queued-tokens", "8192") as port:
+        health = request(port, "/health")
+        assert health["models"]["chat"]["status"] == "ok" and health["models"]["bert"]["status"] == "unloaded"
+        planned = health["models"]["chat"]["model_memory"]
+        assert planned["weights_bytes"] == (checkpoint / "model.safetensors").stat().st_size
+        assert planned["kv_bytes"] == 2**20 and planned["workspace_bytes"] > 0
+        assert planned["total_bytes"] == health["memory_budget"]["reserved_bytes"]
+        assert request(port, "/v1/models/bert")["id"] == "bert"
+        assert request(port, "/health?model=bert")["status"] == "unloaded"
+
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as client:
+            data = json.dumps(dict(tokens=[4] * 6000, max_new_tokens=100, stream=True), separators=(",", ":"))
+            client.sendall((f"POST /infer HTTP/1.1\r\nHost: localhost:{port}\r\n"
+                            f"Content-Length: {len(data)}\r\n\r\n{data}").encode())
+            until(lambda: request(port, "/health?model=chat")["pending_requests"] == 1,
+                  "long request did not enter the primary worker")
+            denied = request(port, api, query, 429)
+            assert "active requests" in denied["error"]["message"]
+            assert request(port, "/health?model=chat")["status"] == "ok"
+        until(lambda: request(port, "/health?model=chat")["pending_requests"] == 0, "request did not drain")
+
+        with ThreadPoolExecutor(max_workers=4) as clients:
+            embeddings = list(clients.map(lambda _: request(port, api, query), range(4)))
+        assert all(result == embeddings[0] for result in embeddings)
+        health = request(port, "/health")
+        assert health["models"]["chat"]["status"] == "unloaded"
+        assert health["models"]["bert"]["status"] == "ok"
+        assert health["models"]["bert"]["model_memory"]["kv_bytes"] == 0
+        assert health["memory_budget"]["reserved_bytes"] == health["models"]["bert"]["model_memory"]["total_bytes"]
+        assert request(port, "/infer", dict(tokens=[4], max_new_tokens=1))["emitted"] == 1
+        assert request(port, "/health?model=bert")["status"] == "unloaded"
+
+    with server(binary, checkpoint, *options, "--also", encoder, "--also", gpt2,
+                "--memory-budget-mib", "160") as port:
+        assert request(port, "/model?model=bert")["architecture"] == "bert"
+        assert request(port, "/infer", dict(tokens=[4], max_new_tokens=1))["emitted"] == 1
+        assert request(port, "/model?model=gpt2")["architecture"] == "gpt2"
+        health = request(port, "/health")
+        assert health["models"]["chat"]["status"] == health["models"]["gpt2"]["status"] == "ok"
+        assert health["models"]["bert"]["status"] == "unloaded"
+        assert health["memory_budget"]["reserved_bytes"] <= health["memory_budget"]["budget_bytes"]
+
+    cache = checkpoint / "absent-model-cache"
+    with server(binary, checkpoint, *options, "--also", "minilm", "--models-dir", cache,
+                "--memory-budget-mib", "80") as port:
+        assert request(port, "/v1/models/minilm")["id"] == "minilm"
+        assert request(port, "/health?model=minilm")["status"] == "unloaded" and not cache.exists()
+    oversized = subprocess.run([binary, "serve", checkpoint, *options, "--memory-budget-mib", "1", "--port", "0"],
+                               capture_output=True, text=True, timeout=15)
+    assert oversized.returncode != 0 and "above the server memory budget" in oversized.stderr
+    assert "Listening" not in oversized.stdout
+
+
+def cancelled_checkpoint_command(binary, checkpoint):
+    command = runpy.run_path(str(binary.with_name("nathr-serve.py")))["checkpoint_command"]
+    marker = checkpoint / "loader.pid"
+    script = ("import os, sys, time; from pathlib import Path; path = Path(sys.argv[1]); "
+              "ready = path.with_suffix('.tmp'); ready.write_text(str(os.getpid())); ready.replace(path); "
+              "time.sleep(30)")
+    deadline = time.monotonic() + 5
+
+    def check():
+        assert time.monotonic() < deadline, "checkpoint subprocess did not start"
+        if marker.exists():
+            raise ConnectionError("client disconnected during load")
+
+    try:
+        command([sys.executable, "-c", script, marker], check)
+    except ConnectionError:
+        try:
+            os.kill(int(marker.read_text()), 0)
+        except ProcessLookupError:
+            return
+        raise AssertionError("cancelled checkpoint subprocess was left running")
+    raise AssertionError("checkpoint load did not abort")
+
+
 if __name__ == "__main__":
     executable, fixtures = map(Path, sys.argv[1:])
     help_text = subprocess.check_output([executable, "help", "serve"], text=True, timeout=10)
@@ -523,4 +607,6 @@ if __name__ == "__main__":
         multi_model_benchmark(executable, checkpoint, fixtures / "bert")
         encoder_batch_checks(executable, fixtures / "bert")
         rerank_checks(executable, fixtures / "bert", checkpoint / "reranker")
+        memory_budget(executable, checkpoint, fixtures / "bert", fixtures / "gpt2")
+        cancelled_checkpoint_command(executable, checkpoint)
         checkpoint_defaults(executable, checkpoint)

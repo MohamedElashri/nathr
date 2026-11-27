@@ -32,9 +32,9 @@ using nathr::detail::Json;
 class Arguments {
   public:
     Arguments(std::span<char*> arguments, bool accepts_prompt) {
-        constexpr std::string_view flags[] = {"--bos",        "--cached", "--greedy", "--json",
-                                              "--logits-f32", "--ready",  "--sample", "--skip-special",
-                                              "--stages",     "--stats",  "--stdin",  "--summary"};
+        constexpr std::string_view flags[] = {
+            "--bos",    "--cached",       "--greedy", "--json",  "--logits-f32", "--memory-plan", "--ready",
+            "--sample", "--skip-special", "--stages", "--stats", "--stdin",      "--summary"};
         bool positional_only = false;
         for (std::size_t i = 0; i < arguments.size(); ++i) {
             std::string key(arguments[i]);
@@ -721,7 +721,10 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
                                  number(args, "--max-result-values", std::size_t{0}), args.adapters(),
                                  args.option("--lora-root").value_or("")};
     const auto tokenizer = args.option("--tokenizer").value_or("");
+    const bool memory_plan = args.flag("--memory-plan");
     args.finish();
+    if (memory_plan)
+        return cli::print_batch_memory_plan(path, batch_options, io);
     cli::run_batch(Model::load(path, options), path, tokenizer, batch_options, io);
 }
 

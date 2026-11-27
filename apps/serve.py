@@ -3,11 +3,12 @@
 import argparse
 import base64
 from collections import deque
-from contextlib import ExitStack, closing
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import os
 from pathlib import Path
 import re
 import select
@@ -229,7 +230,7 @@ class Request:
 
 
 class Worker:
-    def __init__(self, command, limits):
+    def __init__(self, command, limits, static_adapters=None):
         self.limits = limits
         self.changed = threading.Condition()
         self.pending = {}
@@ -238,7 +239,8 @@ class Worker:
         self.queue_bypasses = 0
         self.kv = {"peak_bytes": 0, "resident_bytes": 0}
         self.metadata = None
-        self.lora_adapters = frozenset()
+        self.static_adapters = static_adapters or {}
+        self.lora_adapters = {}
         self.outputs = set()
         self.error = None
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
@@ -248,12 +250,22 @@ class Worker:
         for thread in self.threads:
             thread.start()
 
-    def start(self):
+    def start(self, check=None):
+        deadline = time.monotonic() + 60
         with self.changed:
-            if not self.changed.wait_for(lambda: self.metadata is not None or self.error, timeout=60):
-                raise RuntimeError("model did not become ready")
+            while self.metadata is None and self.error is None:
+                if check is not None:
+                    check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError("model did not become ready")
+                self.changed.wait(min(remaining, 0.1))
             if self.error:
                 raise self.error
+
+    def idle(self):
+        with self.changed:
+            return not self.pending
 
     def fail(self, message):
         with self.changed:
@@ -332,13 +344,19 @@ class Worker:
                 with self.changed:
                     if event["event"] == "ready":
                         del event["event"]
-                        self.lora_adapters = frozenset(event.pop("lora_adapters", ()))
+                        self.lora_adapters = {name: (self.static_adapters[name], False)
+                                              for name in event.pop("lora_adapters", ())}
                         self.metadata = event
                         self.outputs = {item["name"] for item in event["outputs"]}
                         self.changed.notify_all()
                         continue
                     if event["event"] == "result" and "lora_adapters" in event:
-                        self.lora_adapters = frozenset(event["lora_adapters"])
+                        runtime_paths = event.pop("lora_runtime_paths")
+                        self.lora_adapters = {
+                            name: (runtime_paths[name], True) if name in runtime_paths
+                            else (self.static_adapters[name], False)
+                            for name in event["lora_adapters"]
+                        }
                     request = self.pending.get(event.get("id"))
                     if request is None:
                         continue
@@ -404,10 +422,248 @@ class Worker:
             )
 
 
+@dataclass
+class WorkerSlot:
+    path: Path
+    source: str | None
+    worker: Worker | None = None
+    plan: dict | None = None
+    leases: int = 0
+    last_used: float = 0
+    adapters: dict = field(default_factory=dict)
+
+
+def checkpoint_command(command, check):
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, start_new_session=True) as process:
+        try:
+            while True:
+                check()
+                try:
+                    result, stderr = process.communicate(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+        except BaseException:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
+            raise
+        if process.returncode:
+            raise RuntimeError(stderr.strip() or "checkpoint command failed")
+        return result
+
+
+class WorkerPool:
+    def __init__(self, executable, store, slots, options, worker_args):
+        self.executable = executable
+        self.store = store
+        self.slots = slots
+        self.options = options
+        self.worker_args = worker_args
+        self.budget = (getattr(options, "memory_budget_mib", None) or 0) * 1024 * 1024
+        self.changed = threading.Condition()
+        self.stopping = threading.Event()
+        self.loading = None
+
+    def primary_adapters(self):
+        primary = self.slots[self.options.model_id]
+        return primary.worker.lora_adapters if primary.worker is not None else primary.adapters
+
+    def resolve(self, model_id):
+        if isinstance(model_id, str):
+            with self.changed:
+                if model_id in self.slots:
+                    return model_id, self.slots[model_id]
+                if model_id in self.primary_adapters():
+                    primary = self.options.model_id
+                    return primary, self.slots[primary]
+        raise RequestError("model is not configured", 404)
+
+    def model_cards(self):
+        with self.changed:
+            return [model_card(name) for name in self.slots] + [
+                model_card(name, self.options.model_id) for name in sorted(self.primary_adapters())]
+
+    def reserved_bytes(self):
+        return sum(slot.plan["total_bytes"] for slot in self.slots.values() if slot.plan is not None)
+
+    def reserve(self, slot, plan, check):
+        size = plan["total_bytes"]
+        if size > self.budget:
+            raise RequestError(f"checkpoint needs {size} bytes, above the server memory budget of {self.budget} bytes",
+                               429)
+        victims = []
+        with self.changed:
+            need = self.reserved_bytes() + size - self.budget
+            if need > 0:
+                idle = sorted((item for item in self.slots.values()
+                               if item.worker is not None and not item.leases and item.worker.idle()),
+                              key=lambda item: item.last_used)
+                for item in idle:
+                    victims.append((item, item.worker))
+                    need -= item.plan["total_bytes"]
+                    if need <= 0:
+                        break
+                if need > 0:
+                    raise RequestError("active requests are occupying the server memory budget", 429)
+                for item, worker in victims:
+                    item.adapters = worker.lora_adapters
+                    item.worker = None
+        for item, worker in victims:
+            worker.close()
+            with self.changed:
+                item.plan = None
+        check()
+        with self.changed:
+            slot.plan = plan
+
+    def load(self, model_id, slot, check):
+        worker = None
+        try:
+            if slot.source is not None:
+                if self.budget:
+                    checkpoint_command([self.executable, "pull", slot.source, "--models-dir",
+                                        str(self.store.directory)], check)
+                else:
+                    self.store.pull(slot.source)
+            command = [self.executable, "batch", "--model", str(slot.path), *self.worker_args]
+            static_adapters = {name: path for name, (path, runtime) in slot.adapters.items() if not runtime}
+            if model_id == self.options.model_id:
+                if self.options.tokenizer:
+                    command.extend(("--tokenizer", self.options.tokenizer))
+                for name, path in static_adapters.items():
+                    command.extend(("--lora", f"{name}={path}"))
+                if self.options.lora_root is not None:
+                    command.extend(("--lora-root", self.options.lora_root))
+            if self.budget:
+                plan = json.loads(checkpoint_command([*command, "--memory-plan"], check))
+                self.reserve(slot, plan, check)
+            worker = Worker([*command, "--ready"], self.options, static_adapters)
+            worker.start(check)
+            for name, (path, runtime) in slot.adapters.items():
+                if runtime:
+                    self.restore_adapter(worker, name, path, check)
+            check()
+            if self.budget and worker.metadata["weight_bytes"] != plan["weights_bytes"]:
+                raise RequestError("checkpoint size changed during loading", 503)
+            return worker
+        except BaseException as error:
+            if worker is not None:
+                worker.close()
+            with self.changed:
+                slot.plan = None
+            if isinstance(error, (OSError, RuntimeError, ValueError)) and not isinstance(error, ConnectionError):
+                raise RequestError(f"{model_id}: {error}", 503) from error
+            raise
+
+    @staticmethod
+    def restore_adapter(worker, name, path, check):
+        request = worker.submit({"load_lora": {"name": name, "path": path}})
+        try:
+            while True:
+                check()
+                event = worker.take(request, 0.1)
+                if event is not None:
+                    checked_event(event)
+                    return
+        finally:
+            worker.cancel(request)
+
+    @contextmanager
+    def borrow(self, model_id, deadline=None, check_peer=None):
+        model_id, slot = self.resolve(model_id)
+
+        def check():
+            if self.stopping.is_set():
+                raise RequestError("engine is shutting down", 503)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise RequestError("model load deadline exceeded", 504)
+            if check_peer is not None:
+                check_peer()
+
+        loading = False
+        try:
+            with self.changed:
+                while True:
+                    check()
+                    if slot.worker is not None:
+                        worker = slot.worker
+                        slot.leases += 1
+                        break
+                    if self.loading is None:
+                        loading = True
+                        self.loading = model_id
+                        break
+                    self.changed.wait(0.1)
+            if loading:
+                worker = self.load(model_id, slot, check)
+                with self.changed:
+                    slot.worker = worker
+                    slot.leases += 1
+        finally:
+            if loading:
+                with self.changed:
+                    self.loading = None
+                    self.changed.notify_all()
+        try:
+            yield worker
+        finally:
+            with self.changed:
+                slot.leases -= 1
+                slot.last_used = time.monotonic()
+
+    def health(self, model_id=None):
+        def snapshot(name, slot):
+            if slot.worker is not None:
+                value = slot.worker.health()
+            else:
+                state = "loading" if self.loading == name else "evicting" if slot.plan else "unloaded"
+                value = {"status": state, "pending_requests": 0, "cancelled_requests": 0,
+                         "queue_bypasses": 0, "kv": {"peak_bytes": 0, "resident_bytes": 0}}
+            if self.budget:
+                value["model_memory"] = slot.plan
+            return value
+
+        with self.changed:
+            if model_id is not None:
+                name, slot = self.resolve(model_id)
+                result = snapshot(name, slot)
+            elif len(self.slots) == 1:
+                name, slot = next(iter(self.slots.items()))
+                result = snapshot(name, slot)
+            else:
+                models = {name: snapshot(name, slot) for name, slot in self.slots.items()}
+                failed = sum(value["status"] == "unavailable" for value in models.values())
+                status = "unavailable" if failed == len(models) else "degraded" if failed else "ok"
+                result = {"status": status, "models": models}
+            if self.budget:
+                result["memory_budget"] = {"budget_bytes": self.budget, "reserved_bytes": self.reserved_bytes()}
+            return result
+
+    def close(self):
+        self.stopping.set()
+        with self.changed:
+            self.changed.notify_all()
+            self.changed.wait_for(lambda: self.loading is None)
+        for slot in self.slots.values():
+            if slot.worker is not None:
+                slot.worker.close()
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, workers, options):
+    def __init__(self, pool, options):
         directory = Path(__file__).with_name("nathr-web")
         self.assets = {route: ((directory / name).read_bytes(), content_type) for route, name, content_type in (
             ("/", "index.html", "text/html; charset=utf-8"),
@@ -415,33 +671,10 @@ class Server(ThreadingHTTPServer):
             ("/app.js", "app.js", "text/javascript; charset=utf-8"),
         )}
         super().__init__(("127.0.0.1", options.port), Handler)
-        self.workers = workers
-        self.default_model = next(iter(workers))
-        self.primary = workers[self.default_model]
+        self.pool = pool
+        self.default_model = options.model_id
         self.options = options
         self.slots = threading.BoundedSemaphore(options.max_clients)
-
-    def worker_for(self, model_id):
-        if isinstance(model_id, str):
-            if model_id in self.workers:
-                return self.workers[model_id]
-            if model_id in self.primary.lora_adapters:
-                return self.primary
-        raise RequestError("model is not loaded", 404)
-
-    def model_cards(self):
-        cards = [model_card(name) for name in self.workers]
-        cards.extend(model_card(name, self.default_model) for name in sorted(self.primary.lora_adapters))
-        return cards
-
-    def health(self, model_id):
-        if model_id is not None or len(self.workers) == 1:
-            selected = self.default_model if model_id is None else model_id
-            return self.worker_for(selected).health()
-        models = {name: worker.health() for name, worker in self.workers.items()}
-        healthy = sum(snapshot["status"] == "ok" for snapshot in models.values())
-        status = "unavailable" if not healthy else "ok" if healthy == len(models) else "degraded"
-        return {"status": status, "models": models}
 
     def process_request(self, request, client_address):
         if self.slots.acquire(blocking=False):
@@ -540,25 +773,27 @@ class Handler(BaseHTTPRequestHandler):
             if path in self.server.assets:
                 self.send_body(*self.server.assets[path], ui=True)
             elif path == "/health":
-                health = self.server.health(model_id)
+                health = self.server.pool.health(model_id)
                 self.reply(health, 503 if health["status"] == "unavailable" else 200)
             elif path == "/v1/models":
-                self.reply({"object": "list", "data": self.server.model_cards()})
+                cards = self.server.pool.model_cards()
+                self.reply({"object": "list", "data": cards})
             elif path.startswith("/v1/models/"):
                 name = unquote(path.removeprefix("/v1/models/"))
-                self.server.worker_for(name)
-                parent = None if name in self.server.workers else self.server.default_model
-                self.reply(model_card(name, parent))
+                parent, _ = self.server.pool.resolve(name)
+                self.reply(model_card(name, parent if parent != name else None))
             elif path == "/model":
                 name = self.server.default_model if model_id is None else model_id
-                worker = self.server.worker_for(name)
                 options = self.server.options
                 limits = {name: getattr(options, name) for name in
                           ("max_body_bytes", "max_output_tokens", "max_result_values", "max_buffer_bytes")}
-                metadata = dict(worker.metadata, id=name, limits=limits)
-                if name not in self.server.workers:
-                    metadata["base_model"] = self.server.default_model
-                self.reply(metadata)
+                parent, _ = self.server.pool.resolve(name)
+                deadline = time.monotonic() + options.request_timeout
+                with self.server.pool.borrow(parent, deadline, self.check_peer) as worker:
+                    metadata = dict(worker.metadata, id=name, limits=limits)
+                    if name != parent:
+                        metadata["base_model"] = parent
+                    self.reply(metadata)
             else:
                 raise RequestError("endpoint not found", 404)
         except RequestError as error:
@@ -956,7 +1191,7 @@ class Handler(BaseHTTPRequestHandler):
         fields = {"lora_name", "lora_path", "base_model_name"} if load else {"lora_name"}
         check_fields(value, fields)
         name = value.get("lora_name")
-        if not isinstance(name, str) or not name or name in self.server.workers:
+        if not isinstance(name, str) or not name or name in self.server.pool.slots:
             raise RequestError("invalid or reserved LoRA adapter name")
         if load:
             path = value.get("lora_path")
@@ -968,13 +1203,14 @@ class Handler(BaseHTTPRequestHandler):
             payload = {"load_lora": {"name": name, "path": path}}
         else:
             payload = {"unload_lora": name}
-        self.worker = self.server.primary
-        request = self.worker.submit(payload)
-        try:
-            self.waiting(request, time.monotonic() + self.server.options.request_timeout)
-            self.reply({"lora_name": name, "status": "loaded" if load else "unloaded"})
-        finally:
-            self.worker.cancel(request)
+        deadline = time.monotonic() + self.server.options.request_timeout
+        with self.server.pool.borrow(self.server.default_model, deadline, self.check_peer) as self.worker:
+            request = self.worker.submit(payload)
+            try:
+                self.waiting(request, deadline)
+                self.reply({"lora_name": name, "status": "loaded" if load else "unloaded"})
+            finally:
+                self.worker.cancel(request)
 
     def rerank(self, value, deadline):
         check_fields(value, {"query", "documents", "top_n", "user"})
@@ -1013,6 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         request = None
+        lease = ExitStack()
         try:
             self.check_host()
             if (origin := self.headers.get("Origin")) is not None and origin != f"http://{self.headers['Host']}":
@@ -1029,8 +1266,9 @@ class Handler(BaseHTTPRequestHandler):
             if {"lora", "load_lora", "unload_lora"} & value.keys():
                 raise RequestError("select a loaded LoRA adapter with the model field")
             self.model_id = value.pop("model", self.server.default_model)
-            self.worker = self.server.worker_for(self.model_id)
             deadline = time.monotonic() + self.server.options.request_timeout
+            parent, _ = self.server.pool.resolve(self.model_id)
+            self.worker = lease.enter_context(self.server.pool.borrow(parent, deadline, self.check_peer))
             if kind == "embeddings":
                 self.embeddings(value, deadline)
                 return
@@ -1071,7 +1309,7 @@ class Handler(BaseHTTPRequestHandler):
                 structured, schema = structured_format(text.get("format"), responses=True)
             payload, input_kind = self.response_input(value) if kind == "responses" else (value, kind)
             stream, tensor, include_usage = self.normalize(payload, input_kind)
-            if self.model_id not in self.server.workers:
+            if self.model_id != parent:
                 payload["lora"] = self.model_id
             if structured:
                 self.apply_schema(payload, schema)
@@ -1097,6 +1335,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             if request is not None:
                 self.worker.cancel(request)
+            lease.close()
 
 
 def bounded(low, high):
@@ -1236,6 +1475,8 @@ def main(executable, directory, mode, args):
                             help="register a PEFT LoRA adapter for the primary checkpoint; repeat to add more")
         parser.add_argument("--lora-root", metavar="DIR",
                             help="enable runtime loading and unloading of local adapters beneath this directory")
+        parser.add_argument("--memory-budget-mib", type=int,
+                            help="account total worker memory and load additional models on demand")
     parser.set_defaults(lora_root=None)
     parser.add_argument("--model-id", help=argparse.SUPPRESS if run else "API model ID, otherwise the checkpoint name")
     parser.add_argument("--port", type=bounded(0, 65535), default=0 if run else 8000,
@@ -1272,6 +1513,9 @@ def main(executable, directory, mode, args):
                         help=argparse.SUPPRESS if run else "socket I/O timeout in seconds")
     limits.add_argument("--request-timeout", type=bounded(1, 600), default=120, help="inference timeout in seconds")
     options = parser.parse_args(args)
+    budget = getattr(options, "memory_budget_mib", None)
+    if budget is not None and budget <= 0:
+        parser.error("--memory-budget-mib must be positive")
     if run:
         if len(options.lora) > 1 or options.lora == [""]:
             parser.error("--lora requires one adapter directory")
@@ -1288,21 +1532,24 @@ def main(executable, directory, mode, args):
     if options.max_active > options.step_tokens:
         parser.error("--step-tokens must cover all active slots")
     store = ModelStore(options.models_dir)
-    model_path, model_id = store.resolve(options.model or options.model_path)
+    model_path, model_id, source = store.locate(options.model or options.model_path)
     options.model_id = options.model_id or model_id
-    checkpoints = {options.model_id: model_path}
+    checkpoints = {options.model_id: WorkerSlot(model_path, source)}
     for name in getattr(options, "also", []):
-        path, model_id = store.resolve(name)
+        path, model_id, source = store.locate(name)
         if model_id in checkpoints:
             parser.error(f"duplicate model ID: {model_id}")
-        checkpoints[model_id] = path
+        checkpoints[model_id] = WorkerSlot(path, source)
     adapters = ([f"nathr-lora={options.lora}"] if options.lora else []) if run else options.lora
+    configured_adapters = {}
     for spec in adapters:
         name, separator, path = spec.partition("=")
         if not (name and separator and path):
             parser.error("--lora requires NAME=DIR")
-        if not run and name in checkpoints:
-            parser.error(f"LoRA adapter name matches a model ID: {name}")
+        if name in checkpoints or name in configured_adapters:
+            parser.error(f"duplicate or reserved LoRA adapter name: {name}")
+        configured_adapters[name] = path
+    checkpoints[options.model_id].adapters = {name: (path, False) for name, path in configured_adapters.items()}
     worker_args = []
     for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens",
                  "speculative_tokens", "max_queued",
@@ -1312,27 +1559,18 @@ def main(executable, directory, mode, args):
     if options.no_prefix_cache:
         worker_args.append("--no-prefix-cache")
     with ExitStack() as cleanup:
-        workers = {}
-        for model_id, path in checkpoints.items():
-            command = [executable, "batch", "--model", str(path), "--ready", *worker_args]
-            if model_id == options.model_id:
-                if options.tokenizer:
-                    command.extend(("--tokenizer", options.tokenizer))
-                for adapter in adapters:
-                    command.extend(("--lora", adapter))
-                if options.lora_root is not None:
-                    command.extend(("--lora-root", options.lora_root))
-            worker = Worker(command, options)
-            cleanup.callback(worker.close)
-            try:
-                worker.start()
-            except (RequestError, RuntimeError) as error:
-                raise RequestError(f"{model_id}: {error}") from error
-            workers[model_id] = worker
+        pool = WorkerPool(executable, store, checkpoints, options, worker_args)
+        cleanup.callback(pool.close)
+        preload = (options.model_id,) if pool.budget else checkpoints
+        for model_id in preload:
+            deadline = time.monotonic() + options.request_timeout if pool.budget else None
+            with pool.borrow(model_id, deadline):
+                pass
         if run and (not options.no_open or options.prompt is not None):
-            run_terminal(workers[options.model_id], options)
+            with pool.borrow(options.model_id) as worker:
+                run_terminal(worker, options)
             return
-        with Server(workers, options) as server:
+        with Server(pool, options) as server:
             url = f"http://127.0.0.1:{server.server_address[1]}"
             print(f"Listening on {url}", flush=True)
             server.serve_forever()
