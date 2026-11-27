@@ -500,6 +500,53 @@ void queue_bypass() {
     }
 }
 
+void prefix_aware_admission() {
+    const auto model = Model::load(fixture / "f32");
+    for (auto precision : {KvPrecision::f32, KvPrecision::f16}) {
+        BatchOptions options;
+        options.context = 64;
+        options.max_active = 2;
+        options.step_tokens = 4;
+        options.session.kv_precision = precision;
+        options.kv_budget_bytes = Cache::required_bytes(model.config(), 40, precision);
+        BatchScheduler scheduler(model, options);
+        BatchRequest shared{1, std::vector<Token>(33, 4), 4, 0, {}};
+        scheduler.submit(shared);
+        shared.id = 2;
+        scheduler.submit(shared);
+        for (unsigned i = 0; i < 8; ++i)
+            expect(scheduler.step().empty(), "long request computes its first two full pages");
+        const auto both = scheduler.step();
+        expect(both.size() == 2 && both[0].token == 20 && both[1].token == both[0].token && both[1].id == 2 &&
+                   both[1].cached_prompt_tokens == 32,
+               "active prefix reuse admits both requests within the budget");
+
+        expect(scheduler.cancel(1).has_value(), "cancel the first prefix reader");
+        scheduler.submit({3, {1, 2, 3, 4, 5}, 1, 0, {}});
+        const auto held = scheduler.step();
+        expect(held.size() == 1 && held[0].id == 2 && held[0].token == 20,
+               "the second reader still holds the shared reservation");
+        expect(scheduler.cancel(3).has_value(), "cancel the waiting unrelated request");
+        shared.id = 4;
+        scheduler.submit(shared);
+        std::size_t generated = 0;
+        for (unsigned i = 0; i < 12 && !scheduler.empty(); ++i) {
+            for (const auto& event : scheduler.step()) {
+                expect(event.kind != BatchEventKind::error, event.message);
+                if (event.token && event.id == 4) {
+                    expect(event.token == 20 && event.cached_prompt_tokens == 32,
+                           "later reader reuses the prefix without changing its output");
+                    ++generated;
+                }
+            }
+        }
+        expect(generated == 4 && scheduler.empty(), "all remaining readers finish");
+        expect(scheduler.peak_kv_bytes() <= options.kv_budget_bytes &&
+                   scheduler.resident_kv_bytes() <= options.kv_budget_bytes,
+               "shared and private KV remain within budget");
+    }
+}
+
 void threaded_cache_and_chunks() {
     for (unsigned bits = 0; bits <= 0xffff; ++bits) {
         if ((bits & 0x7c00) != 0x7c00)
@@ -1258,6 +1305,7 @@ int main(int argc, char** argv) try {
         batch_scheduler();
         decoder_prefix_cache();
         queue_bypass();
+        prefix_aware_admission();
         gpt2_and_sessions();
         encoder_models();
         checkpoint_outputs();
