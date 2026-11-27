@@ -27,6 +27,7 @@ struct BatchRequest {
     std::vector<Token> stop_ids{};
     std::optional<Tokenizer> tokenizer{};
     std::vector<std::string> stop_strings{};
+    std::optional<LoraAdapter> lora{};
 };
 
 enum class BatchEventKind { token, eos, stop, length, cancelled, error };
@@ -57,6 +58,7 @@ class BatchScheduler {
     void submit(BatchRequest request);
     [[nodiscard]] bool contains(RequestId id) const noexcept;
     [[nodiscard]] std::optional<BatchEvent> cancel(RequestId id);
+    [[nodiscard]] bool uses_lora(const LoraAdapter& adapter) const noexcept;
     [[nodiscard]] std::vector<BatchEvent> step();
     [[nodiscard]] bool empty() const noexcept;
     [[nodiscard]] std::size_t context() const noexcept;

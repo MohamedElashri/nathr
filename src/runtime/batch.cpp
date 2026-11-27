@@ -8,6 +8,7 @@
 #include <iterator>
 #include <list>
 #include <map>
+#include <tuple>
 
 namespace nathr {
 namespace {
@@ -19,9 +20,9 @@ double milliseconds(Clock::duration duration) {
     return std::chrono::duration<double, std::milli>(duration).count();
 }
 
-// A page is identified by its parent prefix and the exact tokens on the page.
+// A page is identified by its adapter, parent prefix, and exact tokens.
 class PrefixCache {
-    using Key = std::pair<std::size_t, std::array<Token, Cache::page_tokens>>;
+    using Key = std::tuple<std::uint64_t, std::size_t, std::array<Token, Cache::page_tokens>>;
 
   public:
     struct Entry {
@@ -32,16 +33,17 @@ class PrefixCache {
         std::size_t children = 0;
     };
 
-    Entry* find(Entry* parent, std::span<const Token> tokens) {
-        const auto it = index_.find(key(parent, tokens));
+    Entry* find(std::uint64_t adapter, Entry* parent, std::span<const Token> tokens) {
+        const auto it = index_.find(key(adapter, parent, tokens));
         if (it == index_.end())
             return nullptr;
         pages_.splice(pages_.end(), pages_, it->second);
         return &*it->second;
     }
 
-    Entry* remember(Entry* parent, std::span<const Token> tokens, const Cache::Page& page) {
-        auto [it, inserted] = index_.try_emplace(key(parent, tokens), pages_.end());
+    Entry* remember(std::uint64_t adapter, Entry* parent, std::span<const Token> tokens,
+                    const Cache::Page& page) {
+        auto [it, inserted] = index_.try_emplace(key(adapter, parent, tokens), pages_.end());
         if (!inserted) {
             pages_.splice(pages_.end(), pages_, it->second);
             return &*it->second;
@@ -71,10 +73,10 @@ class PrefixCache {
     }
 
   private:
-    static Key key(const Entry* parent, std::span<const Token> tokens) {
-        Key result{parent ? parent->id : 0, {}};
-        std::ranges::copy(tokens.first(Cache::page_tokens), result.second.begin());
-        return result;
+    static Key key(std::uint64_t adapter, const Entry* parent, std::span<const Token> tokens) {
+        std::array<Token, Cache::page_tokens> page;
+        std::ranges::copy(tokens.first(Cache::page_tokens), page.begin());
+        return {adapter, parent ? parent->id : 0, page};
     }
 
     std::list<Entry> pages_;
@@ -83,14 +85,17 @@ class PrefixCache {
 };
 
 struct Request {
-    Request(BatchRequest&& input, std::size_t capacity, std::size_t reservation)
-        : input(std::move(input)), capacity(capacity), reservation(reservation) {
+    Request(BatchRequest&& input, std::size_t capacity, std::size_t reservation,
+            const detail::LoraWeights* lora)
+        : input(std::move(input)), capacity(capacity), reservation(reservation), lora(lora) {
         if (this->input.tokenizer)
             text.emplace(std::move(*this->input.tokenizer), std::move(this->input.stop_strings));
     }
 
     BatchRequest input;
     std::size_t capacity, reservation;
+    const detail::LoraWeights* lora;
+    std::uint64_t lora_key() const { return lora ? lora->cache_key() : 0; }
     Clock::time_point arrival = Clock::now();
     std::optional<Clock::time_point> admitted;
     std::optional<Clock::time_point> last_token;
@@ -201,7 +206,7 @@ struct BatchScheduler::Impl {
     void reuse_prefix(Request& request) {
         const auto tokens = std::span(request.input.tokens);
         while (tokens.size() - request.position >= Cache::page_tokens) {
-            auto* page = prefixes.find(request.prefix, tokens.subspan(request.position));
+            auto* page = prefixes.find(request.lora_key(), request.prefix, tokens.subspan(request.position));
             if (!page)
                 break;
             request.cache->use_prefix_page(request.position / Cache::page_tokens, page->page);
@@ -250,8 +255,9 @@ struct BatchScheduler::Impl {
             const auto tokens = std::span(request->input.tokens);
             const auto complete = request->position / Cache::page_tokens;
             for (auto index = previous_position / Cache::page_tokens; index < complete; ++index) {
-                request->prefix = prefixes.remember(
-                    request->prefix, tokens.subspan(index * Cache::page_tokens), request->cache->page(index));
+                request->prefix = prefixes.remember(request->lora_key(), request->prefix,
+                                                    tokens.subspan(index * Cache::page_tokens),
+                                                    request->cache->page(index));
                 request->cache->use_prefix_page(index, request->prefix->page);
             }
         }
@@ -325,6 +331,8 @@ void BatchScheduler::submit(BatchRequest request) {
         throw Error(ErrorCode::resource_limit, "batch queued-token budget exceeded");
     if (!request.tokenizer && !request.stop_strings.empty())
         throw Error(ErrorCode::invalid_argument, "stop strings require a tokenizer");
+    if (request.lora && request.lora->model_ != s.model.impl_)
+        throw Error(ErrorCode::invalid_argument, "LoRA adapter belongs to a different base model");
     if (std::ranges::any_of(request.stop_ids, [&](Token id) { return id >= s.model.config().vocabulary; }))
         throw Error(ErrorCode::invalid_argument, "stop token ID exceeds model vocabulary");
     detail::validate_tokens(request.tokens, s.model.config(), s.options.context);
@@ -340,13 +348,20 @@ void BatchScheduler::submit(BatchRequest request) {
                                                     : 0;
     if (reservation > std::min(s.options.kv_budget_bytes, detail::max_kv_cache_bytes))
         throw Error(ErrorCode::resource_limit, "request exceeds KV budget");
-    s.queued.emplace_back(std::move(request), capacity, reservation);
+    const auto* lora = request.lora ? request.lora->weights_.get() : nullptr;
+    s.queued.emplace_back(std::move(request), capacity, reservation, lora);
     s.queued_tokens += s.queued.back().input.tokens.size();
 }
 
 bool BatchScheduler::contains(RequestId id) const noexcept {
     const auto matches = [=](const Request& item) { return item.input.id == id; };
     return std::ranges::any_of(impl_->active, matches) || std::ranges::any_of(impl_->queued, matches);
+}
+
+bool BatchScheduler::uses_lora(const LoraAdapter& adapter) const noexcept {
+    const auto matches = [&](const Request& item) { return item.lora == adapter.weights_.get(); };
+    return adapter.weights_ &&
+           (std::ranges::any_of(impl_->active, matches) || std::ranges::any_of(impl_->queued, matches));
 }
 
 std::optional<BatchEvent> BatchScheduler::cancel(RequestId id) {
@@ -388,7 +403,7 @@ std::vector<BatchEvent> BatchScheduler::step() {
         try {
             it->cache->ensure(it->position + tokens.size());
             evaluations.push_back({tokens, it->position, &*it->cache, mode, sink, trace, it->logits,
-                                   it->position < it->cached_prompt_tokens});
+                                   it->position < it->cached_prompt_tokens, it->lora});
             requests.push_back(it);
         } catch (const Error& error) {
             s.fail(it, error, events);

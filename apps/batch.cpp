@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <chrono>
 #include <iostream>
+#include <map>
 #include <poll.h>
 #include <unistd.h>
 
@@ -90,6 +91,95 @@ std::size_t integer(const Json& value, std::string_view key, std::size_t fallbac
     return found == value.end() ? fallback : detail::natural(*found, key);
 }
 
+class LoraRegistry {
+  public:
+    LoraRegistry(const Model& model, const BatchIoOptions& io)
+        : model_(model),
+          root_(io.lora_root.empty() ? io.lora_root : std::filesystem::canonical(io.lora_root)) {
+        if (!root_.empty() && (!model.supports_fused_batch() || !std::filesystem::is_directory(root_)))
+            throw Error(ErrorCode::invalid_argument,
+                        "LoRA reloads require a decoder-only model and a directory");
+        for (const auto& spec : io.lora_adapters) {
+            const auto eq = spec.find('=');
+            if (eq == spec.npos || eq + 1 == spec.size())
+                throw Error(ErrorCode::invalid_argument, "batch --lora requires NAME=DIR");
+            load(spec.substr(0, eq), spec.substr(eq + 1));
+        }
+    }
+
+    void reload(std::string name, const std::filesystem::path& path) {
+        require_root();
+        const auto received = root_ / path;
+        check_root(received.lexically_normal());
+        const auto directory = std::filesystem::canonical(received);
+        check_root(directory);
+        for (const auto filename : {"adapter_config.json", "adapter_model.safetensors"})
+            check_root(std::filesystem::canonical(directory / filename));
+        load(std::move(name), directory);
+    }
+
+    void unload(const std::string& name, const BatchScheduler& scheduler) {
+        require_root();
+        const auto found = adapters_.find(name);
+        if (found == adapters_.end())
+            throw Error(ErrorCode::invalid_argument, "LoRA adapter is not loaded");
+        if (scheduler.uses_lora(found->second))
+            throw Error(ErrorCode::resource_limit, "LoRA adapter is in use");
+        bytes_ -= found->second.memory_bytes();
+        adapters_.erase(found);
+    }
+
+    [[nodiscard]] const LoraAdapter* get(const Json& request) const {
+        const auto choice = request.find("lora");
+        if (choice == request.end())
+            return nullptr;
+        const auto found = adapters_.find(choice->get<std::string>());
+        if (found == adapters_.end())
+            throw Error(ErrorCode::invalid_argument, "LoRA adapter is not loaded");
+        return &found->second;
+    }
+
+    [[nodiscard]] Json names() const {
+        auto names = Json::array();
+        for (const auto& [name, adapter] : adapters_)
+            names.push_back(name);
+        return names;
+    }
+
+  private:
+    void require_root() const {
+        if (root_.empty())
+            throw Error(ErrorCode::unsupported, "loading or unloading adapters requires --lora-root");
+    }
+
+    void check_root(const std::filesystem::path& resolved) const {
+        const auto parent = std::mismatch(root_.begin(), root_.end(), resolved.begin(), resolved.end());
+        if (parent.first != root_.end())
+            throw Error(ErrorCode::invalid_argument, "LoRA directory and files must be inside --lora-root");
+    }
+
+    void load(std::string name, const std::filesystem::path& directory) {
+        if (name.empty() || name.size() > 128 || !std::ranges::all_of(name, [](char ch) {
+                return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+                       ch == '_' || ch == '-' || ch == '.';
+            }))
+            throw Error(ErrorCode::invalid_argument, "invalid LoRA adapter name");
+        if (adapters_.contains(name))
+            throw Error(ErrorCode::invalid_argument, "LoRA adapter name is already loaded");
+        if (adapters_.size() == 16)
+            throw Error(ErrorCode::resource_limit, "LoRA adapter count limit reached");
+        auto adapter = model_.load_lora(directory, 256 * detail::mib - bytes_);
+        const auto size = adapter.memory_bytes();
+        adapters_.emplace(std::move(name), std::move(adapter));
+        bytes_ += size;
+    }
+
+    const Model& model_;
+    const std::filesystem::path root_;
+    std::map<std::string, LoraAdapter, std::less<>> adapters_;
+    std::size_t bytes_ = 0;
+};
+
 struct BatchOutput {
     std::optional<Tokenizer> tokenizer;
     std::size_t output_tokens = 0;
@@ -167,7 +257,7 @@ TokenizedInput input_tokens(const Json& json, BatchOutput& output, const Model& 
 
 void command(const Line& line, const Model& model, std::optional<BatchScheduler>& scheduler,
              BatchOutput& output, const std::filesystem::path& path, const std::filesystem::path& sidecar,
-             const RequestDefaults& defaults, std::size_t max_result_values) {
+             const RequestDefaults& defaults, std::size_t max_result_values, LoraRegistry& lora) {
     std::optional<RequestId> id;
     try {
         if (line.too_long)
@@ -186,10 +276,27 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             return;
         }
         id = detail::natural(json.at("id"), "id");
+        const auto load_lora = json.find("load_lora");
+        const auto unload_lora = json.find("unload_lora");
+        if (load_lora != json.end() || unload_lora != json.end()) {
+            if (!scheduler || json.size() != 2 || scheduler->contains(*id))
+                throw Error(ErrorCode::invalid_argument, "invalid LoRA control request");
+            if (load_lora != json.end()) {
+                if (!load_lora->is_object() || load_lora->size() != 2)
+                    throw Error(ErrorCode::invalid_argument, "load_lora requires name and path");
+                lora.reload(load_lora->at("name").get<std::string>(),
+                            load_lora->at("path").get<std::string>());
+            } else {
+                lora.unload(unload_lora->get<std::string>(), *scheduler);
+            }
+            write_output({{"event", "result"}, {"id", *id}, {"lora_adapters", lora.names()}});
+            return;
+        }
+        const auto* adapter = lora.get(json);
         const auto tensor = json.find("output");
         if (tensor != json.end() && scheduler && scheduler->contains(*id))
             throw Error(ErrorCode::invalid_argument, "duplicate request ID");
-        constexpr std::string_view common[] = {"id", "prompt", "tokens"};
+        constexpr std::string_view common[] = {"id", "prompt", "tokens", "lora"};
         constexpr std::string_view tensors[] = {"output", "text_pair", "token_type_ids", "decoder_tokens"};
         constexpr std::string_view generation[] = {"max_new_tokens", "seed",  "greedy",   "temperature",
                                                    "top_k",          "top_p", "messages", "stop",
@@ -220,7 +327,7 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
                         throw Error(ErrorCode::resource_limit, "named tensor exceeds response limit");
                 }
             }
-            auto result = model.infer({input.ids, input.token_type_ids, prefix}, name);
+            auto result = model.infer({input.ids, input.token_type_ids, prefix}, name, adapter);
             write_output({{"event", "result"},
                           {"id", *id},
                           {"output", name},
@@ -246,7 +353,8 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
               integer(json, "top_k", defaults.sampling.top_k), json.value("top_p", defaults.sampling.top_p)},
              std::move(stops),
              decode ? output.tokenizer : std::optional<Tokenizer>{},
-             json.contains("stop") ? stop_strings(json.at("stop")) : std::vector<std::string>{}});
+             json.contains("stop") ? stop_strings(json.at("stop")) : std::vector<std::string>{},
+             adapter ? std::optional(*adapter) : std::nullopt});
     } catch (const std::exception& error) {
         const auto* typed = dynamic_cast<const Error*>(&error);
         const auto code =
@@ -261,6 +369,7 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
 
 void run_batch(const Model& model, const std::filesystem::path& path, const std::filesystem::path& sidecar,
                BatchOptions options, BatchIoOptions io) {
+    LoraRegistry lora(model, io);
     std::optional<BatchScheduler> scheduler;
     if (model.supports_generation())
         scheduler.emplace(model, options);
@@ -275,10 +384,12 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
         } catch (const Error&) {
             // Checkpoints with external tokenizers can still accept raw IDs.
         }
-        Json ready = {{"event", "ready"},
-                      {"text", output.tokenizer.has_value()},
-                      {"chat", model.supports_generation() && defaults.chat.has_value() && output.tokenizer},
-                      {"max_new_tokens", defaults.max_new_tokens}};
+        Json ready = {
+            {"event", "ready"},
+            {"text", output.tokenizer.has_value()},
+            {"chat", model.supports_generation() && defaults.chat.has_value() && output.tokenizer},
+            {"max_new_tokens", defaults.max_new_tokens},
+            {"lora_adapters", lora.names()}};
         add_capabilities(ready, model);
         if (scheduler)
             ready["generation_context"] = scheduler->context();
@@ -288,7 +399,7 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
     const auto empty = [&] { return !scheduler || scheduler->empty(); };
     while (!input.done() || !empty()) {
         if (auto line = input.next(empty()))
-            command(*line, model, scheduler, output, path, sidecar, defaults, io.max_result_values);
+            command(*line, model, scheduler, output, path, sidecar, defaults, io.max_result_values, lora);
         if (!empty()) {
             for (const auto& event : scheduler->step())
                 output.publish(event);

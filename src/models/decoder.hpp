@@ -2,20 +2,25 @@
 
 #include "backend/cpu/scalar.hpp"
 #include "backend/cpu/thread_pool.hpp"
+#include "models/lora.hpp"
 
+#include <algorithm>
 #include <initializer_list>
 #include <utility>
 
 namespace nathr::detail {
+
+struct EvaluationBatch;
 
 class CpuBackend {
   public:
     CpuBackend(BackendOptions options, CpuFeatures features);
     TensorView bind(TensorView view, const std::filesystem::path& path, std::string_view name);
     void project(TensorView weight, std::span<const float> input, std::span<float> output, std::size_t tokens,
-                 std::span<float> packed) const;
+                 std::span<float> packed, const EvaluationBatch* adapters = nullptr) const;
     void project(std::initializer_list<Projection> projections, std::span<const float> input,
-                 std::size_t tokens, std::span<float> packed) const;
+                 std::size_t tokens, std::span<float> packed,
+                 const EvaluationBatch* adapters = nullptr) const;
     [[nodiscard]] std::string_view kernel(std::uint32_t id) const noexcept;
     [[nodiscard]] std::string_view name() const noexcept;
     [[nodiscard]] unsigned threads() const noexcept { return options_.threads; }
@@ -51,6 +56,7 @@ struct Evaluation {
     const TraceSink& trace;
     std::span<float> last_logits{};
     bool replay_cached = false;
+    const LoraWeights* lora = nullptr;
 
     [[nodiscard]] bool wants_logits(std::size_t index) const;
     void record(std::string_view name, std::size_t layer, std::size_t index,
@@ -60,6 +66,12 @@ struct Evaluation {
 
 struct EvaluationBatch {
     std::span<const Evaluation> entries;
+
+    [[nodiscard]] const EvaluationBatch* adapters() const {
+        return std::ranges::any_of(entries, [](const auto& entry) { return entry.lora != nullptr; })
+                   ? this
+                   : nullptr;
+    }
 
     std::size_t size() const {
         std::size_t total = 0;
@@ -87,6 +99,7 @@ class Decoder {
         execute_batch(scratch, {std::span(&evaluation, 1)});
     }
     virtual void execute_batch(Workspace& scratch, const EvaluationBatch& batch) const = 0;
+    [[nodiscard]] virtual std::vector<LoraTarget> lora_targets() const = 0;
 };
 
 inline std::span<float> row(std::span<float> values, std::size_t width, std::size_t index) {
@@ -102,6 +115,8 @@ void project_logits(Workspace& workspace, const EvaluationBatch& batch, const Cp
         normalize(row(hidden, normalized.size(), index), normalized);
         e.record("final_norm", TraceEvent::model_level, i, normalized);
         backend.project(weights, normalized, workspace.logits, 1, workspace.packed);
+        if (e.lora)
+            e.lora->project(weights, normalized, workspace.logits, 1);
         e.publish_logits(i, workspace.logits);
     });
 }

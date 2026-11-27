@@ -52,6 +52,7 @@ class RotaryDecoder final : public Decoder {
         return std::make_unique<RotaryWorkspace>(config, positions, block);
     }
     void execute_batch(Workspace& scratch, const EvaluationBatch& batch) const override;
+    [[nodiscard]] std::vector<LoraTarget> lora_targets() const override;
 
   private:
     const ModelConfig& config;
@@ -118,6 +119,23 @@ RotaryDecoder::RotaryDecoder(File& file, const std::filesystem::path& path, cons
     }
 }
 
+std::vector<LoraTarget> RotaryDecoder::lora_targets() const {
+    std::vector<LoraTarget> targets{{"model.embed_tokens", embedding, true}, {"lm_head", output}};
+    targets.reserve(2 + 7 * layers.size());
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto prefix = "model.layers." + std::to_string(i) + ".";
+        const auto& w = layers[i];
+        targets.insert(targets.end(), {{prefix + "self_attn.q_proj", w.q},
+                                       {prefix + "self_attn.k_proj", w.k},
+                                       {prefix + "self_attn.v_proj", w.v},
+                                       {prefix + "self_attn.o_proj", w.o},
+                                       {prefix + "mlp.gate_proj", w.gate},
+                                       {prefix + "mlp.up_proj", w.up},
+                                       {prefix + "mlp.down_proj", w.down}});
+    }
+    return targets;
+}
+
 void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& batch) const {
     auto& w = static_cast<RotaryWorkspace&>(scratch);
     const auto h = config.hidden;
@@ -134,11 +152,15 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
     const auto projection = w.projection.first(count * h);
     const auto gate = w.gate.first(count * ff);
     const auto up = w.up.first(count * ff);
-    const auto linear = [&](TensorView weight, std::span<const float> input, std::span<float> result,
-                            std::size_t rows) { backend.project(weight, input, result, rows, w.packed); };
+    const auto* adapters = batch.adapters();
+    const auto linear = [&](TensorView weight, std::span<const float> input, std::span<float> result) {
+        backend.project(weight, input, result, count, w.packed, adapters);
+    };
     batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
         auto activation = row(hidden, h, index);
         Scalar::embedding(embedding, e.tokens[i], activation);
+        if (e.lora)
+            e.lora->embed(embedding, e.tokens[i], activation);
         e.record("embedding", TraceEvent::model_level, i, activation);
     });
 
@@ -152,7 +174,7 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
             e.record("input_norm", layer, i, norm_row);
         });
         backend.project({{weights.q, queries}, {weights.k, keys}, {weights.v, values}}, norms, count,
-                        w.packed);
+                        w.packed, adapters);
         batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
             auto q = row(queries, query_width, index);
             auto k = row(keys, kv, index);
@@ -184,7 +206,7 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
                               row(queries, query_width, index), result, w.scores);
             e.record("attention", layer, i, result);
         });
-        linear(weights.o, attention, projection, count);
+        linear(weights.o, attention, projection);
         batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
             auto activation = row(hidden, h, index);
             auto result = row(projection, h, index);
@@ -195,7 +217,7 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
             Scalar::rms_norm(weights.post_attention_norm, activation, norm_row, config.rms_epsilon);
             e.record("post_attention_norm", layer, i, norm_row);
         });
-        backend.project({{weights.gate, gate}, {weights.up, up}}, norms, count, w.packed);
+        backend.project({{weights.gate, gate}, {weights.up, up}}, norms, count, w.packed, adapters);
         batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
             auto g = row(gate, ff, index);
             auto u = row(up, ff, index);
@@ -204,7 +226,7 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
             Scalar::swiglu(g, u);
             e.record("swiglu", layer, i, g);
         });
-        linear(weights.down, gate, projection, count);
+        linear(weights.down, gate, projection);
         batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
             auto result = row(projection, h, index);
             auto activation = row(hidden, h, index);

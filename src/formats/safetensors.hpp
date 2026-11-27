@@ -9,7 +9,7 @@ namespace nathr::detail {
 
 class SafeTensors {
   public:
-    explicit SafeTensors(const std::filesystem::path& path);
+    explicit SafeTensors(const std::filesystem::path& path, std::size_t byte_limit = max_checkpoint_bytes);
     SafeTensors(const SafeTensors&) = delete;
     SafeTensors& operator=(const SafeTensors&) = delete;
     [[nodiscard]] TensorView take(std::string_view name, std::initializer_list<std::size_t> shape);

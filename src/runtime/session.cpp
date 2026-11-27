@@ -7,10 +7,11 @@
 namespace nathr {
 
 struct Session::Impl {
-    Impl(const Model& source, std::size_t limit, std::uint64_t start_seed, SessionOptions options)
+    Impl(const Model& source, std::size_t limit, std::uint64_t start_seed, SessionOptions options,
+         const LoraAdapter* adapter)
         : model(source), decoder(model.impl_->decoder()), cache(model.config(), limit, options.kv_precision),
           chunk(std::min(limit, options.prefill_chunk)), scratch(decoder.workspace(limit, chunk)),
-          seed(start_seed), rng(seed) {
+          lora(adapter ? adapter->weights_ : nullptr), seed(start_seed), rng(seed) {
         tokens.reserve(limit);
     }
 
@@ -25,7 +26,9 @@ struct Session::Impl {
             const auto count = std::min(chunk, ids.size() - i);
             const auto output =
                 (mode == LogitsMode::last_token && i + count != ids.size()) ? LogitsMode::none : mode;
-            decoder.execute(*scratch, {ids.subspan(i, count), start + i, &cache, output, sink, trace});
+            decoder.execute(
+                *scratch,
+                {ids.subspan(i, count), start + i, &cache, output, sink, trace, {}, false, lora.get()});
             i += count;
         }
         // The input may be a view of the already-consumed prefix.
@@ -40,6 +43,7 @@ struct Session::Impl {
     detail::Cache cache;
     const std::size_t chunk;
     std::unique_ptr<detail::Workspace> scratch;
+    std::shared_ptr<const detail::LoraWeights> lora;
     std::vector<Token> tokens;
     SessionState state = SessionState::empty;
     bool has_logits = false;
@@ -52,8 +56,10 @@ Session::~Session() = default;
 Session::Session(Session&&) noexcept = default;
 Session& Session::operator=(Session&&) noexcept = default;
 
-Session Session::create(const Model& model, std::size_t capacity, std::uint64_t seed,
-                        SessionOptions options) {
+Session Session::create(const Model& model, std::size_t capacity, std::uint64_t seed, SessionOptions options,
+                        const LoraAdapter* lora) {
+    if (lora && lora->model_ != model.impl_)
+        throw Error(ErrorCode::invalid_argument, "LoRA adapter belongs to a different base model");
     if (capacity == 0)
         capacity = std::min<std::size_t>(2048, model.config().context);
     if (capacity > model.config().context)
@@ -62,7 +68,7 @@ Session Session::create(const Model& model, std::size_t capacity, std::uint64_t 
         throw Error(ErrorCode::invalid_argument, "prefill chunk must be between 1 and 32 tokens");
     if (options.kv_precision != KvPrecision::f32 && options.kv_precision != KvPrecision::f16)
         throw Error(ErrorCode::invalid_argument, "unknown KV cache precision");
-    return Session(std::make_unique<Impl>(model, capacity, seed, options));
+    return Session(std::make_unique<Impl>(model, capacity, seed, options, lora));
 }
 
 void Session::prefill(std::span<const Token> tokens, LogitsMode mode, const LogitsSink& sink,
