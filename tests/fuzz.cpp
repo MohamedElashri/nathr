@@ -108,7 +108,7 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
         nathr::detail::SafeTensors parsed(path);
 #elif defined(NATHR_FUZZ_gguf)
         nathr::detail::Gguf parsed(path);
-        (void)load_llama_config(parsed);
+        (void)load_gguf_decoder_config(parsed);
         (void)parsed.tokenizer_fingerprint();
 #elif defined(NATHR_FUZZ_tokenizer)
         const auto parsed = Tokenizer::load(path);
