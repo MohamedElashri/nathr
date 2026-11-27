@@ -12,6 +12,8 @@ struct BatchOptions {
     std::size_t step_tokens = 32;
     std::size_t kv_budget_bytes = 512 * 1024 * 1024;
     SessionOptions session;
+    bool prefix_cache = true;
+    std::size_t max_queue_bypasses = 0;
 };
 
 using RequestId = std::uint64_t;
@@ -39,6 +41,8 @@ struct BatchEvent {
     std::string message;
     std::optional<std::string> text{};
     std::size_t prompt_tokens{};
+    std::size_t cached_prompt_tokens{};
+    double queue_ms{};
 };
 
 // Call from one thread. Submit and cancel requests between calls to step().
@@ -59,6 +63,7 @@ class BatchScheduler {
     [[nodiscard]] std::size_t peak_kv_bytes() const noexcept;
     [[nodiscard]] std::size_t resident_kv_bytes() const noexcept;
     [[nodiscard]] std::size_t kv_page_reuses() const noexcept;
+    [[nodiscard]] std::size_t queue_bypasses() const noexcept;
 
   private:
     struct Impl;

@@ -209,7 +209,8 @@ void Gpt2::execute_batch(Workspace& scratch, const EvaluationBatch& batch) const
             e.record("key", layer, i, key);
             e.record("value", layer, i, value);
             if (e.cache) {
-                Scalar::store(*e.cache, layer, e.start + i, key, value);
+                if (!e.replay_cached)
+                    Scalar::store(*e.cache, layer, e.start + i, key, value);
             } else {
                 std::ranges::copy(key, row(keys, h, index).begin());
                 std::ranges::copy(value, row(values, h, index).begin());
@@ -250,15 +251,8 @@ void Gpt2::execute_batch(Workspace& scratch, const EvaluationBatch& batch) const
             e.record("layer_output", layer, i, activation);
         });
     }
-    batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
-        if (!e.wants_logits(i))
-            return;
-        const auto final = norm.first(h);
-        normalize(final_norm, row(hidden, h, index), final);
-        e.record("final_norm", TraceEvent::model_level, i, final);
-        backend.project(output, final, w.logits, 1, w.packed);
-        e.publish_logits(i, w.logits);
-    });
+    project_logits(w, batch, backend, output, hidden, norm.first(h),
+                   [&](auto input, auto result) { normalize(final_norm, input, result); });
 }
 
 } // namespace

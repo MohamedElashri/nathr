@@ -45,10 +45,6 @@ std::uint16_t float_to_half(float value) noexcept {
     return static_cast<std::uint16_t>(sign | (rounded >> shift));
 }
 
-float bf16_to_float(std::uint16_t bits) noexcept {
-    return std::bit_cast<float>(std::uint32_t{bits} << 16);
-}
-
 namespace {
 
 template <DType dtype, BlockDecode unpack = nullptr>
@@ -152,8 +148,6 @@ Cache::Cache(const ModelConfig& config, std::size_t limit, KvPrecision format, C
       bytes_per_token_(required_bytes(config, 1, format)), pool_(pool) {
     if (product({capacity, bytes_per_token_}, "KV cache") > max_kv_cache_bytes)
         throw Error(ErrorCode::resource_limit, "KV cache exceeds 512 MiB");
-    if (precision == KvPrecision::f16)
-        pages_.emplace<Pages<std::uint16_t>>();
 }
 
 std::size_t Cache::required_bytes(const ModelConfig& config, std::size_t capacity, KvPrecision precision) {
@@ -169,30 +163,37 @@ void Cache::ensure(std::size_t positions) {
     if (positions > capacity)
         throw Error(ErrorCode::invalid_argument, "KV page request exceeds capacity");
     const auto required = positions / page_tokens + (positions % page_tokens != 0);
-    std::visit(
-        [&](auto& pages) {
-            using Element = typename std::decay_t<decltype(pages)>::value_type::element_type;
-            const auto original = pages.size();
-            try {
-                while (pages.size() < required) {
-                    const auto count = 2 * bank_width_ * page_length(pages.size());
-                    const auto data = pool_ ? pool_->acquire<Element>(count)
-                                            : std::make_unique_for_overwrite<Element[]>(count).release();
-                    using Lease = typename std::decay_t<decltype(pages)>::value_type;
-                    pages.push_back(Lease(data, {pool_, count}));
-                }
-            } catch (...) {
-                while (pages.size() > original)
-                    pages.pop_back();
-                throw;
-            }
-        },
-        pages_);
+    const auto allocate = [&]<class T>(std::size_t count) {
+        if (!pool_) {
+            auto page = std::make_shared_for_overwrite<T[]>(count);
+            const auto data = page.get();
+            return Page(std::move(page), data);
+        }
+        return Page(pool_->acquire<T>(count), Recycle<T>{pool_, count});
+    };
+    const auto original = pages_.size();
+    try {
+        while (pages_.size() < required) {
+            const auto count = 2 * bank_width_ * page_length(pages_.size());
+            pages_.push_back(precision == KvPrecision::f16 ? allocate.operator()<std::uint16_t>(count)
+                                                           : allocate.operator()<float>(count));
+        }
+    } catch (...) {
+        pages_.resize(original);
+        throw;
+    }
+}
+
+void Cache::use_prefix_page(std::size_t index, const Page& shared) {
+    assert(index <= pages_.size() && page_length(index) == page_tokens);
+    if (index == pages_.size())
+        pages_.push_back(shared);
+    else
+        pages_[index] = shared;
 }
 
 std::size_t Cache::bytes() const noexcept {
-    const auto count = std::visit([](const auto& pages) { return pages.size(); }, pages_);
-    return std::min(count * page_tokens, capacity) * bytes_per_token_;
+    return std::min(pages_.size() * page_tokens, capacity) * bytes_per_token_;
 }
 
 void Scalar::embedding(TensorView table, std::size_t index, std::span<float> output) {

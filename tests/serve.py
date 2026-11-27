@@ -119,6 +119,8 @@ def http_checks(binary, checkpoint, encoder):
         assert metadata["limits"]["max_result_values"] == 64
         chat = dict(model="test", messages=[dict(role="user", content="b")], temperature=0, max_tokens=4)
         complete = request(port, chat_path, chat)
+        nullable = request(port, chat_path, dict(chat, max_tokens=None, max_completion_tokens=4, n=None, stream=None))
+        assert nullable["choices"] == complete["choices"] and nullable["usage"] == complete["usage"]
         events = request(port, chat_path, dict(chat, stream=True))
         deltas = [event["choices"][0]["delta"] for event in events]
         assert deltas[0] == {"role": "assistant"}
@@ -209,6 +211,16 @@ def http_checks(binary, checkpoint, encoder):
         request(port, "/v1/embeddings", dict(input="The sky is blue."))
         request(port, "/v1/embeddings", dict(input=["The sky is blue."] * 4), 429)
 
+    with server(binary, checkpoint, "--max-buffer-bytes", "512", "--model-id", "test") as port:
+        request(port, "/v1/chat/completions", dict(messages=[dict(role="user", content="b")], max_tokens=1))
+        request(port, "/v1/responses", dict(input="b", max_output_tokens=1), 429)
+        events = request(port, "/v1/responses", dict(input="b", max_output_tokens=1, stream=True))
+        assert events[0]["type"] == "response.created"
+        assert events[-1]["type"] == "error" and events[-1]["error"]["code"] == 429
+        assert all(len(json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode()) <= 512
+                   for event in events)
+        assert request(port, "/health")["pending_requests"] == 0
+
     with server(binary, encoder.parent / "model/f32") as port:
         assert not request(port, "/model")["text"]
         assert request(port, "/infer", dict(tokens=[4, 4], max_new_tokens=1))["emitted"] == 1
@@ -272,6 +284,36 @@ def user_commands(binary, checkpoint, encoder, directory):
     assert json.loads(output)["shape"] == [12]
 
 
+def multi_model_benchmark(binary, checkpoint, encoder):
+    with server(binary, checkpoint, "--model-id", "chat", "--also", encoder, "--context", "128") as port:
+        models = request(port, "/v1/models")["data"]
+        assert [model["id"] for model in models] == ["chat", "bert"]
+        assert request(port, "/v1/models/bert") == models[1]
+        assert request(port, "/model")["id"] == "chat"
+        assert request(port, "/model?model=bert")["outputs"] != request(port, "/model")["outputs"]
+        assert set(request(port, "/health")["models"]) == {"chat", "bert"}
+        request(port, "/health?model=missing", status=404)
+        assert request(port, "/health?model=chat")["kv"]["peak_bytes"] == 0
+        assert request(port, "/v1/responses", dict(input="b", max_output_tokens=1))["model"] == "chat"
+        embedding = request(port, "/v1/embeddings", dict(model="bert", input="The sky is blue."))
+        assert embedding["model"] == "bert" and len(embedding["data"][0]["embedding"]) == 12
+        request(port, "/v1/responses", dict(model="bert", input="The sky is blue."), status=400)
+
+        report = subprocess.check_output([binary, "bench", "--serve", "--port", str(port), "--model", "chat",
+                                          "--workload", "shared-prefix", "--requests", "4", "--concurrency", "2",
+                                          "--warmups", "1", "--prompt-length", "48", "--seed", "43",
+                                          "--decode-length", "4"], text=True, timeout=15)
+        result = json.loads(report)
+        assert result["failed"] == 0 and result["cached_prompt_tokens"] >= 64
+        assert result["kv_peak_bytes"] > 0 and result["ttft_ms"]["p95"] > 0 and result["queue_ms"]["p95"] >= 0
+        mixed = subprocess.check_output([binary, "bench", "--serve", "--port", str(port), "--model", "chat",
+                                         "--workload", "mixed", "--requests", "4", "--concurrency", "2",
+                                         "--prompt-length", "16", "--seed", "43", "--decode-length", "4"],
+                                        text=True, timeout=15)
+        result = json.loads(mixed)
+        assert result["short"]["requests"] == 3 and result["long"]["requests"] == 1
+
+
 if __name__ == "__main__":
     executable, fixtures = map(Path, sys.argv[1:])
     help_text = subprocess.check_output([executable, "help", "serve"], text=True, timeout=10)
@@ -283,4 +325,5 @@ if __name__ == "__main__":
         stalled_consumer(executable, checkpoint)
         chat_stdin(executable, checkpoint)
         user_commands(executable, checkpoint, fixtures / "bert", checkpoint / "empty cache")
+        multi_model_benchmark(executable, checkpoint, fixtures / "bert")
         checkpoint_defaults(executable, checkpoint)

@@ -674,6 +674,8 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
     batch_options.max_active = number(args, "--max-active", batch_options.max_active);
     batch_options.max_queued = number(args, "--max-queued", batch_options.max_queued);
     batch_options.max_queued_tokens = number(args, "--max-queued-tokens", batch_options.max_queued_tokens);
+    batch_options.max_queue_bypasses = number(args, "--max-queue-bypasses", batch_options.max_queue_bypasses);
+    batch_options.prefix_cache = !args.flag("--no-prefix-cache");
     batch_options.step_tokens = number(args, "--step-tokens", batch_options.step_tokens);
     batch_options.kv_budget_bytes = detail::product(
         {number(args, "--kv-budget-mib", batch_options.kv_budget_bytes / detail::mib), detail::mib},
@@ -878,13 +880,16 @@ constexpr CommandHelp commands[] = {
      "  --max-active N                Set the number of active requests (default 4).\n"
      "  --max-queued N                Set the request queue limit (default 32).\n"
      "  --max-queued-tokens N         Limit queued prompt tokens (default 16384).\n"
+     "  --max-queue-bypasses N        Let up to N fitting requests pass a blocked queue head (default 0).\n"
      "  --step-tokens N               Set the total tokens per scheduler step (default 32).\n"
      "  --kv-budget-mib N             Limit KV memory (default 512).\n"
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"
+     "  --no-prefix-cache             Disable sharing of computed decoder KV pages.\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
      "  --stats                       Emit timings and KV stats after the batch drains.\n"},
     {"serve", "Start the local OpenAI-compatible API", "serve [MODEL]", ""},
-    {"bench", "Measure decoder-only prefill and decode", "bench MODEL",
+    {"bench", "Measure decoder inference or HTTP serving", "bench MODEL | nathr bench --serve",
+     "  --serve                       Benchmark a running server (see bench --serve --help).\n"
      "  --prompt-length N             Set the synthetic prompt length (default 128).\n"
      "  --decode-length N             Set the decode length (default 32).\n"
      "  --context N                   Set session capacity (default 512).\n"
@@ -970,6 +975,8 @@ int main(int argc, char** argv) try {
         return 0;
     }
     const auto arguments = std::span(argv + 2, static_cast<std::size_t>(argc - 2));
+    if (command == "bench" && !arguments.empty() && std::string_view(arguments.front()) == "--serve")
+        launch_frontend("bench-serve", arguments.subspan(1), false);
     bool help = command == "help";
     if (help) {
         if (arguments.empty()) {

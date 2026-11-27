@@ -50,6 +50,7 @@ struct Evaluation {
     const LogitsSink& sink;
     const TraceSink& trace;
     std::span<float> last_logits{};
+    bool replay_cached = false;
 
     [[nodiscard]] bool wants_logits(std::size_t index) const;
     void record(std::string_view name, std::size_t layer, std::size_t index,
@@ -90,6 +91,19 @@ class Decoder {
 
 inline std::span<float> row(std::span<float> values, std::size_t width, std::size_t index) {
     return values.subspan(width * index, width);
+}
+
+void project_logits(Workspace& workspace, const EvaluationBatch& batch, const CpuBackend& backend,
+                    TensorView weights, std::span<float> hidden, std::span<float> normalized,
+                    const auto& normalize) {
+    batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
+        if (!e.wants_logits(i))
+            return;
+        normalize(row(hidden, normalized.size(), index), normalized);
+        e.record("final_norm", TraceEvent::model_level, i, normalized);
+        backend.project(weights, normalized, workspace.logits, 1, workspace.packed);
+        e.publish_logits(i, workspace.logits);
+    });
 }
 
 } // namespace nathr::detail

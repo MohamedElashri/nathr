@@ -93,12 +93,15 @@ std::size_t integer(const Json& value, std::string_view key, std::size_t fallbac
 struct BatchOutput {
     std::optional<Tokenizer> tokenizer;
     std::size_t output_tokens = 0;
+    const BatchScheduler* live_stats = nullptr;
 
     void publish(const BatchEvent& event) {
         Json value = {{"id", event.id},
                       {"emitted", event.emitted},
                       {"elapsed_ms", event.elapsed_ms},
                       {"prompt_tokens", event.prompt_tokens}};
+        if (event.cached_prompt_tokens)
+            value["cached_prompt_tokens"] = event.cached_prompt_tokens;
         if (event.text)
             value["text"] = *event.text;
         if (event.kind == BatchEventKind::token) {
@@ -109,6 +112,12 @@ struct BatchOutput {
                 value["inter_token_ms"] = *event.inter_token_ms;
         } else {
             value["event"] = "done";
+            if (live_stats) {
+                value["queue_ms"] = event.queue_ms;
+                value["kv"] = {{"peak_bytes", live_stats->peak_kv_bytes()},
+                               {"resident_bytes", live_stats->resident_kv_bytes()}};
+                value["queue_bypasses"] = live_stats->queue_bypasses();
+            }
             switch (event.kind) {
             case BatchEventKind::eos:
                 value["reason"] = "eos";
@@ -256,6 +265,8 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
     if (model.supports_generation())
         scheduler.emplace(model, options);
     BatchOutput output;
+    if (io.ready && scheduler)
+        output.live_stats = &*scheduler;
     BatchInput input;
     const auto defaults = request_defaults(path, model, true);
     if (io.ready) {
@@ -292,7 +303,8 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
                       {"output_tokens_s", seconds > 0 ? output.output_tokens / seconds : 0.0},
                       {"peak_kv_bytes", scheduler ? scheduler->peak_kv_bytes() : 0},
                       {"resident_kv_bytes", scheduler ? scheduler->resident_kv_bytes() : 0},
-                      {"kv_page_reuses", scheduler ? scheduler->kv_page_reuses() : 0}});
+                      {"kv_page_reuses", scheduler ? scheduler->kv_page_reuses() : 0},
+                      {"queue_bypasses", scheduler ? scheduler->queue_bypasses() : 0}});
     }
 }
 } // namespace nathr::cli

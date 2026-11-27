@@ -151,7 +151,7 @@ void Llama::execute_batch(Workspace& scratch, const EvaluationBatch& batch) cons
             Scalar::rope(q, k, frequency, e.start + i);
             e.record("q_after_rope", layer, i, q);
             e.record("key_after_rope", layer, i, k);
-            if (e.cache)
+            if (e.cache && !e.replay_cached)
                 Scalar::store(*e.cache, layer, e.start + i, k, v);
         });
         batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t offset) {
@@ -190,14 +190,8 @@ void Llama::execute_batch(Workspace& scratch, const EvaluationBatch& batch) cons
             e.record("layer_output", layer, i, activation);
         });
     }
-    batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
-        if (!e.wants_logits(i))
-            return;
-        const auto final_norm = w.norm.first(h);
-        Scalar::rms_norm(norm, row(hidden, h, index), final_norm, config.rms_epsilon);
-        e.record("final_norm", TraceEvent::model_level, i, final_norm);
-        linear(output, final_norm, w.logits, 1);
-        e.publish_logits(i, w.logits);
+    project_logits(w, batch, backend, output, hidden, norms.first(h), [&](auto input, auto result) {
+        Scalar::rms_norm(norm, input, result, config.rms_epsilon);
     });
 }
 

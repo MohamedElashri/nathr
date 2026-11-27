@@ -61,8 +61,8 @@ nathr help serve
 | `infer MODEL PROMPT --output NAME` | Return a named tensor as JSON. Accepts plain text from `--stdin` or raw IDs from `--tokens IDS`. |
 | `tokenize MODEL PROMPT` | Return token IDs. Use `--tokens IDS` to decode or `--stdin` to read one JSON string per line. |
 | `batch MODEL` | Run JSONL generation and tensor requests with one loaded checkpoint. |
-| `serve [MODEL]` | Start the OpenAI-compatible API on loopback. |
-| `bench MODEL` | Measure decoder-only prefill and decode. |
+| `serve [MODEL]` | Serve one or more models through the local OpenAI-compatible API. |
+| `bench MODEL` or `bench --serve` | Measure a decoder or benchmark a running server. |
 | `encode MODEL PROMPT` | Return BERT hidden states as JSON rows. |
 | `forward MODEL --tokens IDS` | Inspect decoder-only logits and intermediate activations. |
 
@@ -140,6 +140,17 @@ nathr bench "$model" --prompt-length 16 --decode-length 4 --warmups 1 --repetiti
 
 The JSON report includes prefill and decode throughput, inter-token timings, and KV memory.
 
+### Benchmark a running server
+
+Start `nathr serve` in another terminal, then run a concurrent streaming workload.
+
+```sh
+nathr bench --serve --workload mixed --concurrency 4 --requests 16
+nathr bench --serve --workload shared-prefix --prompt-length 512 --warmups 1 --seed 43
+```
+
+The workloads send synthetic token IDs. The report includes time to first token, approximate inter-token percentiles, queue time, throughput, and the worker's peak KV bytes since startup. Mixed workloads also report latency separately for short and long requests. Start fresh servers with the same seed to compare settings. Use `--no-prefix-cache` for a cache-disabled trial or `--max-queue-bypasses 2` to test admission under a tight KV budget.
+
 ## OpenAI-compatible API
 
 Start the local server with the default `smollm2` model.
@@ -176,7 +187,7 @@ print(reply.choices[0].message.content)
 
 | Endpoint | Use |
 | --- | --- |
-| `GET /health` | Worker status and request counts |
+| `GET /health` | Worker status, request counts, and KV memory |
 | `GET /model` | Checkpoint capabilities, output shapes, and request limits |
 | `GET /v1/models`, `GET /v1/models/{id}` | List and retrieve model IDs for OpenAI-compatible clients |
 | `POST /infer` | A batch-style request without an ID, for generation or a named tensor |
@@ -185,7 +196,13 @@ print(reply.choices[0].message.content)
 | `POST /v1/responses` | Generate from text or message history in the current source build |
 | `POST /v1/embeddings` | Embed text or token arrays with a checkpoint that exposes `sentence_embedding` |
 
-Set `stream=true` for incremental output. Responses requests are stateless and text-only. Send conversation history in `input` for each turn on a chat checkpoint. For embeddings, start `nathr serve minilm` and use the model ID `minilm`. Embedding requests accept up to 16 inputs. Each server loads one checkpoint. See `nathr serve --help` for ports and limits.
+Set `stream=true` for incremental output. Responses requests are stateless and text-only. Send conversation history in `input` for each turn on a chat checkpoint.
+
+```sh
+nathr serve smollm2 --also minilm
+```
+
+Use `smollm2` for generation and `minilm` for embedding up to 16 inputs per request. Repeat `--also` to load more checkpoints. The first model handles requests without a model ID. Each model has its own worker and KV budget. Use `/model?model=minilm` or `/health?model=minilm` to inspect one worker.
 
 ## Build from source
 

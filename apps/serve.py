@@ -3,6 +3,7 @@
 import argparse
 import base64
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -16,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote, urlsplit
 from uuid import uuid4
 
 
@@ -64,7 +65,10 @@ def prompt_input(value):
 
 def completion_usage(event):
     prompt, generated = event["prompt_tokens"], event["emitted"]
-    return {"prompt_tokens": prompt, "completion_tokens": generated, "total_tokens": prompt + generated}
+    usage = {"prompt_tokens": prompt, "completion_tokens": generated, "total_tokens": prompt + generated}
+    if cached := event.get("cached_prompt_tokens"):
+        usage["prompt_tokens_details"] = {"cached_tokens": cached}
+    return usage
 
 
 def response_message(value):
@@ -81,6 +85,17 @@ def response_message(value):
     if not isinstance(content, str):
         raise RequestError("message content must be text")
     return {"role": "system" if role == "developer" else role, "content": content}
+
+
+def model_card(model_id):
+    return {"id": model_id, "object": "model", "owned_by": "nathr", "created": 0}
+
+
+def checked_event(event):
+    if event["event"] == "error" or event.get("reason") == "error":
+        status = 429 if event.get("code") == "resource_limit" else 400
+        raise RequestError(event.get("message", "inference failed"), status)
+    return event
 
 
 @dataclass
@@ -102,7 +117,10 @@ class Worker:
         self.pending = {}
         self.next_id = 0
         self.cancelled = 0
+        self.queue_bypasses = 0
+        self.kv = {"peak_bytes": 0, "resident_bytes": 0}
         self.metadata = None
+        self.outputs = set()
         self.error = None
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
         # Buffered reads keep the pipe efficient and cap each worker message.
@@ -187,10 +205,12 @@ class Worker:
             while line := self.stdout.readline(cap + 1):
                 if len(line) > cap or not line.endswith(b"\n"):
                     raise RuntimeError("worker response exceeds its frame limit")
-                event = read_json(line)
+                event = json.loads(line)
                 with self.changed:
                     if event["event"] == "ready":
+                        del event["event"]
                         self.metadata = event
+                        self.outputs = {item["name"] for item in event["outputs"]}
                         self.changed.notify_all()
                         continue
                     request = self.pending.get(event.get("id"))
@@ -198,6 +218,9 @@ class Worker:
                         continue
                     terminal = event["event"] in {"done", "error", "result"}
                     if terminal:
+                        if "kv" in event:
+                            self.kv = event["kv"]
+                            self.queue_bypasses = event["queue_bypasses"]
                         del self.pending[request.id]
                         self.cancelled += event.get("reason") == "cancelled"
                     if request.cancelled:
@@ -250,13 +273,15 @@ class Worker:
                 status="unavailable" if self.error else "ok",
                 pending_requests=len(self.pending),
                 cancelled_requests=self.cancelled,
+                queue_bypasses=self.queue_bypasses,
+                kv=self.kv,
             )
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, worker, options):
+    def __init__(self, workers, options):
         directory = Path(__file__).with_name("nathr-web")
         self.assets = {route: ((directory / name).read_bytes(), content_type) for route, name, content_type in (
             ("/", "index.html", "text/html; charset=utf-8"),
@@ -264,12 +289,24 @@ class Server(ThreadingHTTPServer):
             ("/app.js", "app.js", "text/javascript; charset=utf-8"),
         )}
         super().__init__(("127.0.0.1", options.port), Handler)
-        self.worker = worker
+        self.workers = workers
+        self.default_model = next(iter(workers))
         self.options = options
-        self.model = {"id": options.model_id, "object": "model", "owned_by": "nathr", "created": 0}
-        self.capabilities = {key: value for key, value in worker.metadata.items() if key != "event"}
-        self.outputs = {item["name"] for item in self.capabilities["outputs"]}
         self.slots = threading.BoundedSemaphore(options.max_clients)
+
+    def worker_for(self, model_id):
+        if not isinstance(model_id, str) or model_id not in self.workers:
+            raise RequestError("model is not loaded", 404)
+        return self.workers[model_id]
+
+    def health(self, model_id):
+        if model_id is not None or len(self.workers) == 1:
+            selected = self.default_model if model_id is None else model_id
+            return self.worker_for(selected).health()
+        models = {name: worker.health() for name, worker in self.workers.items()}
+        healthy = sum(snapshot["status"] == "ok" for snapshot in models.values())
+        status = "unavailable" if not healthy else "ok" if healthy == len(models) else "degraded"
+        return {"status": status, "models": models}
 
     def process_request(self, request, client_address):
         if self.slots.acquire(blocking=False):
@@ -302,6 +339,7 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(self.server.options.io_timeout)
         self.started_stream = False
         self.response_sequence = None
+        self.next_peer_check = 0
 
     def log_message(self, *args):
         pass
@@ -315,6 +353,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def reply(self, value, status=200):
         self.send_body(json_bytes(value), "application/json", status)
+
+    def check_response_size(self, size):
+        if size > self.server.options.max_buffer_bytes:
+            raise RequestError("response buffer limit reached", 429)
+
+    def inference_body(self, body):
+        self.check_response_size(len(body))
+        self.send_body(body, "application/json")
+
+    def inference_reply(self, value):
+        self.inference_body(json_bytes(value))
 
     def send_body(self, body, content_type, status=200, ui=False):
         self.close_connection = True
@@ -336,7 +385,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.response_sequence is not None:
                 self.response_event("error", message=str(error), code=str(error.status), param=None, **response)
             elif self.started_stream:
-                self.sse(response)
+                self.sse(response, enforce_limit=False)
                 self.sse("[DONE]")
             else:
                 self.reply(response, error.status)
@@ -346,25 +395,37 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         try:
             self.check_host()
-            if self.path in self.server.assets:
-                self.send_body(*self.server.assets[self.path], ui=True)
-            elif self.path == "/health":
-                health = self.server.worker.health()
+            target = urlsplit(self.path)
+            path = target.path
+            query = parse_qs(target.query, keep_blank_values=True)
+            models = query.get("model", [])
+            if len(models) > 1:
+                raise RequestError("select one model")
+            model_id = models[0] if models else None
+            if path in self.server.assets:
+                self.send_body(*self.server.assets[path], ui=True)
+            elif path == "/health":
+                health = self.server.health(model_id)
                 self.reply(health, 503 if health["status"] == "unavailable" else 200)
-            elif self.path == "/v1/models":
-                self.reply({"object": "list", "data": [self.server.model]})
-            elif (self.path.startswith("/v1/models/") and
-                  unquote(self.path.removeprefix("/v1/models/")) == self.server.model["id"]):
-                self.reply(self.server.model)
-            elif self.path == "/model":
+            elif path == "/v1/models":
+                self.reply({"object": "list", "data": [model_card(name) for name in self.server.workers]})
+            elif path.startswith("/v1/models/"):
+                name = unquote(path.removeprefix("/v1/models/"))
+                self.server.worker_for(name)
+                self.reply(model_card(name))
+            elif path == "/model":
+                name = self.server.default_model if model_id is None else model_id
+                worker = self.server.worker_for(name)
                 options = self.server.options
                 limits = {name: getattr(options, name) for name in
                           ("max_body_bytes", "max_output_tokens", "max_result_values", "max_buffer_bytes")}
-                self.reply(dict(self.server.capabilities, id=options.model_id, limits=limits))
+                self.reply(dict(worker.metadata, id=name, limits=limits))
             else:
                 raise RequestError("endpoint not found", 404)
         except RequestError as error:
             self.send_error_response(error)
+        except ValueError:
+            self.send_error_response(RequestError("invalid request path"))
         except OSError:
             self.close_connection = True
 
@@ -401,8 +462,10 @@ class Handler(BaseHTTPRequestHandler):
         return value
 
     def normalize(self, value, kind):
-        options, metadata = self.server.options, self.server.capabilities
+        options, metadata = self.server.options, self.worker.metadata
         stream = value.pop("stream", False)
+        if kind != "infer" and stream is None:
+            stream = False
         if not isinstance(stream, bool):
             raise RequestError("stream must be a boolean")
         include_usage = False
@@ -410,8 +473,8 @@ class Handler(BaseHTTPRequestHandler):
             allowed = {"max_tokens", "temperature", "top_p", "stop", "seed", "n", "stream_options", "user"}
             check_fields(value, allowed | ({"messages", "max_completion_tokens"} if kind == "chat" else {"prompt"}))
             value.pop("user", None)
-            count = value.pop("n", 1)
-            if type(count) is not int or count != 1:
+            count = value.pop("n", None)
+            if count is not None and (type(count) is not int or count != 1):
                 raise RequestError("only one completion per request is supported")
             stream_options = value.pop("stream_options", None)
             if stream_options is not None:
@@ -430,11 +493,13 @@ class Handler(BaseHTTPRequestHandler):
                 value.update(prompt_input(value.pop("prompt", None)))
                 if "tokens" in value:
                     value["decode"] = True
-            if "max_tokens" in value and "max_completion_tokens" in value:
+            max_tokens = value.pop("max_tokens", None)
+            max_completion = value.pop("max_completion_tokens", None)
+            if max_tokens is not None and max_completion is not None:
                 raise RequestError("choose max_tokens or max_completion_tokens")
-            for name in ("max_tokens", "max_completion_tokens"):
-                if name in value:
-                    value["max_new_tokens"] = value.pop(name)
+            maximum = max_tokens if max_tokens is not None else max_completion
+            if maximum is not None:
+                value["max_new_tokens"] = maximum
             if (temperature := value.get("temperature")) is not None:
                 if type(temperature) not in (float, int) or not math.isfinite(temperature) or not 0 <= temperature <= 2:
                     raise RequestError("temperature must be between 0 and 2")
@@ -450,7 +515,7 @@ class Handler(BaseHTTPRequestHandler):
         if tensor:
             if stream:
                 raise RequestError("named tensors are returned as JSON")
-            if not isinstance(value["output"], str) or value["output"] not in self.server.outputs:
+            if not isinstance(value["output"], str) or value["output"] not in self.worker.outputs:
                 raise RequestError("checkpoint does not expose the requested output")
         else:
             if not metadata["generation"]:
@@ -463,7 +528,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def response_input(self, value):
         check_fields(value, {"input", "instructions", "max_output_tokens", "temperature", "top_p", "stream", "store"})
-        if value.get("store", False) is not False:
+        store = value.get("store")
+        if store is not None and store is not False:
             raise RequestError("Responses are stateless. Use store=false")
         text = value.get("input")
         instructions = value.get("instructions")
@@ -478,7 +544,7 @@ class Handler(BaseHTTPRequestHandler):
         payload = {key: value[key] for key in ("temperature", "top_p", "stream") if key in value}
         if value.get("max_output_tokens") is not None:
             payload["max_tokens"] = value["max_output_tokens"]
-        if self.server.capabilities["chat"]:
+        if self.worker.metadata["chat"]:
             if instructions is not None:
                 if messages[0]["role"] == "system":
                     raise RequestError("pass instructions or a system message")
@@ -494,13 +560,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ConnectionError("client disconnected")
 
     def waiting(self, request, deadline):
-        while (remaining := deadline - time.monotonic()) > 0:
-            self.check_peer()
-            if result := self.server.worker.take(request, min(remaining, 0.1)):
-                if result["event"] == "error" or result.get("reason") == "error":
-                    status = 429 if result.get("code") == "resource_limit" else 400
-                    raise RequestError(result.get("message", "inference failed"), status)
-                return result
+        while (now := time.monotonic()) < deadline:
+            if now >= self.next_peer_check:
+                self.check_peer()
+                self.next_peer_check = now + 0.1
+            if result := self.worker.take(request, min(deadline, self.next_peer_check) - now):
+                return checked_event(result)
         raise RequestError("inference deadline exceeded", 504)
 
     def open_stream(self):
@@ -512,14 +577,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.started_stream = True
 
-    def sse(self, value, name=None):
+    def sse(self, value, name=None, *, enforce_limit=True):
         data = b"[DONE]" if value == "[DONE]" else json_bytes(value)
+        if enforce_limit:
+            self.check_response_size(len(data))
         event = b"" if name is None else b"event: " + name.encode("ascii") + b"\n"
         self.wfile.write(event + b"data: " + data + b"\n\n")
         self.wfile.flush()
 
     def response_event(self, kind, **fields):
-        self.sse(dict(fields, type=kind, sequence_number=self.response_sequence), kind)
+        self.sse(dict(fields, type=kind, sequence_number=self.response_sequence), kind,
+                 enforce_limit=kind != "error")
         self.response_sequence += 1
 
     def generation_events(self, event, request, deadline):
@@ -535,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
         part = {"type": "output_text", "text": "", "annotations": [], "logprobs": []}
         position = {"item_id": item["id"], "output_index": 0, "content_index": 0}
         response = {"id": f"resp_{identifier}", "object": "response", "created_at": int(time.time()),
-                    "model": self.server.model["id"], "status": "in_progress", "output": [], "usage": None,
+                    "model": self.model_id, "status": "in_progress", "output": [], "usage": None,
                     "error": None, "incomplete_details": None, "store": False, "parallel_tool_calls": False,
                     "tool_choice": "none", "tools": [], "text": {"format": {"type": "text"}},
                     "instructions": value.get("instructions"), "max_output_tokens": value.get("max_output_tokens"),
@@ -551,8 +619,7 @@ class Handler(BaseHTTPRequestHandler):
         for event in self.generation_events(first, request, deadline):
             if piece := event.get("text"):
                 collected += len(json_bytes(piece)) - 2
-                if collected > self.server.options.max_buffer_bytes:
-                    raise RequestError("response buffer limit reached", 429)
+                self.check_response_size(collected)
                 text.append(piece)
                 if stream:
                     self.response_event("response.output_text.delta", **position, delta=piece, logprobs=[])
@@ -562,7 +629,8 @@ class Handler(BaseHTTPRequestHandler):
         input_tokens, output_tokens = event["prompt_tokens"], event["emitted"]
         item.update(status=status, content=[part])
         response.update(status=status, output=[item], usage={
-            "input_tokens": input_tokens, "input_tokens_details": {"cached_tokens": 0},
+            "input_tokens": input_tokens,
+            "input_tokens_details": {"cached_tokens": event.get("cached_prompt_tokens", 0)},
             "output_tokens": output_tokens, "output_tokens_details": {"reasoning_tokens": 0},
             "total_tokens": input_tokens + output_tokens,
         })
@@ -576,12 +644,11 @@ class Handler(BaseHTTPRequestHandler):
             self.response_event("response.output_item.done", output_index=0, item=item)
             self.response_event(f"response.{status}", response=response)
         else:
-            self.reply(response)
+            self.inference_reply(response)
 
     def generation(self, first, request, deadline, kind, stream, include_usage):
         prefix = "chatcmpl" if kind == "chat" else "cmpl"
-        identity = {"id": f"{prefix}-{request.id}", "created": int(time.time()),
-                    "model": self.server.options.model_id}
+        identity = {"id": f"{prefix}-{uuid4().hex}", "created": int(time.time()), "model": self.model_id}
         object_type = "chat.completion.chunk" if kind == "chat" and stream else (
             "chat.completion" if kind == "chat" else "text_completion")
 
@@ -611,14 +678,13 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     self.sse(event)
             else:
-                collected += len(json_bytes(piece)) - 2
+                if piece:
+                    text.append(piece)
+                    collected += len(json_bytes(piece)) - 2
                 if kind == "infer" and "token_id" in event:
                     token_ids.append(event["token_id"])
                     collected += len(str(event["token_id"])) + 1
-                if collected > self.server.options.max_buffer_bytes:
-                    raise RequestError("response buffer limit reached", 429)
-                if piece:
-                    text.append(piece)
+                self.check_response_size(collected)
         if stream:
             if include_usage:
                 self.sse(envelope([], usage=completion_usage(event)))
@@ -626,24 +692,24 @@ class Handler(BaseHTTPRequestHandler):
         else:
             result = "".join(text)
             if kind == "infer":
-                self.reply(dict(event, generated_ids=token_ids, text=result))
+                self.inference_reply(dict(event, generated_ids=token_ids, text=result))
                 return
             choice = {"index": 0, "finish_reason": reason}
             if kind == "chat":
                 choice["message"] = {"role": "assistant", "content": result}
             else:
                 choice.update(text=result, logprobs=None)
-            self.reply(envelope([choice], usage=completion_usage(event)))
+            self.inference_reply(envelope([choice], usage=completion_usage(event)))
 
     def embeddings(self, value, deadline):
         check_fields(value, {"input", "encoding_format", "dimensions", "user"})
         output_name = "sentence_embedding"
-        if output_name not in self.server.outputs:
+        if output_name not in self.worker.outputs:
             raise RequestError("checkpoint does not expose sentence_embedding")
         encoding = value.get("encoding_format", "float")
         if encoding not in ("float", "base64"):
             raise RequestError("encoding_format must be float or base64")
-        output = next(item for item in self.server.capabilities["outputs"] if item["name"] == output_name)
+        output = next(item for item in self.worker.metadata["outputs"] if item["name"] == output_name)
         dimensions = value.get("dimensions", output["width"])
         if type(dimensions) is not int or dimensions != output["width"]:
             raise RequestError(f"checkpoint has fixed embedding width {output['width']}")
@@ -655,8 +721,9 @@ class Handler(BaseHTTPRequestHandler):
                   (all(isinstance(item, str) for item in inputs) or all(token_input(item) for item in inputs))):
             raise RequestError("expected text, tokens, or a batch of up to 16 inputs of the same type")
         payloads = [dict(prompt_input(item), output=output_name) for item in inputs]
-        data, prompt_tokens, collected = [], 0, 0
-        worker = self.server.worker
+        data = bytearray(b'{"object":"list","model":' + json_bytes(self.model_id) + b',"data":[')
+        prompt_tokens = 0
+        worker = self.worker
         for index, payload in enumerate(payloads):
             self.check_peer()
             if time.monotonic() >= deadline:
@@ -669,14 +736,14 @@ class Handler(BaseHTTPRequestHandler):
             vector = result["values"]
             if encoding == "base64":
                 vector = base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
-            entry = {"object": "embedding", "index": index, "embedding": vector}
-            collected += len(json_bytes(entry)) + 1
-            if collected > self.server.options.max_buffer_bytes:
-                raise RequestError("response buffer limit reached", 429)
-            data.append(entry)
+            entry = json_bytes({"object": "embedding", "index": index, "embedding": vector})
+            self.check_response_size(len(data) + bool(index) + len(entry))
+            if index:
+                data.extend(b",")
+            data.extend(entry)
             prompt_tokens += result["prompt_tokens"]
-        self.reply({"object": "list", "model": self.server.model["id"], "data": data,
-                    "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}})
+        data.extend(b'],"usage":' + json_bytes({"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}) + b"}")
+        self.inference_body(data)
 
     def do_POST(self):
         request = None
@@ -689,18 +756,18 @@ class Handler(BaseHTTPRequestHandler):
             if kind is None:
                 raise RequestError("endpoint not found", 404)
             value = self.body()
-            if value.pop("model", self.server.model["id"]) != self.server.model["id"]:
-                raise RequestError("model is not loaded", 404)
+            self.model_id = value.pop("model", self.server.default_model)
+            self.worker = self.server.worker_for(self.model_id)
             deadline = time.monotonic() + self.server.options.request_timeout
             if kind == "embeddings":
                 self.embeddings(value, deadline)
                 return
             payload, input_kind = self.response_input(value) if kind == "responses" else (value, kind)
             stream, tensor, include_usage = self.normalize(payload, input_kind)
-            request = self.server.worker.submit(payload)
+            request = self.worker.submit(payload)
             first = self.waiting(request, deadline)
             if tensor:
-                self.reply(first)
+                self.inference_reply(first)
             elif kind == "responses":
                 self.response_generation(first, request, deadline, stream, value)
             else:
@@ -717,7 +784,7 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             self.close_connection = True
             if request is not None:
-                self.server.worker.cancel(request)
+                self.worker.cancel(request)
 
 
 def bounded(low, high):
@@ -738,8 +805,7 @@ def terminal_input(worker, value, timeout):
             event = worker.take(request, remaining)
             if event is None:
                 break
-            if event["event"] == "error" or event.get("reason") == "error":
-                raise RequestError(event.get("message", "inference failed"))
+            event = checked_event(event)
             if event["event"] == "result":
                 print(json_bytes({key: item for key, item in event.items() if key not in ("event", "id")}).decode(),
                       flush=True)
@@ -823,6 +889,10 @@ def run_terminal(worker, options):
 
 def main(executable, directory, mode, args):
     sys.path.insert(0, directory)
+    if mode == "bench-serve":
+        from bench_serve import benchmark
+        benchmark(args)
+        return
     from model_store import ModelStore, command as model_command
 
     if mode in ("models", "pull"):
@@ -844,6 +914,9 @@ def main(executable, directory, mode, args):
         parser.add_argument("--no-open", action="store_true", help=argparse.SUPPRESS)
         parser.add_argument("--max-new-tokens", type=bounded(0, 8192), help="limit generated tokens per turn")
         parser.add_argument("--output", help="return a named tensor as JSON")
+    else:
+        parser.add_argument("--also", action="append", default=[], metavar="MODEL",
+                            help="load an additional checkpoint under its usual ID; repeat to load more")
     parser.add_argument("--model-id", help=argparse.SUPPRESS if run else "API model ID, otherwise the checkpoint name")
     parser.add_argument("--port", type=bounded(0, 65535), default=0 if run else 8000,
                         help=argparse.SUPPRESS if run else "HTTP port, or 0 for an available port")
@@ -858,8 +931,11 @@ def main(executable, directory, mode, args):
     scheduler.add_argument("--step-tokens", type=bounded(1, 128), default=32, help="total tokens per scheduler step")
     scheduler.add_argument("--max-queued", type=bounded(1, 256), default=16, help="queued generation requests")
     scheduler.add_argument("--max-queued-tokens", type=bounded(1, 262144), default=16384, help="queued prompt tokens")
+    scheduler.add_argument("--max-queue-bypasses", type=bounded(0, 256), default=0,
+                           help="fitting requests that may pass a KV-blocked queue head")
     scheduler.add_argument("--kv-budget-mib", type=bounded(1, 4096), default=512, help="KV cache budget in MiB")
     scheduler.add_argument("--kv-cache", choices=("f32", "f16"), default="f32", help="KV cache precision")
+    scheduler.add_argument("--no-prefix-cache", action="store_true", help="disable sharing of computed decoder KV pages")
 
     limits = parser.add_argument_group("request limits" if run else "HTTP limits")
     limits.add_argument("--max-clients", type=bounded(1, 128), default=16,
@@ -869,7 +945,7 @@ def main(executable, directory, mode, args):
     limits.add_argument("--max-output-tokens", type=bounded(1, 8192), default=256, help="generated tokens per request")
     limits.add_argument("--max-result-values", type=bounded(1, 131072), default=65536, help="values per named tensor")
     limits.add_argument("--max-buffer-bytes", type=bounded(128, 8388608), default=2097152,
-                        help="buffer size per response in bytes")
+                        help="response buffer and streaming event limit in bytes")
     limits.add_argument("--io-timeout", type=bounded(1, 60), default=5,
                         help=argparse.SUPPRESS if run else "socket I/O timeout in seconds")
     limits.add_argument("--request-timeout", type=bounded(1, 600), default=120, help="inference timeout in seconds")
@@ -883,25 +959,42 @@ def main(executable, directory, mode, args):
             parser.error("terminal options cannot be used with --no-open")
     if options.max_active > options.step_tokens:
         parser.error("--step-tokens must cover all active slots")
-    model_path, model_id = ModelStore(options.models_dir).resolve(options.model or options.model_path)
+    store = ModelStore(options.models_dir)
+    model_path, model_id = store.resolve(options.model or options.model_path)
     options.model_id = options.model_id or model_id
-    command = [executable, "batch", "--model", str(model_path), "--ready"]
+    checkpoints = {options.model_id: model_path}
+    for name in getattr(options, "also", []):
+        path, model_id = store.resolve(name)
+        if model_id in checkpoints:
+            parser.error(f"duplicate model ID: {model_id}")
+        checkpoints[model_id] = path
+    worker_args = []
     for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens", "max_queued",
-                 "max_queued_tokens", "kv_budget_mib", "kv_cache", "tokenizer", "max_result_values"):
+                 "max_queued_tokens", "max_queue_bypasses", "kv_budget_mib", "kv_cache", "max_result_values"):
         if (value := getattr(options, name)) is not None:
-            command.extend(("--" + name.replace("_", "-"), str(value)))
-    worker = Worker(command, options)
-    try:
-        worker.start()
+            worker_args.extend(("--" + name.replace("_", "-"), str(value)))
+    if options.no_prefix_cache:
+        worker_args.append("--no-prefix-cache")
+    with ExitStack() as cleanup:
+        workers = {}
+        for model_id, path in checkpoints.items():
+            command = [executable, "batch", "--model", str(path), "--ready", *worker_args]
+            if options.tokenizer and model_id == options.model_id:
+                command.extend(("--tokenizer", options.tokenizer))
+            worker = Worker(command, options)
+            cleanup.callback(worker.close)
+            try:
+                worker.start()
+            except (RequestError, RuntimeError) as error:
+                raise RequestError(f"{model_id}: {error}") from error
+            workers[model_id] = worker
         if run and (not options.no_open or options.prompt is not None):
-            run_terminal(worker, options)
+            run_terminal(workers[options.model_id], options)
             return
-        with Server(worker, options) as server:
+        with Server(workers, options) as server:
             url = f"http://127.0.0.1:{server.server_address[1]}"
             print(f"Listening on {url}", flush=True)
             server.serve_forever()
-    finally:
-        worker.close()
 
 
 if __name__ == "__main__":

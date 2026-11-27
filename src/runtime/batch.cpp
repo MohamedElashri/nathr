@@ -3,9 +3,11 @@
 #include "models/model.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <iterator>
 #include <list>
+#include <map>
 
 namespace nathr {
 namespace {
@@ -17,6 +19,69 @@ double milliseconds(Clock::duration duration) {
     return std::chrono::duration<double, std::milli>(duration).count();
 }
 
+// A page is identified by its parent prefix and the exact tokens on the page.
+class PrefixCache {
+    using Key = std::pair<std::size_t, std::array<Token, Cache::page_tokens>>;
+
+  public:
+    struct Entry {
+        Key key;
+        Cache::Page page;
+        Entry* parent;
+        std::size_t id;
+        std::size_t children = 0;
+    };
+
+    Entry* find(Entry* parent, std::span<const Token> tokens) {
+        const auto it = index_.find(key(parent, tokens));
+        if (it == index_.end())
+            return nullptr;
+        pages_.splice(pages_.end(), pages_, it->second);
+        return &*it->second;
+    }
+
+    Entry* remember(Entry* parent, std::span<const Token> tokens, const Cache::Page& page) {
+        auto [it, inserted] = index_.try_emplace(key(parent, tokens), pages_.end());
+        if (!inserted) {
+            pages_.splice(pages_.end(), pages_, it->second);
+            return &*it->second;
+        }
+        try {
+            pages_.push_back({it->first, page, parent, ++next_id_});
+        } catch (...) {
+            index_.erase(it);
+            throw;
+        }
+        it->second = std::prev(pages_.end());
+        if (parent)
+            ++parent->children;
+        return &pages_.back();
+    }
+
+    bool reclaim() {
+        const auto it = std::ranges::find_if(
+            pages_, [](const Entry& entry) { return !entry.children && entry.page.use_count() == 1; });
+        if (it == pages_.end())
+            return false;
+        if (it->parent)
+            --it->parent->children;
+        index_.erase(it->key);
+        pages_.erase(it);
+        return true;
+    }
+
+  private:
+    static Key key(const Entry* parent, std::span<const Token> tokens) {
+        Key result{parent ? parent->id : 0, {}};
+        std::ranges::copy(tokens.first(Cache::page_tokens), result.second.begin());
+        return result;
+    }
+
+    std::list<Entry> pages_;
+    std::map<Key, std::list<Entry>::iterator> index_;
+    std::size_t next_id_ = 0;
+};
+
 struct Request {
     Request(BatchRequest&& input, std::size_t capacity, std::size_t reservation)
         : input(std::move(input)), capacity(capacity), reservation(reservation) {
@@ -27,6 +92,7 @@ struct Request {
     BatchRequest input;
     std::size_t capacity, reservation;
     Clock::time_point arrival = Clock::now();
+    std::optional<Clock::time_point> admitted;
     std::optional<Clock::time_point> last_token;
     std::optional<Cache> cache;
     std::optional<T5Session> seq2seq;
@@ -36,10 +102,21 @@ struct Request {
     std::mt19937_64 rng{input.seed};
     std::vector<float> logits;
     std::size_t emitted = 0, position = 0;
+    PrefixCache::Entry* prefix = nullptr;
+    std::size_t cached_prompt_tokens = 0, bypasses = 0;
 
-    BatchEvent event(BatchEventKind kind) const {
-        return {input.id,           kind, {}, emitted, milliseconds(Clock::now() - arrival), {}, {}, {},
-                input.tokens.size()};
+    BatchEvent event(BatchEventKind kind, Clock::time_point now = Clock::now()) const {
+        return {input.id,
+                kind,
+                {},
+                emitted,
+                milliseconds(now - arrival),
+                {},
+                {},
+                {},
+                input.tokens.size(),
+                cached_prompt_tokens,
+                milliseconds(admitted.value_or(now) - arrival)};
     }
 };
 
@@ -48,7 +125,8 @@ using Requests = std::list<Request>;
 
 struct BatchScheduler::Impl {
     Impl(const Model& source, BatchOptions settings)
-        : model(source), options(settings), pool(settings.kv_budget_bytes) {
+        : model(source), options(settings),
+          pool(settings.kv_budget_bytes, [this] { return prefixes.reclaim(); }) {
         if (const auto* loaded = std::get_if<std::unique_ptr<detail::Decoder>>(&model.impl_->execution))
             decoder = loaded->get();
         if (!model.supports_generation())
@@ -75,34 +153,65 @@ struct BatchScheduler::Impl {
 
     void admit(std::vector<BatchEvent>& events) {
         while (!queued.empty() && active.size() < options.max_active) {
-            auto& request = queued.front();
-            if (request.reservation > options.kv_budget_bytes - reserved)
-                break;
+            const auto available = options.kv_budget_bytes - reserved;
+            auto candidate = queued.begin();
+            if (candidate->reservation > available) {
+                if (candidate->bypasses >= options.max_queue_bypasses)
+                    break;
+                candidate = std::find_if(std::next(candidate), queued.end(),
+                                         [=](const Request& item) { return item.reservation <= available; });
+                if (candidate == queued.end())
+                    break;
+            }
+            auto& request = *candidate;
+            request.admitted = Clock::now();
             try {
                 request.sampler.emplace(request.input.sampling, model.config().vocabulary);
                 if (!request.input.max_new_tokens) {
                     events.push_back(request.event(BatchEventKind::length));
                     queued_tokens -= request.input.tokens.size();
-                    queued.pop_front();
+                    queued.erase(candidate);
                     continue;
                 }
                 if (decoder) {
                     request.cache.emplace(model.config(), request.capacity, options.session.kv_precision,
                                           &pool);
                     request.logits.resize(model.config().vocabulary);
+                    if (options.prefix_cache)
+                        reuse_prefix(request);
                 }
             } catch (const Error& error) {
                 auto event = request.event(BatchEventKind::error);
                 event.message = error.what();
                 events.push_back(std::move(event));
                 queued_tokens -= request.input.tokens.size();
-                queued.pop_front();
+                queued.erase(candidate);
                 continue;
+            }
+            if (candidate != queued.begin()) {
+                ++queued.front().bypasses;
+                ++queue_bypasses;
             }
             reserved += request.reservation;
             queued_tokens -= request.input.tokens.size();
-            active.splice(active.end(), queued, queued.begin());
+            active.splice(active.end(), queued, candidate);
         }
+    }
+
+    void reuse_prefix(Request& request) {
+        const auto tokens = std::span(request.input.tokens);
+        while (tokens.size() - request.position >= Cache::page_tokens) {
+            auto* page = prefixes.find(request.prefix, tokens.subspan(request.position));
+            if (!page)
+                break;
+            request.cache->use_prefix_page(request.position / Cache::page_tokens, page->page);
+            request.prefix = page;
+            request.position += Cache::page_tokens;
+        }
+        request.cached_prompt_tokens = request.position;
+        // Replay the last token for its logits while reading the already complete page.
+        if (request.position == tokens.size())
+            --request.position;
     }
 
     bool emit_token(Request& request, std::vector<BatchEvent>& events) {
@@ -112,16 +221,10 @@ struct BatchScheduler::Impl {
         const bool eos = token == model.config().eos;
         const bool stop_id = std::ranges::find(request.input.stop_ids, token) != request.input.stop_ids.end();
         ++request.emitted;
-        BatchEvent event{request.input.id,
-                         BatchEventKind::token,
-                         token,
-                         request.emitted,
-                         milliseconds(now - request.arrival),
-                         {},
-                         {}};
+        auto event = request.event(BatchEventKind::token, now);
+        event.token = token;
         if (request.last_token)
             event.inter_token_ms = milliseconds(now - *request.last_token);
-        event.prompt_tokens = request.input.tokens.size();
         if (request.text)
             event.text = eos || stop_id ? std::string() : request.text->push(token);
         request.last_token = now;
@@ -141,7 +244,17 @@ struct BatchScheduler::Impl {
     }
 
     void finish(Requests::iterator request, const Evaluation& eval, std::vector<BatchEvent>& events) {
+        const auto previous_position = request->position;
         request->position += eval.tokens.size();
+        if (options.prefix_cache && !request->pending && !eval.replay_cached) {
+            const auto tokens = std::span(request->input.tokens);
+            const auto complete = request->position / Cache::page_tokens;
+            for (auto index = previous_position / Cache::page_tokens; index < complete; ++index) {
+                request->prefix = prefixes.remember(
+                    request->prefix, tokens.subspan(index * Cache::page_tokens), request->cache->page(index));
+                request->cache->use_prefix_page(index, request->prefix->page);
+            }
+        }
         if (eval.mode == LogitsMode::last_token && !emit_token(*request, events))
             remove_active(request);
     }
@@ -188,11 +301,12 @@ struct BatchScheduler::Impl {
     BatchOptions options;
     const detail::Decoder* decoder = nullptr;
     detail::CachePagePool pool;
+    PrefixCache prefixes;
     std::unique_ptr<detail::Workspace> scratch;
     Requests queued, active;
     std::vector<Evaluation> evaluations;
     std::vector<Requests::iterator> scheduled;
-    std::size_t reserved = 0, queued_tokens = 0;
+    std::size_t reserved = 0, queued_tokens = 0, queue_bypasses = 0;
 };
 
 BatchScheduler::BatchScheduler(const Model& model, BatchOptions options)
@@ -273,7 +387,8 @@ std::vector<BatchEvent> BatchScheduler::step() {
     const auto schedule = [&](Requests::iterator it, std::span<const Token> tokens, LogitsMode mode) {
         try {
             it->cache->ensure(it->position + tokens.size());
-            evaluations.push_back({tokens, it->position, &*it->cache, mode, sink, trace, it->logits});
+            evaluations.push_back({tokens, it->position, &*it->cache, mode, sink, trace, it->logits,
+                                   it->position < it->cached_prompt_tokens});
             requests.push_back(it);
         } catch (const Error& error) {
             s.fail(it, error, events);
@@ -303,22 +418,22 @@ std::vector<BatchEvent> BatchScheduler::step() {
     }
     if (evaluations.empty())
         return events;
+    bool retry_individually = false;
     try {
         s.decoder->execute_batch(*s.scratch, {evaluations});
     } catch (const Error&) {
         // Recompute the uncommitted rows individually to isolate a failing request.
-        for (std::size_t i = 0; i < evaluations.size(); ++i) {
-            try {
-                s.decoder->execute(*s.scratch, evaluations[i]);
-                s.finish(requests[i], evaluations[i], events);
-            } catch (const Error& error) {
-                s.fail(requests[i], error, events);
-            }
-        }
-        return events;
+        retry_individually = true;
     }
-    for (std::size_t i = 0; i < evaluations.size(); ++i)
-        s.finish(requests[i], evaluations[i], events);
+    for (std::size_t i = 0; i < evaluations.size(); ++i) {
+        try {
+            if (retry_individually)
+                s.decoder->execute(*s.scratch, evaluations[i]);
+            s.finish(requests[i], evaluations[i], events);
+        } catch (const Error& error) {
+            s.fail(requests[i], error, events);
+        }
+    }
     return events;
 }
 
@@ -339,5 +454,9 @@ std::size_t BatchScheduler::resident_kv_bytes() const noexcept {
 }
 std::size_t BatchScheduler::kv_page_reuses() const noexcept {
     return impl_->pool.reuses();
+}
+
+std::size_t BatchScheduler::queue_bypasses() const noexcept {
+    return impl_->queue_bypasses;
 }
 } // namespace nathr

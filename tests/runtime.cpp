@@ -412,6 +412,94 @@ void batch_scheduler() {
            "additional stop IDs finish a batch request at the sampled match");
 }
 
+void decoder_prefix_cache() {
+    const auto run = [](BatchScheduler& engine, const BatchRequest& input, std::size_t expected_hit) {
+        engine.submit(input);
+        std::vector<Token> tokens;
+        while (!engine.empty()) {
+            for (const auto& event : engine.step()) {
+                expect(event.kind != BatchEventKind::error, event.message);
+                expect(event.cached_prompt_tokens == expected_hit, "exact computed prefix length");
+                if (event.token)
+                    tokens.push_back(*event.token);
+            }
+        }
+        expect(!tokens.empty(), "cached decoder generates tokens");
+        return tokens;
+    };
+    const auto model = Model::load(fixture / "f32");
+    const auto gpt2 = Model::load(fixtures / "gpt2");
+    for (auto precision : {KvPrecision::f32, KvPrecision::f16}) {
+        BatchOptions options;
+        options.context = 64;
+        options.step_tokens = 8;
+        options.session = {precision, 7};
+        options.kv_budget_bytes = Cache::required_bytes(model.config(), 37, precision);
+        BatchScheduler scheduler(model, options);
+        BatchRequest request{1, std::vector<Token>(33, 4), 5, 19, {false, 0.8, 7, 0.95}};
+        const auto cold = run(scheduler, request, 0);
+        expect(run(scheduler, request, 32) == cold, "warm cache preserves seeded output");
+
+        options.prefix_cache = false;
+        BatchScheduler uncached(model, options);
+        request.tokens.back() = 7;
+        expect(run(scheduler, request, 32) == run(uncached, request, 0), "diverging suffix preserves output");
+        request.tokens.pop_back();
+        expect(run(scheduler, request, 32) == run(uncached, request, 0),
+               "page-aligned prompts obtain logits");
+
+        request.tokens.front() = 8;
+        expect(run(scheduler, request, 0) == run(uncached, request, 0),
+               "later pages depend on earlier tokens");
+        request.tokens.front() = 4;
+        expect(run(scheduler, request, 0) == run(uncached, request, 0),
+               "idle pages are evicted under pressure");
+        expect(scheduler.peak_kv_bytes() <= options.kv_budget_bytes &&
+                   scheduler.resident_kv_bytes() <= options.kv_budget_bytes,
+               "shared and idle pages stay within the KV budget");
+
+        options.context = gpt2.config().context;
+        options.kv_budget_bytes = Cache::required_bytes(gpt2.config(), options.context, precision);
+        options.prefix_cache = true;
+        BatchScheduler learned_positions(gpt2, options);
+        request.tokens.resize(Cache::page_tokens);
+        const auto gpt2_cold = run(learned_positions, request, 0);
+        expect(run(learned_positions, request, Cache::page_tokens) == gpt2_cold,
+               "GPT-2 replays a page-aligned prompt without changing generated tokens");
+    }
+}
+
+void queue_bypass() {
+    const auto model = Model::load(fixture / "f32");
+    for (const auto count : {0u, 1u}) {
+        BatchOptions options;
+        options.context = 32;
+        options.max_active = 2;
+        options.step_tokens = 4;
+        options.session.prefill_chunk = 3;
+        options.kv_budget_bytes = Cache::required_bytes(model.config(), 24, KvPrecision::f32);
+        options.max_queue_bypasses = count;
+        BatchScheduler scheduler(model, options);
+        scheduler.submit({1, std::vector<Token>(20, 4), 1, 0, {}});
+        expect(scheduler.step().empty(), "long request is prefilling");
+        scheduler.submit({2, std::vector<Token>(12, 7), 1, 0, {}});
+        scheduler.submit({3, {4}, 1, 0, {}});
+        scheduler.submit({4, {4}, 1, 0, {}});
+        std::vector<RequestId> finished;
+        while (!scheduler.empty()) {
+            for (const auto& event : scheduler.step()) {
+                expect(event.kind != BatchEventKind::error, event.message);
+                if (!event.token)
+                    finished.push_back(event.id);
+            }
+        }
+        const auto position = [&](RequestId id) { return std::ranges::find(finished, id); };
+        expect(finished.size() == 4 && (position(3) < position(1)) == (count == 1) &&
+                   position(4) > position(1) && scheduler.queue_bypasses() == count,
+               "only the configured number of short requests pass a blocked head");
+    }
+}
+
 void threaded_cache_and_chunks() {
     for (unsigned bits = 0; bits <= 0xffff; ++bits) {
         if ((bits & 0x7c00) != 0x7c00)
@@ -1168,6 +1256,8 @@ int main(int argc, char** argv) try {
         model_and_sessions();
         paged_cache();
         batch_scheduler();
+        decoder_prefix_cache();
+        queue_bypass();
         gpt2_and_sessions();
         encoder_models();
         checkpoint_outputs();
