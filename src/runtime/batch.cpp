@@ -255,8 +255,12 @@ struct BatchScheduler::Impl {
     }
 
     bool emit_token(Request& request, std::vector<BatchEvent>& events) {
-        const auto token = request.seq2seq ? request.seq2seq->sample(*request.sampler)
-                                           : request.sampler->select(request.logits, request.rng);
+        const auto [token, complete] =
+            request.input.constraint
+                ? request.input.constraint(*request.sampler, request.logits, request.rng)
+                : ConstrainedToken{request.seq2seq ? request.seq2seq->sample(*request.sampler)
+                                                   : request.sampler->select(request.logits, request.rng),
+                                   false};
         const auto now = Clock::now();
         const bool eos = token == model.config().eos;
         const bool stop_id = std::ranges::find(request.input.stop_ids, token) != request.input.stop_ids.end();
@@ -274,7 +278,7 @@ struct BatchScheduler::Impl {
             event.text = eos || stop_id ? std::string() : request.text->push(token);
         request.last_token = now;
         events.push_back(std::move(event));
-        const bool stop = stop_id || (request.text && request.text->stopped());
+        const bool stop = complete || stop_id || (request.text && request.text->stopped());
         if (eos || stop || request.emitted == request.input.max_new_tokens) {
             auto done = request.event(eos    ? BatchEventKind::eos
                                       : stop ? BatchEventKind::stop
@@ -379,6 +383,9 @@ void BatchScheduler::submit(BatchRequest request) {
         throw Error(ErrorCode::invalid_argument, "LoRA adapter belongs to a different base model");
     if (request.top_logprobs && *request.top_logprobs > max_top_logprobs)
         throw Error(ErrorCode::invalid_argument, "top logprobs must be between 0 and 20");
+    if (request.constraint && (!s.decoder || !request.tokenizer || !request.stop_strings.empty()))
+        throw Error(ErrorCode::invalid_argument,
+                    "structured output requires a decoder tokenizer and no stop strings");
     if (std::ranges::any_of(request.stop_ids, [&](Token id) { return id >= s.model.config().vocabulary; }))
         throw Error(ErrorCode::invalid_argument, "stop token ID exceeds model vocabulary");
     detail::validate_tokens(request.tokens, s.model.config(), s.options.context);

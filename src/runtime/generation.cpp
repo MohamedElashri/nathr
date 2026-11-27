@@ -20,31 +20,47 @@ Sampler::Sampler(SamplingOptions options, std::size_t vocabulary)
 }
 
 Token Sampler::select(std::span<const float> logits, std::mt19937_64& generator) {
+    return select_masked(logits, generator, {});
+}
+
+Token Sampler::select_masked(std::span<const float> logits, std::mt19937_64& generator,
+                             std::span<const std::uint8_t> mask) {
     constexpr auto invalid_logits = "sampler requires vocabulary-sized finite logits";
     if (logits.size() != vocabulary_)
         throw Error(ErrorCode::invalid_argument, invalid_logits);
+    if (!mask.empty() && mask.size() != vocabulary_)
+        throw Error(ErrorCode::invalid_argument, "sampling mask must match the vocabulary");
     if (options_.greedy) {
         Token best = 0;
+        bool found = mask.empty();
         for (Token i = 0; i < logits.size(); ++i) {
             if (!std::isfinite(logits[i]))
                 throw Error(ErrorCode::invalid_argument, invalid_logits);
-            if (logits[i] > logits[best])
+            if ((mask.empty() || mask[i]) && (!found || logits[i] > logits[best])) {
                 best = i;
+                found = true;
+            }
         }
+        if (!found)
+            throw Error(ErrorCode::unsupported, "no vocabulary token can extend the structured output");
         return best;
     }
+    std::size_t size = 0;
     for (Token i = 0; i < logits.size(); ++i) {
         if (!std::isfinite(logits[i]))
             throw Error(ErrorCode::invalid_argument, invalid_logits);
-        candidates_[i] = {i, logits[i]};
+        if (mask.empty() || mask[i])
+            candidates_[size++] = {i, logits[i]};
     }
-    auto allowed = std::span(candidates_);
+    if (!size)
+        throw Error(ErrorCode::unsupported, "no vocabulary token can extend the structured output");
+    auto allowed = std::span(candidates_).first(size);
     if (options_.top_k)
-        allowed = allowed.first(options_.top_k);
-    std::partial_sort(candidates_.begin(), candidates_.begin() + static_cast<std::ptrdiff_t>(allowed.size()),
-                      candidates_.end(), [](const auto& a, const auto& b) {
-                          return a.value == b.value ? a.id < b.id : a.value > b.value;
-                      });
+        allowed = allowed.first(std::min(options_.top_k, size));
+    std::partial_sort(
+        candidates_.begin(), candidates_.begin() + static_cast<std::ptrdiff_t>(allowed.size()),
+        candidates_.begin() + static_cast<std::ptrdiff_t>(size),
+        [](const auto& a, const auto& b) { return a.value == b.value ? a.id < b.id : a.value > b.value; });
     const auto maximum = allowed.front().value;
     double sum = 0.0;
     for (auto& candidate : allowed) {

@@ -100,6 +100,102 @@ def chat_fixture(target, source):
     (target / "generation_config.json").write_text(json.dumps(dict(eos_token_id=[0, 22], do_sample=False)))
 
 
+def structured_fixture(target, source):
+    target.mkdir()
+    chat_fixture(target, source)
+    tokenizer_path = target / "tokenizer.json"
+    tokenizer = json.loads(tokenizer_path.read_text())
+    vocabulary = tokenizer["model"]["vocab"]
+    original = len(vocabulary)
+    for symbol in [*(chr(code) for code in range(33, 127)), "Ã", "©"]:
+        vocabulary.setdefault(symbol, len(vocabulary))
+    tokenizer_path.write_text(json.dumps(tokenizer))
+    config_path = target / "config.json"
+    config_path.write_text(json.dumps(dict(json.loads(config_path.read_text()), vocab_size=len(vocabulary))))
+
+    model = target / "model.safetensors"
+    raw = model.read_bytes()
+    (size,) = struct.unpack("<Q", raw[:8])
+    metadata = json.loads(raw[8:8 + size])
+    payload = raw[8 + size:]
+    embedding = metadata["model.embed_tokens.weight"]
+    end = embedding["data_offsets"][1]
+    row_bytes = end // original
+    extra = bytes((len(vocabulary) - original) * row_bytes)
+    embedding["shape"][0] = len(vocabulary)
+    embedding["data_offsets"][1] += len(extra)
+    for tensor in metadata.values():
+        if "data_offsets" in tensor and tensor["data_offsets"][0] >= end:
+            tensor["data_offsets"] = [index + len(extra) for index in tensor["data_offsets"]]
+    header = json.dumps(metadata).encode()
+    header += b" " * (-len(header) % 8)
+    model.unlink()
+    model.write_bytes(struct.pack("<Q", len(header)) + header + payload[:end] + extra + payload[end:])
+
+
+def structured_checks(binary, checkpoint):
+    properties = {
+        "city": {"type": "string", "enum": ["Paris"]},
+        "nested": {
+            "type": "object", "properties": {"label": {"const": "é"}, "value": {"const": True}},
+            "required": ["label", "value"], "additionalProperties": False,
+        },
+    }
+    schema = {"type": "object", "properties": properties, "required": list(properties), "additionalProperties": False}
+    output = {"type": "json_schema", "json_schema": {"name": "place", "strict": True, "schema": schema}}
+    expected = {"city": "Paris", "nested": {"label": "é", "value": True}}
+    messages = [{"role": "user", "content": "b"}]
+    chat_path = "/v1/chat/completions"
+    response_path = "/v1/responses"
+    with server(binary, checkpoint) as port:
+        assert request(port, "/model")["structured_outputs"]
+        chat = {"messages": messages, "response_format": output, "temperature": 0, "max_tokens": 72}
+        result = request(port, chat_path, chat)["choices"][0]
+        assert result["finish_reason"] == "stop" and json.loads(result["message"]["content"]) == expected
+        sampled = request(port, chat_path, dict(chat, temperature=0.7, seed=6))["choices"][0]
+        assert sampled["finish_reason"] == "stop" and json.loads(sampled["message"]["content"]) == expected
+        events = request(port, chat_path, dict(chat, stream=True))
+        text = "".join(event["choices"][0]["delta"].get("content", "") for event in events)
+        assert json.loads(text) == expected and events[-1]["choices"][0]["finish_reason"] == "stop"
+        result = request(port, chat_path, dict(chat, max_tokens=1))["choices"][0]
+        assert result["finish_reason"] == "length" and result["message"]["content"] == "{"
+        result = request(port, chat_path, dict(chat, max_tokens=1, response_format={"type": "json_object"}))["choices"][0]
+        assert result["finish_reason"] == "length" and result["message"]["content"] == "{"
+        request(port, chat_path, dict(chat, stop=["}"]), 400)
+        bad = dict(schema, minProperties=1)
+        request(port, chat_path, dict(chat, response_format=dict(output, json_schema={"name": "bad", "schema": bad})), 400)
+
+        format = dict(output["json_schema"], type="json_schema")
+        arguments = {"input": "b", "text": {"format": format}, "max_output_tokens": 72, "temperature": 0}
+        response = request(port, response_path, arguments)
+        assert response["status"] == "completed" and response["text"] == arguments["text"]
+        assert json.loads(response["output"][0]["content"][0]["text"]) == expected
+        events = request(port, response_path, dict(arguments, stream=True, max_output_tokens=1))
+        assert events[-1]["type"] == "response.incomplete"
+        assert events[-1]["response"]["incomplete_details"] == {"reason": "max_output_tokens"}
+
+        function = {"name": "lookup_place", "parameters": schema, "strict": True}
+        tools = [{"type": "function", "function": function}]
+        tool_choice = {"type": "function", "function": {"name": function["name"]}}
+        call_input = {"messages": messages, "tools": tools, "tool_choice": tool_choice,
+                      "temperature": 0, "max_tokens": 72}
+        choice = request(port, chat_path, call_input)["choices"][0]
+        assistant = choice["message"]
+        (call,) = assistant["tool_calls"]
+        assert choice["finish_reason"] == "tool_calls" and assistant["content"] is None
+        assert call["function"]["name"] == function["name"] and json.loads(call["function"]["arguments"]) == expected
+        events = request(port, chat_path, dict(call_input, stream=True))
+        deltas = [event["choices"][0]["delta"]["tool_calls"][0]["function"].get("arguments", "")
+                  for event in events if "tool_calls" in event["choices"][0]["delta"]]
+        assert json.loads("".join(deltas)) == expected and events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+        result = request(port, chat_path, dict(call_input, max_tokens=1))["choices"][0]
+        assert result["finish_reason"] == "length" and "tool_calls" not in result["message"]
+        tool_result = {"role": "tool", "tool_call_id": call["id"], "content": "Paris is in France."}
+        assert request(port, chat_path, {"messages": [*messages, assistant, tool_result], "max_tokens": 1})["choices"]
+        request(port, chat_path, {"messages": [*messages, assistant, dict(tool_result, tool_call_id="wrong")]}, 400)
+        request(port, chat_path, dict(call_input, tool_choice="auto"), 400)
+
+
 def http_checks(binary, checkpoint, encoder):
     chat_path = "/v1/chat/completions"
     with server(binary, checkpoint, "--model-id", "test", "--context", "8192", "--max-body-bytes", "16384",
@@ -341,6 +437,9 @@ if __name__ == "__main__":
         checkpoint = Path(directory)
         chat_fixture(checkpoint, fixtures / "model/f32")
         http_checks(executable, checkpoint, fixtures / "bert")
+        structured = checkpoint / "structured"
+        structured_fixture(structured, fixtures / "model/f32")
+        structured_checks(executable, structured)
         stalled_consumer(executable, checkpoint)
         chat_stdin(executable, checkpoint)
         user_commands(executable, checkpoint, fixtures / "bert", checkpoint / "empty cache")

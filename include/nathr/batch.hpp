@@ -29,6 +29,7 @@ struct BatchRequest {
     std::vector<std::string> stop_strings{};
     std::optional<LoraAdapter> lora{};
     std::optional<std::size_t> top_logprobs{};
+    TokenConstraint constraint{};
 };
 
 enum class BatchEventKind { token, eos, stop, length, cancelled, error };

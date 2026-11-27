@@ -577,6 +577,10 @@ std::size_t Tokenizer::vocabulary() const noexcept {
     return impl_->subword ? impl_->subword->vocabulary() : impl_->raw.size();
 }
 
+bool Tokenizer::byte_level() const noexcept {
+    return !impl_->subword;
+}
+
 std::vector<Token> Tokenizer::encode(std::string_view text) const {
     if (impl_->subword)
         return impl_->subword->encode(text, {}).ids;

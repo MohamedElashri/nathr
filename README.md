@@ -231,6 +231,13 @@ nathr serve smollm2 --also minilm
 Use `smollm2` for generation and `minilm` for embedding up to 16 inputs per request. Repeat `--also` to load more checkpoints. The first model handles requests without a model ID. Each model has its own worker and KV budget. Use `/model?model=minilm` or `/health?model=minilm` to inspect one worker.
 
 Add `--lora-root ./adapters` to enable loading and unloading without restarting. `POST /v1/load_lora_adapter` accepts `{"lora_name":"tuned","lora_path":"my-adapter"}`, where the path resolves beneath that directory. `POST /v1/unload_lora_adapter` accepts `{"lora_name":"tuned"}` once the adapter's active and queued requests finish. The primary worker holds up to 16 adapters and 256 MiB of decoded adapter weights.
+### Structured outputs and function calls
+
+Use `response_format` with Chat Completions or `text.format` with Responses. Both accept `json_object` and `json_schema` on decoder-only checkpoints with a byte-level tokenizer. The inference worker masks tokens before sampling and stops when the object is complete.
+
+The schema subset supports object properties and required fields, array items, scalar types, and scalar `enum` and `const`. The root must be an object. Objects generate only declared properties, with up to 32 properties per object and eight nesting levels. Numbers use bounded plain decimal forms. A reply that exhausts its token budget is marked with `finish_reason="length"` or a Responses status of `incomplete`.
+
+On the supported SmolLM2 ChatML profile, Chat Completions also supports one named function call per turn. Supply `tools` and a named `tool_choice`. Use the returned `tool_calls` entry after a `tool_calls` finish, run the function in your application, then send the assistant message and a `tool` message with the matching `tool_call_id`. The function's parameters follow the same schema subset.
 
 ## Build from source
 
