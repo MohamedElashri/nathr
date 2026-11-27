@@ -257,7 +257,7 @@ curl -fsS http://127.0.0.1:8000/v1/rerank \
 
 Results include original document indices and sigmoid relevance scores in descending order.
 
-Add `--lora-root ./adapters` to enable loading and unloading without restarting. `POST /v1/load_lora_adapter` accepts `{"lora_name":"tuned","lora_path":"my-adapter"}`, where the path resolves beneath that directory. `POST /v1/unload_lora_adapter` accepts `{"lora_name":"tuned"}` once the adapter's active and queued requests finish. The primary worker holds up to 16 adapters and 256 MiB of decoded adapter weights. Keep the adapter files available so they can be reloaded after worker eviction.
+Add `--lora-root ./adapters` to enable loading and unloading without restarting. `POST /v1/load_lora_adapter` accepts `{"lora_name":"tuned","lora_path":"my-adapter"}`, where the path resolves beneath that directory. `POST /v1/unload_lora_adapter` accepts `{"lora_name":"tuned"}` once the adapter's active and queued requests finish. The primary worker holds up to 16 adapters and 256 MiB of decoded adapter weights. Keep adapter files available and unchanged so workers can reload them after eviction.
 
 ### Structured outputs and function calls
 

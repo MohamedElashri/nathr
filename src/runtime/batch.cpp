@@ -318,8 +318,6 @@ struct BatchScheduler::Impl {
             prefix_hits += !admission_pages.empty();
             cached_prompt_tokens += request.position;
         }
-        cached_prompt_tokens += request.position;
-        prefix_hits += request.position > 0;
         // Replay the last token for its logits while reading the already complete page.
         if (request.position == request.input.tokens.size())
             --request.position;

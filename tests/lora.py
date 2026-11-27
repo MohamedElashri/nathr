@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 
-from serve import chat_fixture, request, server
+from serve import chat_fixture, metric_value, request, server
 
 
 def read_tensors(path):
@@ -158,6 +158,32 @@ def check_server(checkpoint, adapter, merged, root):
         request(port, load, config)
         assert request(port, "/infer", dict(prefix, model="tuned")).get("cached_prompt_tokens", 0) == 0
 
+def check_eviction(checkpoint, encoder, adapter, root):
+    load, unload = "/v1/load_lora_adapter", "/v1/unload_lora_adapter"
+    with server(executable, checkpoint, "--model-id", "base", "--also", encoder,
+                "--memory-budget-mib", "350", "--kv-budget-mib", "1", "--lora-root", root,
+                "--lora", f"startup={adapter}") as port:
+        request(port, load, {"lora_name": "runtime", "lora_path": adapter.name})
+        request(port, unload, {"lora_name": "startup"})
+        prompt = dict(model="runtime", tokens=[1, 3, 4, 5, 6] * 5, max_new_tokens=3, top_logprobs=2)
+        before = request(port, "/infer", prompt)
+        assert request(port, "/infer", prompt)["cached_prompt_tokens"] >= 16
+        health = request(port, "/health?model=runtime")
+        assert health["model_memory"]["lora_bytes"] == 256 * 2**20
+        assert metric_value(request(port, "/metrics?model=runtime"), "prefix_cache_hits_total", "base") == 1
+        result = request(port, "/v1/embeddings", dict(model="bert", input=["The sky.", "The sky is blue."]))
+        assert [item["index"] for item in result["data"]] == [0, 1]
+        assert request(port, "/health?model=runtime")["status"] == "unloaded"
+        assert metric_value(request(port, "/metrics?model=runtime"), "worker_up", "base") == 0
+        assert request(port, "/v1/models/runtime")["parent"] == "base"
+        request(port, "/v1/models/startup", status=404)
+        after = request(port, "/infer", prompt)
+        assert after.get("cached_prompt_tokens", 0) == 0 and after["generated_ids"] == before["generated_ids"]
+        assert after["token_logprobs"] == before["token_logprobs"]
+        assert metric_value(request(port, "/metrics?model=runtime"), "worker_up", "base") == 1
+        request(port, unload, {"lora_name": "runtime"})
+        request(port, "/v1/models/runtime", status=404)
+
 
 def check_invalid(checkpoint, adapter, invalid):
     invalid.mkdir()
@@ -195,6 +221,7 @@ if __name__ == "__main__":
         check_parity(checkpoint, adapter, merged)
         check_batch(checkpoint, adapter, merged)
         check_server(checkpoint, adapter, merged, root)
+        check_eviction(checkpoint, fixtures / "bert", adapter, root)
         check_invalid(checkpoint, adapter, root / "invalid")
         gpt2 = fixtures / "gpt2"
         fixture(gpt2, (root / "gpt2-adapter", root / "gpt2-merged"), gpt2=True)

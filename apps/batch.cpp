@@ -120,7 +120,7 @@ class LoraRegistry {
         check_root(directory);
         for (const auto filename : {"adapter_config.json", "adapter_model.safetensors"})
             check_root(std::filesystem::canonical(directory / filename));
-        load(std::move(name), directory, directory);
+        load(std::move(name), directory);
     }
 
     void unload(const std::string& name, const BatchScheduler& scheduler) {
@@ -128,9 +128,9 @@ class LoraRegistry {
         const auto found = adapters_.find(name);
         if (found == adapters_.end())
             throw Error(ErrorCode::invalid_argument, "LoRA adapter is not loaded");
-        if (scheduler.uses_lora(found->second.adapter))
+        if (scheduler.uses_lora(found->second))
             throw Error(ErrorCode::resource_limit, "LoRA adapter is in use");
-        bytes_ -= found->second.adapter.memory_bytes();
+        bytes_ -= found->second.memory_bytes();
         adapters_.erase(found);
     }
 
@@ -141,7 +141,7 @@ class LoraRegistry {
         const auto found = adapters_.find(choice->get<std::string>());
         if (found == adapters_.end())
             throw Error(ErrorCode::invalid_argument, "LoRA adapter is not loaded");
-        return &found->second.adapter;
+        return &found->second;
     }
 
     [[nodiscard]] Json names() const {
@@ -151,20 +151,7 @@ class LoraRegistry {
         return names;
     }
 
-    [[nodiscard]] Json runtime_paths() const {
-        auto paths = Json::object();
-        for (const auto& [name, entry] : adapters_)
-            if (entry.runtime_path)
-                paths[name] = entry.runtime_path->string();
-        return paths;
-    }
-
   private:
-    struct Entry {
-        LoraAdapter adapter;
-        std::optional<std::filesystem::path> runtime_path;
-    };
-
     void require_root() const {
         if (root_.empty())
             throw Error(ErrorCode::unsupported, "loading or unloading adapters requires --lora-root");
@@ -176,8 +163,7 @@ class LoraRegistry {
             throw Error(ErrorCode::invalid_argument, "LoRA directory and files must be inside --lora-root");
     }
 
-    void load(std::string name, const std::filesystem::path& directory,
-              std::optional<std::filesystem::path> runtime_path = {}) {
+    void load(std::string name, const std::filesystem::path& directory) {
         if (name.empty() || name.size() > 128 || !std::ranges::all_of(name, [](char ch) {
                 return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
                        ch == '_' || ch == '-' || ch == '.';
@@ -189,13 +175,13 @@ class LoraRegistry {
             throw Error(ErrorCode::resource_limit, "LoRA adapter count limit reached");
         auto adapter = model_.load_lora(directory, lora_budget_bytes - bytes_);
         const auto size = adapter.memory_bytes();
-        adapters_.emplace(std::move(name), Entry{std::move(adapter), std::move(runtime_path)});
+        adapters_.emplace(std::move(name), std::move(adapter));
         bytes_ += size;
     }
 
     const Model& model_;
     const std::filesystem::path root_;
-    std::map<std::string, Entry, std::less<>> adapters_;
+    std::map<std::string, LoraAdapter, std::less<>> adapters_;
     std::size_t bytes_ = 0;
 };
 
@@ -407,10 +393,10 @@ void command(const Line& line, const Model& model, std::optional<BatchScheduler>
             } else {
                 lora.unload(unload_lora->get<std::string>(), *scheduler);
             }
-            write_output({{"event", "result"},
-                          {"id", *id},
-                          {"lora_adapters", lora.names()},
-                          {"lora_runtime_paths", lora.runtime_paths()}});
+            Json result = {{"event", "result"}, {"id", *id}, {"lora_adapters", lora.names()}};
+            if (load_lora != json.end())
+                result["lora_loaded"] = *load_lora;
+            write_output(result);
             return;
         }
         const auto* adapter = lora.get(json);

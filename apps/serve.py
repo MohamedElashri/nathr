@@ -352,13 +352,15 @@ class Worker:
                         self.outputs = {item["name"] for item in event["outputs"]}
                         self.changed.notify_all()
                         continue
+                    size = len(line)
                     if event["event"] == "result" and "lora_adapters" in event:
-                        runtime_paths = event.pop("lora_runtime_paths")
-                        self.lora_adapters = {
-                            name: (runtime_paths[name], True) if name in runtime_paths
-                            else (self.static_adapters[name], False)
-                            for name in event["lora_adapters"]
-                        }
+                        names = event.pop("lora_adapters")
+                        loaded = event.pop("lora_loaded", None)
+                        adapters = dict(self.lora_adapters)
+                        if loaded is not None:
+                            adapters[loaded["name"]] = (loaded["path"], True)
+                        self.lora_adapters = {name: adapters[name] for name in names}
+                        size = len(json_bytes(event))
                     if event["event"] == "metrics":
                         if self.metrics is not None:
                             self.metrics.scheduler = event["values"]
@@ -378,12 +380,12 @@ class Worker:
                         self.cancelled += event.get("reason") == "cancelled"
                     if request.cancelled:
                         continue
-                    if request.buffered + len(line) > self.limits.max_buffer_bytes or len(request.events) == 256:
+                    if request.buffered + size > self.limits.max_buffer_bytes or len(request.events) == 256:
                         request.error = RequestError("response buffer limit reached", 429)
                         self.cancel_locked(request)
                     else:
-                        request.events.append((event, len(line)))
-                        request.buffered += len(line)
+                        request.events.append((event, size))
+                        request.buffered += size
                     self.changed.notify_all()
             self.fail("model worker exited")
         except (OSError, ValueError, KeyError, RuntimeError) as error:
