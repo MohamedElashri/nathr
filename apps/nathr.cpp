@@ -638,9 +638,9 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         if (*messages == "-") {
             const auto input = read_stdin();
             prompt = cli::render_chat(detail::parse_json(std::as_bytes(std::span(input)), "<stdin>"),
-                                      defaults.chat_system);
+                                      defaults.chat);
         } else {
-            prompt = cli::render_chat(detail::read_json(*messages, detail::mib), defaults.chat_system);
+            prompt = cli::render_chat(detail::read_json(*messages, detail::mib), defaults.chat);
         }
     }
     std::optional<Tokenizer> tokenizer;
@@ -1017,19 +1017,25 @@ int main(int argc, char** argv) try {
         if (args.flag("--json") && summary)
             invalid("choose --summary or --json");
         args.finish();
-        auto info = std::filesystem::is_directory(path) ? model_info(Model::load(path, options))
-                                                        : gguf_info(path, options);
-        if (info.at("format") == "gguf") {
+        Json info;
+        if (std::filesystem::is_directory(path)) {
+            const auto model = Model::load(path, options);
+            info = model_info(model);
+            info["chat"] = cli::chat_format(path, model).has_value();
+        } else {
+            info = gguf_info(path, options);
             try {
-                cli::add_capabilities(info, Model::load(path, options));
+                const auto model = Model::load(path, options);
+                cli::add_capabilities(info, model);
+                info["chat"] = cli::chat_format(path, model).has_value();
             } catch (const Error& error) {
                 info["outputs"] = Json::array();
                 info["generation"] = false;
                 info["fused_decoder_batch"] = false;
+                info["chat"] = false;
                 info["load_error"] = error.what();
             }
         }
-        info["chat"] = info.value("generation", false) && cli::chat_system(path).has_value();
         if (summary)
             print_summary(path, info);
         else

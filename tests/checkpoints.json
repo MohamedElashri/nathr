@@ -33,6 +33,107 @@
       6792
     ]
   },
+  "qwen3": {
+    "path": "Qwen3-0.6B-Q8_0.gguf",
+    "prompt": "The capital of France is",
+    "ids": [
+      785,
+      6722,
+      315,
+      9625,
+      374
+    ],
+    "output": "logits",
+    "shape": [
+      5,
+      151936
+    ],
+    "probes": {
+      "607744": 5.1515326,
+      "607761": 5.2420106,
+      "607964": 13.4273701,
+      "619839": 17.2427979,
+      "615151": 14.2181149,
+      "759389": -1.8848047
+    },
+    "tolerance": 0.25,
+    "last_token_argmax": 12095,
+    "chat": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer in one word."
+        },
+        {
+          "role": "user",
+          "content": "What is the capital of Italy?"
+        },
+        {
+          "role": "assistant",
+          "content": "Rome"
+        },
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        }
+      ],
+      "prompt_ids": [
+        151644,
+        8948,
+        198,
+        16141,
+        304,
+        825,
+        3409,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        15344,
+        30,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        49,
+        635,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        9625,
+        30,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        151667,
+        271,
+        151668,
+        271
+      ],
+      "generated_ids": [
+        59604,
+        151645
+      ],
+      "text": "Paris"
+    }
+  },
   "safetensors": {
     "path": "SmolLM2-135M",
     "prompt": "Once upon a time",

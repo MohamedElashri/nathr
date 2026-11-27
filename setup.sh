@@ -118,7 +118,7 @@ example_command() {
 }
 for model in "${models[@]}"; do
     printf 'Checking inference with %s\n' "$model"
-    if [[ $selection == instruct || $selection == smollm2 ]]; then
+    if [[ $selection == instruct || $selection == smollm2 || $selection == qwen3 ]]; then
         printf '%s\n' '{"id":1,"messages":[{"role":"user","content":"What is the capital of France?"}],"max_new_tokens":8}' |
             "$bin" batch "$model" --backend auto |
             python3 -c 'import json, sys
@@ -133,7 +133,7 @@ done
 
 printf '\nReady. Run from the repository root:\n'
 for model in "${models[@]}"; do
-    if [[ $selection == instruct || $selection == smollm2 ]]; then
+    if [[ $selection == instruct || $selection == smollm2 || $selection == qwen3 ]]; then
         printf ' %q' "$bin" run "$model"
         printf '\n'
         continue

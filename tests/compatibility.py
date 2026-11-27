@@ -20,14 +20,17 @@ def require(condition, message):
 
 def verify_files(path, profile):
     manifest = json.loads((ROOT / "models/manifest.json").read_text())
-    if profile == "gguf":
-        source = next(item for item in manifest["sources"] if item["repository"].startswith("QuantFactory/"))
-        files = [item for item in source["files"] if item["filename"] == path.name]
-    else:
-        source = next(item for item in manifest["sources"] if item["repository"].split("/")[-1] == path.name)
-        files = source["files"]
+    checkpoint = next(item for item in manifest["checkpoints"]
+                      if profile in [item["name"], *item.get("aliases", [])])
+    source = next(item for item in manifest["sources"] if item["repository"] == checkpoint["repository"])
+    files = source["files"]
+    checkpoint_file = checkpoint.get("file")
+    if checkpoint_file:
+        require(path.name == checkpoint_file, f"{path}: expected checkpoint file {checkpoint_file}")
+        files = [item for item in files if item["filename"] == checkpoint_file]
+    require(files, f"{profile}: no files in manifest")
     for item in files:
-        filename = path if profile == "gguf" else path / item["filename"]
+        filename = path if checkpoint_file else path / item["filename"]
         sha = hashlib.sha256()
         with filename.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -66,6 +69,11 @@ def check(binary, path, case, backend):
         value = result["values"][int(offset)]
         require(math.isclose(value, expected, rel_tol=0, abs_tol=case["tolerance"]),
                 f"{case['output']}[{offset}]: {value} differs from {expected}")
+
+    if "last_token_argmax" in case:
+        last = result["values"][-result["shape"][-1]:]
+        require(max(range(len(last)), key=last.__getitem__) == case["last_token_argmax"],
+                "last-token greedy ID diverged")
 
     if "seeded_ids" in case:
         standalone = run(binary, "generate", path, "--tokens", csv(case["ids"]), "--max-new-tokens", "8",

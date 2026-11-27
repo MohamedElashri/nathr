@@ -943,7 +943,7 @@ def main(executable, directory, mode, args):
     limits.add_argument("--max-body-bytes", type=bounded(1, 262144), default=65536,
                         help=argparse.SUPPRESS if run else "request body size in bytes")
     limits.add_argument("--max-output-tokens", type=bounded(1, 8192), default=256, help="generated tokens per request")
-    limits.add_argument("--max-result-values", type=bounded(1, 131072), default=65536, help="values per named tensor")
+    limits.add_argument("--max-result-values", type=bounded(1, 262144), default=65536, help="values per named tensor")
     limits.add_argument("--max-buffer-bytes", type=bounded(128, 8388608), default=2097152,
                         help="response buffer and streaming event limit in bytes")
     limits.add_argument("--io-timeout", type=bounded(1, 60), default=5,

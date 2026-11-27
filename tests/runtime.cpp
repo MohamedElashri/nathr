@@ -986,6 +986,13 @@ void gguf_tokenizer_metadata() {
     expect(Tokenizer::load_model(model).encode("12🙂xy") == std::vector<Token>{0, 2, 1, 6},
            "digit isolation comes from tokenizer metadata");
     rejects([&] { (void)Tokenizer::load_model(model, sidecar); }, ErrorCode::malformed);
+    constexpr std::array qwen_types{1, 4, 1, 5, 1, 1, 1};
+    write_model("qwen2", qwen_types);
+    const auto qwen = Tokenizer::load_model(model);
+    expect(qwen.encode("12🙂xy") == std::vector<Token>{0, 2, 1, 6},
+           "Qwen isolates digits and matches user-defined literal tokens");
+    expect(qwen.decode(std::array<Token, 3>{0, 1, 3}, true) == "1🙂",
+           "Qwen retains user-defined tokens and skips unused entries");
     write_model("gpt-2", std::span(control_types).first(2));
     rejects([&] { (void)Tokenizer::load_model(model); }, ErrorCode::malformed);
     write_model("unrecognized", {});
@@ -994,11 +1001,32 @@ void gguf_tokenizer_metadata() {
            "matching sidecar supplies missing tokenizer behavior");
 }
 
+void qwen3_and_sessions() {
+    const auto model = Model::load(fixtures / "qwen3.gguf");
+    const auto& config = model.config();
+    expect(model.architecture() == "qwen3" && config.hidden == 8 && config.query_heads == 2 &&
+               config.kv_heads == 1 && config.head_dim == 8,
+           "Qwen3 query width is independent of the residual width");
+    // Last-token logits from a separate FP64 implementation of the fixture's block.
+    constexpr std::array reference{-0.37114424f, -0.49031260f, -0.91207813f, 0.83842275f,  0.00667866f,
+                                   0.47324808f,  -0.36197448f, 0.09055675f,  0.71851120f,  0.76297914f,
+                                   -1.37145985f, 0.12935372f,  -0.14064940f, -1.26965575f, -0.57705031f,
+                                   -0.62020144f, 0.08083565f,  0.36785062f,  -0.01250742f, 0.41548643f,
+                                   1.11443795f,  -1.83596955f, 0.48053733f};
+    std::vector<float> logits(config.vocabulary);
+    model.forward(ids, LogitsMode::last_token, logits);
+    compare(logits, reference, 0.00001);
+    auto session = Session::create(model, 64, 0, {KvPrecision::f32, 3});
+    session.prefill(std::span(ids).first(7));
+    session.append(std::span(ids).last(1));
+    compare(session.logits(), logits, 0);
+}
+
 void gguf_layout() {
     const auto golden = fixtures / "tiny.gguf";
     const Gguf metadata(golden);
     expect(metadata.alignment() == 32 && metadata.records().size() == 20 &&
-               load_llama_config(metadata).tied_embeddings,
+               load_gguf_decoder_config(metadata).tied_embeddings,
            "GGUF inventory");
     expect(metadata.memory().mapped_file_bytes == std::filesystem::file_size(golden),
            "GGUF mapping accounting");
@@ -1265,6 +1293,7 @@ int main(int argc, char** argv) try {
         tokenizer_and_sampling();
         gguf_tokenizer_metadata();
         gguf_layout();
+        qwen3_and_sessions();
         packed_kernels();
         packed_encodings();
     } else {

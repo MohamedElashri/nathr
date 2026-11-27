@@ -90,6 +90,7 @@ class Model {
     [[nodiscard]] const ModelConfig& config() const noexcept;
     [[nodiscard]] ModelMemory memory() const noexcept;
     [[nodiscard]] std::string_view architecture() const noexcept;
+    [[nodiscard]] std::string_view embedded_chat_template() const noexcept;
     [[nodiscard]] std::string_view backend() const noexcept;
     [[nodiscard]] unsigned threads() const noexcept;
     [[nodiscard]] std::string_view kernel(std::uint32_t encoding_id) const noexcept;

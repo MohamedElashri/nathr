@@ -32,17 +32,17 @@ class Reader {
 
     std::string text() { return std::string(text_view()); }
 
-    Json value(std::uint32_t type, bool keep) {
+    Json value(std::uint32_t type, bool keep, std::size_t array_limit = 65536) {
         if (type == 9) {
             const auto element = static_cast<std::uint32_t>(uint(4));
             const auto count = uint(8);
             if (element == 9 || element > 12)
                 fail("unsupported GGUF array element type");
-            if (count > 65536)
-                fail("GGUF array exceeds 65,536 elements");
+            if (count > array_limit)
+                fail("GGUF array exceeds element limit");
             Json array;
             if (keep) {
-                if (count > 262144 - kept_elements_)
+                if (count > 3 * max_vocabulary - kept_elements_)
                     fail("GGUF retained metadata exceeds aggregate element limit", ErrorCode::resource_limit);
                 kept_elements_ += count;
                 array = Json::array();
@@ -180,7 +180,9 @@ Gguf::Gguf(const std::filesystem::path& path) : path_(path), file_(path) {
             if (alignment_ < 8 || alignment_ > 4096 || !std::has_single_bit(alignment_))
                 reader.fail("invalid GGUF alignment");
         } else if (key.starts_with("tokenizer.")) {
-            tokenizer_[std::move(key)] = reader.value(type, true);
+            const bool vocabulary = key == "tokenizer.ggml.tokens" || key == "tokenizer.ggml.token_type" ||
+                                    key == "tokenizer.ggml.merges";
+            tokenizer_[std::move(key)] = reader.value(type, true, vocabulary ? max_vocabulary : 65536);
         } else if (key == "general.architecture") {
             architecture_[std::move(key)] = reader.value(type, true);
         } else if (key.starts_with("split.")) {

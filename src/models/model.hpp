@@ -10,7 +10,7 @@
 
 namespace nathr::detail {
 
-enum class Checkpoint { llama_safetensors, llama_gguf, gpt2_safetensors, bert_safetensors, t5_safetensors };
+enum class Checkpoint { llama_safetensors, decoder_gguf, gpt2_safetensors, bert_safetensors, t5_safetensors };
 void validate_tokens(std::span<const Token> tokens, const ModelConfig& config, std::size_t limit);
 void validate_mode(LogitsMode mode, const LogitsSink& sink);
 
@@ -27,5 +27,6 @@ struct nathr::Model::Impl {
     detail::CpuBackend backend;
     std::variant<std::unique_ptr<detail::Decoder>, std::unique_ptr<detail::Bert>, std::unique_ptr<detail::T5>>
         execution;
-    const std::string_view architecture;
+    std::string_view architecture;
+    std::string chat_template;
 };

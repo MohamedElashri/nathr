@@ -159,7 +159,7 @@ TokenizedInput input_tokens(const Json& json, BatchOutput& output, const Model& 
         return {token_array(*tokens, "tokens"),
                 types == json.end() ? std::vector<Token>{} : token_array(*types, "token_type_ids")};
     const auto text =
-        messages == json.end() ? prompt->get<std::string>() : render_chat(*messages, defaults.chat_system);
+        messages == json.end() ? prompt->get<std::string>() : render_chat(*messages, defaults.chat);
     if (pair != json.end())
         return output.tokenizer->encode_pair(text, pair->get<std::string>());
     return {output.tokenizer->encode(text), {}};
@@ -275,11 +275,10 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
         } catch (const Error&) {
             // Checkpoints with external tokenizers can still accept raw IDs.
         }
-        Json ready = {
-            {"event", "ready"},
-            {"text", output.tokenizer.has_value()},
-            {"chat", model.supports_generation() && defaults.chat_system.has_value() && output.tokenizer},
-            {"max_new_tokens", defaults.max_new_tokens}};
+        Json ready = {{"event", "ready"},
+                      {"text", output.tokenizer.has_value()},
+                      {"chat", model.supports_generation() && defaults.chat.has_value() && output.tokenizer},
+                      {"max_new_tokens", defaults.max_new_tokens}};
         add_capabilities(ready, model);
         if (scheduler)
             ready["generation_context"] = scheduler->context();
