@@ -128,6 +128,28 @@ nathr serve smollm2 --lora tuned=./adapter
 
 Select `tuned` as the model in API requests. Repeat `--lora NAME=DIR` to register more adapters for the primary model. To manage adapters at runtime, start the server with `--lora-root ./adapters`. For an adapter in `./adapters/my-adapter`, POST `{"lora_name":"tuned","lora_path":"my-adapter"}` to `/v1/load_lora_adapter`. POST `{"lora_name":"tuned"}` to `/v1/unload_lora_adapter` after its requests finish. Keep the files available for worker reloads. The primary worker holds up to 16 adapters and 256 MiB of decoded adapter weights.
 
+## Inference statistics
+
+```sh
+nathr run qwen3 "Explain integer square roots in Python." --threads 4 --stats
+```
+
+`run --stats` prints a summary to stderr after each reply. For JSON, use `generate --stats --json`, `batch --stats`, or `/infer` with `serve --stats`. Batch and HTTP streams include request stats in `done` events. Batch also reports aggregate throughput and KV memory.
+
+| Field | Meaning |
+| --- | --- |
+| `queue_ms` | Time waiting for admission to the native scheduler. |
+| `ttft_ms` | Time to first sampled token, including time queued by the native worker. |
+| `prefill_ms`, `prefill_tokens_s` | Time from admission to the first token and uncached prompt tokens per second over that interval. |
+| `tpot_ms`, `decode_tokens_s` | Mean time per output token and its reciprocal rate, measured from the first token to the last. |
+| `elapsed_ms`, `output_tokens_s` | Total request time and output tokens per second over the whole measured request. |
+
+Timers start after model loading and tokenization. Counts include sampled stop tokens. JSON uses `null` for unavailable timings and rates. When tuning `--threads`, `--prefill-chunk`, or `--kv-cache`, compare the same prompt, output limit, and cached-token count.
+
+`infer --stats` reports native tensor execution time in JSON. For named outputs, `run --stats` reports the worker round trip on stderr.
+
+`/metrics` exposes per-model latency histograms, token counters, and KV memory. In Prometheus, `rate(nathr_generated_tokens_total[1m])` gives output tokens per second. Mean TPOT uses the inter-token latency histogram's `_sum` and `_count` rates.
+
 ## Benchmark inference
 
 ```sh

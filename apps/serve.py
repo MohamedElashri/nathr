@@ -1392,7 +1392,23 @@ def bounded(low, high):
     return parse
 
 
-def terminal_input(worker, value, timeout):
+def print_generation_stats(event):
+    stats = event["stats"]
+    fields = [f"{stats['prompt_tokens']} prompt tokens ({stats['cached_prompt_tokens']} cached)",
+              f"{stats['output_tokens']} output tokens ({event['reason']})"]
+    for key, label, unit in (("ttft_ms", "TTFT", "ms"), ("tpot_ms", "TPOT", "ms/token"),
+                             ("prefill_tokens_s", "prefill", "tok/s"), ("decode_tokens_s", "decode", "tok/s"),
+                             ("output_tokens_s", "overall", "tok/s"), ("queue_ms", "queue", "ms"),
+                             ("elapsed_ms", "total", "ms")):
+        if stats[key] is not None:
+            fields.append(f"{label} {stats[key]:.2f} {unit}")
+    if kv := event.get("kv"):
+        fields.append(f"worker KV peak {kv['peak_bytes'] / 2**20:.2f} MiB")
+    print("nathr: " + " | ".join(fields), file=sys.stderr, flush=True)
+
+
+def terminal_input(worker, value, timeout, stats):
+    start = time.monotonic()
     request = worker.submit(value)
     deadline = time.monotonic() + timeout
     text = []
@@ -1403,14 +1419,20 @@ def terminal_input(worker, value, timeout):
                 break
             event = checked_event(event)
             if event["event"] == "result":
+                elapsed = (time.monotonic() - start) * 1000
                 print(json_bytes({key: item for key, item in event.items() if key not in ("event", "id")}).decode(),
                       flush=True)
+                if stats:
+                    print(f"nathr: {event['prompt_tokens']} prompt tokens | request {elapsed:.2f} ms",
+                          file=sys.stderr, flush=True)
                 return
             if piece := event.get("text"):
                 text.append(piece)
                 print(piece, end="", flush=True)
             if event["event"] == "done":
                 print(flush=True)
+                if stats:
+                    print_generation_stats(event)
                 return "".join(text)
         raise RequestError("inference deadline exceeded")
     except (RequestError, KeyboardInterrupt):
@@ -1454,7 +1476,7 @@ def run_terminal(worker, options):
             value["max_new_tokens"] = count
         if options.lora:
             value["lora"] = "nathr-lora"
-        reply = terminal_input(worker, value, options.request_timeout)
+        reply = terminal_input(worker, value, options.request_timeout, options.stats)
         if chat:
             history.extend((messages[-1], {"role": "assistant", "content": reply}))
 
@@ -1537,6 +1559,8 @@ def main(executable, directory, mode, invoked, version, args):
     parser.add_argument("--tokenizer", help="matching GGUF tokenizer sidecar")
     parser.add_argument("--chat-format", choices=("auto", "none", "chatml", "qwen3", "zephyr"), default="auto",
                         help="chat format for the primary checkpoint")
+    parser.add_argument("--stats", action="store_true",
+                        help="print inference stats to stderr" if run else "include request stats in /infer replies")
 
     scheduler = parser.add_argument_group("generation scheduler")
     scheduler.add_argument("--context", type=bounded(1, 65536), help="context, otherwise up to 8192 tokens")
@@ -1616,6 +1640,8 @@ def main(executable, directory, mode, invoked, version, args):
             worker_args.extend(("--" + name.replace("_", "-"), str(value)))
     if options.no_prefix_cache:
         worker_args.append("--no-prefix-cache")
+    if options.stats:
+        worker_args.append("--stats")
     if serving:
         worker_args.append("--metrics")
     with ExitStack() as cleanup:

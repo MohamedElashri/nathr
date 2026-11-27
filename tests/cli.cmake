@@ -94,6 +94,20 @@ assert_command(1 "duplicate option: --prompt" generate "${model}" ab --prompt ab
 assert_command(1 "exactly one of --prompt or --tokens" generate "${model}" ab --tokens 1,7,2)
 assert_command(1 "exactly one of --prompt or --tokens" generate "${model}" --greedy)
 assert_command(0 "\"generated_ids\"" generate "${model}" --tokens 1,7,2 --greedy --max-new-tokens 2 --json)
+assert_command(0 "\"stats\"" generate "${model}" --tokens 4,4,4,4 --greedy --max-new-tokens 3 --stats --json)
+string(JSON stats GET "${command_output}" stats)
+string(JSON prompt_tokens GET "${stats}" prompt_tokens)
+string(JSON output_tokens GET "${stats}" output_tokens)
+string(JSON ttft GET "${stats}" ttft_ms)
+string(JSON elapsed GET "${stats}" elapsed_ms)
+string(JSON tpot TYPE "${stats}" tpot_ms)
+if(NOT prompt_tokens EQUAL 4 OR NOT output_tokens EQUAL 3 OR NOT tpot STREQUAL "NUMBER" OR
+   NOT ttft GREATER 0 OR ttft GREATER elapsed)
+    message(FATAL_ERROR "Unexpected generation statistics\n${command_output}")
+endif()
+assert_command(0 "\"tpot_ms\":null" generate "${model}" --tokens 4 --max-new-tokens 1 --stats --json)
+assert_command(0 "\"ttft_ms\":null" generate "${model}" --tokens 4 --max-new-tokens 0 --stats --json)
+assert_command(0 "\"stats\"" infer "${NATHR_FIXTURES}/bert" hello --output hidden_states --stats)
 assert_command(0 "\"emitted\":1024" generate "${model}" --tokens 4,4,4,4 --greedy --json)
 assert_command(0 "\"emitted\":3" generate "${model}" --tokens 4,4,4,4 --context 6 --greedy --json)
 assert_command(1 "exceed context" generate "${model}" --tokens 4,4,4,4 --context 6 --max-new-tokens 4 --json)
@@ -127,7 +141,7 @@ if(NOT status EQUAL 0 OR NOT error STREQUAL "" OR NOT output MATCHES "\"event\":
    NOT output MATCHES "\"id\":9,\"prompt_tokens\":8,\"reason\":\"cancelled\"" OR
    NOT output MATCHES "\"event\":\"error\",\"id\":11" OR
    NOT output MATCHES "\"id\":12,\"prompt_tokens\":1,\"reason\":\"length\"" OR
-   NOT output MATCHES "\"output_tokens\":1")
+   NOT output MATCHES "\"output_tokens\":1" OR NOT output MATCHES "\"stats\":\\{")
     message(FATAL_ERROR "Unexpected batch CLI events\n${output}\n${error}")
 endif()
 file(WRITE "${batch_input}" [=[{"id":1,"prompt":"The sky?","text_pair":"The sky is blue.","output":"logits"}]=])

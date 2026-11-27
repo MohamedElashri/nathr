@@ -429,6 +429,10 @@ def user_commands(binary, checkpoint, encoder, directory):
     reply = subprocess.check_output([binary, "run", checkpoint, "bbbb", *limit], text=True, timeout=10)
     expected = subprocess.check_output(generate, input=json.dumps(messages), text=True, timeout=10)
     assert reply == expected
+    measured = subprocess.run([binary, "run", checkpoint, "bbbb", *limit, "--stats"], text=True,
+                              capture_output=True, check=True, timeout=10)
+    assert measured.stdout == expected
+    assert all(label in measured.stderr for label in ("TTFT", "TPOT", "decode", "overall", "worker KV peak"))
     terminal = [binary, "run", checkpoint, *limit, "--context", "36"]
     result = subprocess.run(terminal, input="bbbb\nbbbb\n", text=True, capture_output=True, timeout=10)
     assert result.returncode != 0 and "exceed context" in result.stderr and result.stdout == expected
@@ -475,6 +479,29 @@ def metrics_under_load(binary, checkpoint):
             until(lambda: metric_value(request(port, "/metrics"), "requests_active", "chat") == 1,
                   "metrics did not report active generation under load")
             request(port, "/infer", dict(tokens=[4], max_new_tokens=1), status=429)
+
+
+def inference_stats(binary, checkpoint):
+    with server(binary, checkpoint, "--stats", "--model-id", "chat") as port:
+        payload = dict(tokens=[4] * 33, max_new_tokens=4)
+        result = request(port, "/infer", payload)
+        assert result["stats"]["prompt_tokens"] == 33 and result["stats"]["cached_prompt_tokens"] == 0
+        events = request(port, "/infer", dict(payload, stream=True))
+        assert events[-1]["event"] == "done"
+        stats = events[-1]["stats"]
+        tokens = [event for event in events if event["event"] == "token"]
+        first, last = tokens[0]["elapsed_ms"], tokens[-1]["elapsed_ms"]
+        assert stats["output_tokens"] == len(tokens) == 4 and stats["cached_prompt_tokens"] == 32
+        assert 0 <= stats["queue_ms"] <= first == stats["ttft_ms"] <= stats["elapsed_ms"]
+        assert math.isclose(stats["decode_ms"], last - first)
+        assert math.isclose(stats["tpot_ms"], (last - first) / 3)
+        assert math.isclose(stats["decode_tokens_s"], 1000 / stats["tpot_ms"])
+        assert math.isclose(stats["output_tokens_s"], 4000 / stats["elapsed_ms"])
+        metrics = request(port, "/metrics")
+        assert metric_value(metrics, "prompt_tokens_total", "chat") == 66
+        assert metric_value(metrics, "generated_tokens_total", "chat") == 8
+        reply = request(port, "/v1/chat/completions", dict(messages=[dict(role="user", content="b")], max_tokens=1))
+        assert "stats" not in reply and "stats" not in reply["usage"]
 
 
 def multi_model_benchmark(binary, checkpoint, encoder):
@@ -690,5 +717,6 @@ if __name__ == "__main__":
         memory_budget(executable, checkpoint, fixtures / "bert", fixtures / "gpt2")
         cancelled_checkpoint_command(executable, checkpoint)
         metrics_under_load(executable, checkpoint)
+        inference_stats(executable, checkpoint)
         generation_limits(executable, checkpoint)
         checkpoint_defaults(executable, checkpoint)

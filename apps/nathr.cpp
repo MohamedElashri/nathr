@@ -6,6 +6,7 @@
 #include "batch.hpp"
 #include "core/input.hpp"
 #include "formats/gguf.hpp"
+#include "inference_stats.hpp"
 #include "requests.hpp"
 
 #include <algorithm>
@@ -14,6 +15,7 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <numeric>
@@ -24,6 +26,11 @@
 namespace {
 using namespace nathr;
 using nathr::detail::Json;
+using StatsClock = std::chrono::steady_clock;
+
+double elapsed_ms(StatsClock::time_point start) {
+    return std::chrono::duration<double, std::milli>(StatsClock::now() - start).count();
+}
 
 [[noreturn]] void invalid(const std::string& message) {
     throw Error(ErrorCode::invalid_argument, message);
@@ -343,6 +350,7 @@ void encode(Arguments& args, const std::filesystem::path& path, BackendOptions o
 
 void infer(Arguments& args, const std::filesystem::path& path, BackendOptions options) {
     const auto output = args.required("--output");
+    const bool stats = args.flag("--stats");
     auto prompt = args.option("--prompt");
     const auto stdin_prompt = args.flag("--stdin");
     const auto tokens = args.option("--tokens");
@@ -372,12 +380,14 @@ void infer(Arguments& args, const std::filesystem::path& path, BackendOptions op
             input.token_type_ids = parse_tokens(*types);
     }
     const auto prefix = decoder ? parse_tokens(*decoder) : std::vector<Token>{};
+    const auto start = StatsClock::now();
     auto result = model.infer({input.ids, input.token_type_ids, prefix}, output, lora ? &*lora : nullptr);
-    std::cout << Json({{"output", output},
-                       {"shape", std::move(result.shape)},
-                       {"values", std::move(result.values)}})
-                     .dump()
-              << '\n';
+    const auto elapsed = stats ? elapsed_ms(start) : 0.0;
+    Json reply = {
+        {"output", output}, {"shape", std::move(result.shape)}, {"values", std::move(result.values)}};
+    if (stats)
+        reply["stats"] = {{"prompt_tokens", input.ids.size()}, {"elapsed_ms", elapsed}};
+    std::cout << reply.dump() << '\n';
 }
 
 class TraceFile {
@@ -572,11 +582,12 @@ void tokenize(Arguments& args, const std::filesystem::path& path) {
 void emit_generation(auto& session, const Model& model, const SamplingOptions& sampling,
                      std::span<const Token> input, std::span<const Token> stop_ids, std::size_t max_tokens,
                      std::optional<GenerationText>& decoder, bool as_json, const Tokenizer* tokenizer,
-                     std::optional<std::size_t> top_logprobs) {
+                     std::optional<std::size_t> top_logprobs, std::optional<StatsClock::time_point> start) {
     Sampler sampler(sampling, model.config().vocabulary);
     std::vector<Token> emitted;
     auto scores = top_logprobs ? Json::array() : Json{};
     const bool json = as_json || !decoder;
+    std::optional<double> first, last;
     std::string text;
     if (json)
         emitted.reserve(max_tokens);
@@ -588,6 +599,11 @@ void emit_generation(auto& session, const Model& model, const SamplingOptions& s
     };
     const auto result = generate_until(
         session, sampler, model.config().eos, stop_ids, max_tokens, [&](Token token, bool stop_id) {
+            if (start) {
+                last = elapsed_ms(*start);
+                if (!first)
+                    first = last;
+            }
             if (json)
                 emitted.push_back(token);
             if (top_logprobs)
@@ -599,6 +615,13 @@ void emit_generation(auto& session, const Model& model, const SamplingOptions& s
         });
     if (decoder)
         append_text(decoder->finish());
+    const auto reason = result.stopped_at_eos || result.stopped_at_stop ? "stop" : "length";
+    Json stats;
+    if (start) {
+        stats = cli::inference_stats({input.size(), 0, result.emitted, elapsed_ms(*start), 0.0, first, last});
+        if constexpr (requires { session.memory(); })
+            stats["kv_cache_bytes"] = session.memory().cache_bytes;
+    }
     if (json) {
         Json output = {{model.architecture() == "t5" ? "source_ids" : "prompt_ids", input},
                        {"generated_ids", emitted},
@@ -606,15 +629,32 @@ void emit_generation(auto& session, const Model& model, const SamplingOptions& s
                        {"consumed", result.consumed},
                        {"stopped_at_eos", result.stopped_at_eos},
                        {"stopped_at_stop", result.stopped_at_stop},
-                       {"finish_reason", result.stopped_at_eos || result.stopped_at_stop ? "stop" : "length"},
+                       {"finish_reason", reason},
                        {"pending_id", result.pending ? Json(*result.pending) : Json(nullptr)}};
         if (decoder)
             output["text"] = text;
         if (top_logprobs)
             output["token_logprobs"] = std::move(scores);
+        if (start)
+            output["stats"] = std::move(stats);
         std::cout << output.dump() << '\n';
     } else {
         std::cout << '\n';
+        if (start) {
+            std::cerr << std::fixed << std::setprecision(2) << "nathr: " << input.size() << " prompt tokens, "
+                      << result.emitted << " output tokens (" << reason << ")";
+            const auto show = [&](const char* key, const char* label, const char* unit) {
+                if (stats.at(key).is_number())
+                    std::cerr << " | " << label << ' ' << stats.at(key).get<double>() << ' ' << unit;
+            };
+            show("ttft_ms", "TTFT", "ms");
+            show("tpot_ms", "TPOT", "ms/token");
+            show("prefill_tokens_s", "prefill", "tok/s");
+            show("decode_tokens_s", "decode", "tok/s");
+            show("output_tokens_s", "overall", "tok/s");
+            show("elapsed_ms", "total", "ms");
+            std::cerr << '\n';
+        }
     }
 }
 
@@ -637,6 +677,8 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         invalid("top logprobs must be between 0 and 20");
     const auto top_logprobs = logprobs ? std::optional(count) : std::nullopt;
     const bool as_json = args.flag("--json") || logprobs;
+    const bool stats = args.flag("--stats");
+    const auto start_timing = [stats] { return stats ? std::optional(StatsClock::now()) : std::nullopt; };
     const bool explicit_max = args.has("--max-new-tokens");
     auto max_tokens = number(args, "--max-new-tokens", defaults.max_new_tokens);
     const auto context = number(args, "--context", std::size_t{0});
@@ -697,9 +739,10 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         const auto capacity = context ? context : std::max<std::size_t>(1, max_tokens);
         if (max_tokens > capacity)
             invalid("T5 generation budget exceeds decoder context");
+        const auto start = start_timing();
         auto session = T5Session::create(model, ids, capacity, seed);
         emit_generation(session, model, sampling, ids, defaults.stop_ids, max_tokens, decoder, as_json,
-                        tokenizer ? &*tokenizer : nullptr, top_logprobs);
+                        tokenizer ? &*tokenizer : nullptr, top_logprobs, start);
         return;
     }
     const auto lora = adapter ? std::optional(model.load_lora(*adapter)) : std::nullopt;
@@ -710,9 +753,10 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
     if (ids.empty() || ids.size() > session.capacity() ||
         (max_tokens && max_tokens - 1 > session.capacity() - ids.size()))
         invalid("prompt and generation budget exceed context, or prompt is empty");
+    const auto start = start_timing();
     session.prefill(ids);
     emit_generation(session, model, sampling, ids, defaults.stop_ids, max_tokens, decoder, as_json,
-                    tokenizer ? &*tokenizer : nullptr, top_logprobs);
+                    tokenizer ? &*tokenizer : nullptr, top_logprobs, start);
 }
 
 void batch(Arguments& args, const std::filesystem::path& path, BackendOptions options) {
@@ -923,6 +967,7 @@ constexpr CommandHelp commands[] = {
      "  --lora DIR                    Apply a PEFT LoRA adapter.\n"
      "  --chat-format auto|none|chatml|qwen3|zephyr\n"
      "  --logprobs [--top-logprobs N] Include token log probabilities in JSON (0 to 20 alternatives).\n"
+     "  --stats                       Report inference latency and throughput.\n"
      "  --json                        Include token IDs and the finish reason.\n",
      true},
     {"infer", "Return a named tensor as JSON", "infer MODEL (PROMPT | --stdin | --tokens IDS) --output NAME",
@@ -932,6 +977,7 @@ constexpr CommandHelp commands[] = {
      "  --token-type-ids IDS           Supply BERT segment IDs with --tokens.\n"
      "  --decoder-tokens IDS          Supply a T5 prefix beginning with its decoder start ID.\n"
      "  --tokenizer FILE               Use a matching GGUF tokenizer sidecar.\n"
+     "  --stats                        Include inference timing in JSON.\n"
      "  --lora DIR                     Apply a PEFT LoRA adapter.\n",
      true},
     {"inspect", "Show checkpoint capabilities and outputs", "inspect MODEL",
@@ -959,7 +1005,7 @@ constexpr CommandHelp commands[] = {
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
      "  --lora NAME=DIR               Register a PEFT LoRA adapter. Repeat to register more.\n"
      "  --lora-root DIR               Enable runtime loading of adapters beneath this directory.\n"
-     "  --stats                       Emit timings and KV stats after the batch drains.\n"},
+     "  --stats                       Add request timings and print a summary after the batch drains.\n"},
     {"serve", "Start the local OpenAI-compatible API", "serve [MODEL]", ""},
     {"bench", "Measure decoder inference or HTTP serving", "bench MODEL | nathr bench --serve",
      "  --serve                       Benchmark a running server (see bench --serve --help).\n"

@@ -165,6 +165,7 @@ struct Request {
     std::uint64_t lora_key() const { return lora ? lora->cache_key() : 0; }
     Clock::time_point arrival = Clock::now();
     std::optional<Clock::time_point> admitted;
+    std::optional<Clock::time_point> first_token;
     std::optional<Clock::time_point> last_token;
     std::optional<Cache> cache;
     std::optional<T5::State> seq2seq;
@@ -181,20 +182,25 @@ struct Request {
     std::size_t draft_tokens = 0, accepted_draft_tokens = 0;
 
     BatchEvent event(BatchEventKind kind, Clock::time_point now = Clock::now()) const {
-        return {input.id,
-                kind,
-                {},
-                emitted,
-                milliseconds(now - arrival),
-                {},
-                {},
-                {},
-                input.tokens.size(),
-                cached_prompt_tokens,
-                milliseconds(admitted.value_or(now) - arrival),
-                {},
-                draft_tokens,
-                accepted_draft_tokens};
+        BatchEvent result{input.id,
+                          kind,
+                          {},
+                          emitted,
+                          milliseconds(now - arrival),
+                          {},
+                          {},
+                          {},
+                          input.tokens.size(),
+                          cached_prompt_tokens,
+                          milliseconds(admitted.value_or(now) - arrival),
+                          {},
+                          draft_tokens,
+                          accepted_draft_tokens};
+        if (kind != BatchEventKind::token && first_token && last_token) {
+            result.first_token_ms = milliseconds(*first_token - arrival);
+            result.last_token_ms = milliseconds(*last_token - arrival);
+        }
+        return result;
     }
 };
 
@@ -411,6 +417,8 @@ struct BatchScheduler::Impl {
         event.logprobs = std::move(scores);
         if (request.last_token)
             event.inter_token_ms = milliseconds(now - *request.last_token);
+        else
+            request.first_token = now;
         if (request.text)
             event.text = eos || stop_id ? std::string() : request.text->push(token);
         request.last_token = now;

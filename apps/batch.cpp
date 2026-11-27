@@ -2,6 +2,7 @@
 
 #include "backend/cpu/scalar.hpp"
 #include "core/input.hpp"
+#include "inference_stats.hpp"
 #include "models/t5/model.hpp"
 #include "requests.hpp"
 #include "structured.hpp"
@@ -191,6 +192,7 @@ struct BatchOutput {
     std::size_t output_tokens = 0;
     std::size_t draft_tokens = 0, accepted_draft_tokens = 0;
     const BatchScheduler* live_stats = nullptr;
+    bool request_stats = false;
 
     void publish(const BatchEvent& event) {
         Json value = {{"id", event.id},
@@ -212,6 +214,10 @@ struct BatchOutput {
                 value["inter_token_ms"] = *event.inter_token_ms;
         } else {
             value["event"] = "done";
+            if (request_stats)
+                value["stats"] = inference_stats({event.prompt_tokens, event.cached_prompt_tokens,
+                                                  event.emitted, event.elapsed_ms, event.queue_ms,
+                                                  event.first_token_ms, event.last_token_ms});
             if (event.draft_tokens) {
                 value["draft_tokens"] = event.draft_tokens;
                 value["accepted_draft_tokens"] = event.accepted_draft_tokens;
@@ -573,6 +579,7 @@ void run_batch(const Model& model, const std::filesystem::path& path, const std:
     if (model.supports_generation())
         scheduler.emplace(model, options);
     BatchOutput output;
+    output.request_stats = io.stats;
     if (io.ready && scheduler)
         output.live_stats = &*scheduler;
     BatchInput input;

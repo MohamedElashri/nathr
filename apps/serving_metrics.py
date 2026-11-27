@@ -18,6 +18,7 @@ GAUGES = {
 COUNTERS = {
     "requests_finished_total": "Native requests with a terminal event.",
     "requests_cancelled_total": "Requests cancelled before or during inference.",
+    "prompt_tokens_total": "Prompt tokens in completed generation requests, including cached tokens.",
     "generated_tokens_total": "Generation tokens emitted by the native worker.",
     "prefix_cache_lookups_total": "Generation requests eligible for prompt KV reuse.",
     "prefix_cache_hits_total": "Generation requests that reused a decoder prefix or a full T5 source.",
@@ -51,12 +52,15 @@ class ModelMetrics:
     def __init__(self):
         self.scheduler = {}
         self.finished = 0
+        self.prompt_tokens = 0
         self.generated = 0
         self.histograms = {name: Histogram() for name in HISTOGRAMS}
 
     def observe(self, event, duration=None):
         if duration is not None:
             self.finished += 1
+            if event["event"] == "done" and event["reason"] in {"eos", "stop", "length"}:
+                self.prompt_tokens += event["prompt_tokens"]
             self.histograms["request_duration_seconds"].observe(duration)
             if "queue_ms" in event:
                 self.histograms["request_queue_time_seconds"].observe(event["queue_ms"] / 1000)
@@ -70,7 +74,7 @@ class ModelMetrics:
     def snapshot(self, *, up, pending, cancelled):
         values = dict(self.scheduler, worker_up=int(up), requests_pending=pending,
                       requests_cancelled_total=cancelled, requests_finished_total=self.finished,
-                      generated_tokens_total=self.generated)
+                      prompt_tokens_total=self.prompt_tokens, generated_tokens_total=self.generated)
         if not up:
             for name in ("requests_active", "requests_queued", "queued_tokens", "kv_used_bytes", "kv_resident_bytes"):
                 values[name] = 0

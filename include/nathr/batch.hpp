@@ -50,6 +50,8 @@ struct BatchEvent {
     std::optional<TokenLogprobs> logprobs{};
     std::size_t draft_tokens{};
     std::size_t accepted_draft_tokens{};
+    // Terminal generation events carry both timestamps relative to submission.
+    std::optional<double> first_token_ms{}, last_token_ms{};
 };
 
 struct BatchMetrics {

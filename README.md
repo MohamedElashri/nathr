@@ -81,6 +81,8 @@ Run `nathr --help` for the command list and `nathr COMMAND --help` for that comm
 
 ### CLI examples
 
+Use `nathr run MODEL "Your prompt" --stats` to report latency, tokens per second, and peak KV memory. See [inference statistics](docs/usage.md#inference-statistics).
+
 Use a quantized checkpoint to inspect token IDs and generate a short continuation. `--json` includes the generated token IDs and finish reason.
 
 ```sh
