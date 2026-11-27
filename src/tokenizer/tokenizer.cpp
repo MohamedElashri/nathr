@@ -447,8 +447,8 @@ struct Tokenizer::Impl {
         }
         if (std::ranges::find(byte_tokens, missing) != byte_tokens.end())
             throw Error(ErrorCode::unsupported, "SentencePiece BPE requires 256 byte fallback tokens");
-        std::ranges::stable_sort(
-            added, [](const Added& a, const Added& b) { return a.text.size() > b.text.size(); });
+        std::ranges::sort(added,
+                          [](const Added& a, const Added& b) { return a.text.size() > b.text.size(); });
     }
 
     Token checked_id(const detail::Json& value) const {
