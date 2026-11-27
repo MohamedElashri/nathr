@@ -554,9 +554,11 @@ void tokenize(Arguments& args, const std::filesystem::path& path) {
 
 void emit_generation(auto& session, const Model& model, const SamplingOptions& sampling,
                      std::span<const Token> input, std::span<const Token> stop_ids, std::size_t max_tokens,
-                     std::optional<GenerationText>& decoder, bool as_json) {
+                     std::optional<GenerationText>& decoder, bool as_json, const Tokenizer* tokenizer,
+                     std::optional<std::size_t> top_logprobs) {
     Sampler sampler(sampling, model.config().vocabulary);
     std::vector<Token> emitted;
+    auto scores = top_logprobs ? Json::array() : Json{};
     const bool json = as_json || !decoder;
     std::string text;
     if (json)
@@ -567,14 +569,17 @@ void emit_generation(auto& session, const Model& model, const SamplingOptions& s
         else
             std::cout << piece << std::flush;
     };
-    const auto result = generate_until(session, sampler, model.config().eos, stop_ids, max_tokens,
-                                       [&](Token token, bool stop_id) {
-                                           if (json)
-                                               emitted.push_back(token);
-                                           if (decoder && !stop_id)
-                                               append_text(decoder->push(token));
-                                           return !decoder || !decoder->stopped();
-                                       });
+    const auto result = generate_until(
+        session, sampler, model.config().eos, stop_ids, max_tokens, [&](Token token, bool stop_id) {
+            if (json)
+                emitted.push_back(token);
+            if (top_logprobs)
+                scores.push_back(cli::logprobs_json(token_logprobs(session.logits(), token, *top_logprobs),
+                                                    tokenizer, emitted.size() == 1));
+            if (decoder && !stop_id)
+                append_text(decoder->push(token));
+            return !decoder || !decoder->stopped();
+        });
     if (decoder)
         append_text(decoder->finish());
     if (json) {
@@ -588,6 +593,8 @@ void emit_generation(auto& session, const Model& model, const SamplingOptions& s
                        {"pending_id", result.pending ? Json(*result.pending) : Json(nullptr)}};
         if (decoder)
             output["text"] = text;
+        if (top_logprobs)
+            output["token_logprobs"] = std::move(scores);
         std::cout << output.dump() << '\n';
     } else {
         std::cout << '\n';
@@ -606,7 +613,12 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         invalid("BERT uses the infer or encode command");
     auto defaults = cli::request_defaults(path, model, messages.has_value());
     const auto bos = args.flag("--bos");
-    const auto as_json = args.flag("--json");
+    const bool logprobs = args.flag("--logprobs") || args.has("--top-logprobs");
+    const auto count = number(args, "--top-logprobs", std::size_t{0});
+    if (count > max_top_logprobs)
+        invalid("top logprobs must be between 0 and 20");
+    const auto top_logprobs = logprobs ? std::optional(count) : std::nullopt;
+    const bool as_json = args.flag("--json") || logprobs;
     const auto max_tokens = number(args, "--max-new-tokens", defaults.max_new_tokens);
     const auto context = number(args, "--context", std::size_t{0});
     const auto seed = number(args, "--seed", std::uint64_t{0});
@@ -651,13 +663,14 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         ids.insert(ids.begin(), model.config().bos);
     std::optional<GenerationText> decoder;
     if (tokenizer)
-        decoder.emplace(std::move(*tokenizer), std::move(stops));
+        decoder.emplace(*tokenizer, std::move(stops));
     if (seq2seq) {
         const auto capacity = context ? context : std::max<std::size_t>(1, max_tokens);
         if (max_tokens > capacity)
             invalid("T5 generation budget exceeds decoder context");
         auto session = T5Session::create(model, ids, capacity, seed);
-        emit_generation(session, model, sampling, ids, defaults.stop_ids, max_tokens, decoder, as_json);
+        emit_generation(session, model, sampling, ids, defaults.stop_ids, max_tokens, decoder, as_json,
+                        tokenizer ? &*tokenizer : nullptr, top_logprobs);
         return;
     }
     auto session = Session::create(model, context, seed, settings);
@@ -665,7 +678,8 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         (max_tokens && max_tokens - 1 > session.capacity() - ids.size()))
         invalid("prompt and generation budget exceed context, or prompt is empty");
     session.prefill(ids);
-    emit_generation(session, model, sampling, ids, defaults.stop_ids, max_tokens, decoder, as_json);
+    emit_generation(session, model, sampling, ids, defaults.stop_ids, max_tokens, decoder, as_json,
+                    tokenizer ? &*tokenizer : nullptr, top_logprobs);
 }
 
 void batch(Arguments& args, const std::filesystem::path& path, BackendOptions options) {
@@ -856,6 +870,7 @@ constexpr CommandHelp commands[] = {
      "  --context N                   Limit session context (decoder context for T5).\n"
      "  --kv-cache f32|f16 --prefill-chunk N\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
+     "  --logprobs [--top-logprobs N] Include token log probabilities in JSON (0 to 20 alternatives).\n"
      "  --json                        Include token IDs and the finish reason.\n",
      true},
     {"infer", "Return a named tensor as JSON", "infer MODEL (PROMPT | --stdin | --tokens IDS) --output NAME",

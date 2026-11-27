@@ -129,6 +129,25 @@ def http_checks(binary, checkpoint, encoder):
         assert complete["usage"]["prompt_tokens"] == 15
         with_usage = request(port, chat_path, dict(chat, stream=True, stream_options=dict(include_usage=True)))
         assert with_usage[-1]["choices"] == [] and with_usage[-1]["usage"] == complete["usage"]
+        scored = request(port, chat_path, dict(chat, logprobs=True, top_logprobs=2))["choices"][0]
+        scores = scored["logprobs"]["content"]
+        native = json.loads(subprocess.check_output(
+            [binary, "generate", checkpoint, "--messages", "-", "--greedy", "--max-new-tokens", "4",
+             "--top-logprobs", "2"], input=json.dumps(chat["messages"]), text=True, timeout=10))
+        expected = native["token_logprobs"]
+        for item in expected:
+            item.pop("token_id")
+            for alternative in item["top_logprobs"]:
+                alternative.pop("token_id")
+        assert scores == expected and len(scores) == 4
+        assert scored["message"] == complete["choices"][0]["message"]
+        stream_scores = request(port, chat_path, dict(chat, logprobs=True, top_logprobs=2, stream=True))
+        assert [score for event in stream_scores for choice in event["choices"]
+                for score in choice.get("logprobs", {}).get("content", [])] == expected
+        request(port, chat_path, dict(chat, top_logprobs=1), 400)
+        request(port, chat_path, dict(chat, logprobs=True, top_logprobs=21), 400)
+        empty_scores = request(port, chat_path, dict(chat, logprobs=True, max_tokens=0))
+        assert empty_scores["choices"][0]["logprobs"]["content"] == []
         request(port, chat_path, dict(chat, model="other"), 404)
         request(port, chat_path, dict(chat, messages=[dict(role="assistant", content="b")]), 400)
 

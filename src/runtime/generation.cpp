@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 
 namespace nathr {
 
@@ -65,6 +66,39 @@ Token Sampler::select(std::span<const float> logits, std::mt19937_64& generator)
             return candidate.id;
     }
     return allowed[count - 1].id;
+}
+
+TokenLogprobs token_logprobs(std::span<const float> logits, Token chosen, std::size_t top_count) {
+    if (chosen >= logits.size() || logits.size() > detail::max_vocabulary || top_count > max_top_logprobs)
+        throw Error(ErrorCode::invalid_argument, "invalid vocabulary, token ID or top logprob count");
+    double maximum = -std::numeric_limits<double>::infinity();
+    for (float value : logits) {
+        if (!std::isfinite(value))
+            throw Error(ErrorCode::invalid_argument, "log probabilities require finite logits");
+        maximum = std::max(maximum, static_cast<double>(value));
+    }
+    const auto better = [](const TokenLogprob& a, const TokenLogprob& b) {
+        return a.logprob == b.logprob ? a.id < b.id : a.logprob > b.logprob;
+    };
+    TokenLogprobs scores{{chosen, logits[chosen]}, {}};
+    auto& top = scores.alternatives;
+    top_count = std::min(top_count, logits.size());
+    top.reserve(top_count + (top_count != 0));
+    double sum = 0;
+    for (Token id = 0; id < logits.size(); ++id) {
+        const TokenLogprob item{id, logits[id]};
+        sum += std::exp(item.logprob - maximum);
+        if (!top_count || (top.size() == top_count && !better(item, top.back())))
+            continue;
+        top.insert(std::lower_bound(top.begin(), top.end(), item, better), item);
+        if (top.size() > top_count)
+            top.pop_back();
+    }
+    const auto normalizer = std::log(sum);
+    const auto normalize = [&](TokenLogprob& item) { item.logprob = (item.logprob - maximum) - normalizer; };
+    normalize(scores.chosen);
+    std::ranges::for_each(top, normalize);
+    return scores;
 }
 
 namespace {

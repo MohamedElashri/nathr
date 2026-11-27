@@ -19,6 +19,7 @@ std::optional<std::string> chat_system(const std::filesystem::path& path);
 std::string render_chat(const detail::Json& messages, const std::optional<std::string>& system);
 std::vector<Token> token_array(const detail::Json& value, std::string_view name);
 std::vector<std::string> stop_strings(const detail::Json& value);
+detail::Json logprobs_json(const TokenLogprobs& scores, const Tokenizer* tokenizer, bool first);
 Tokenizer load_tokenizer(const Model& model, const std::filesystem::path& path,
                          const std::filesystem::path& sidecar);
 

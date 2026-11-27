@@ -27,6 +27,7 @@ struct BatchRequest {
     std::vector<Token> stop_ids{};
     std::optional<Tokenizer> tokenizer{};
     std::vector<std::string> stop_strings{};
+    std::optional<std::size_t> top_logprobs{};
 };
 
 enum class BatchEventKind { token, eos, stop, length, cancelled, error };
@@ -43,6 +44,7 @@ struct BatchEvent {
     std::size_t prompt_tokens{};
     std::size_t cached_prompt_tokens{};
     double queue_ms{};
+    std::optional<TokenLogprobs> logprobs{};
 };
 
 // Call from one thread. Submit and cancel requests between calls to step().

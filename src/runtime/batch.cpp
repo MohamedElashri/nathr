@@ -223,6 +223,11 @@ struct BatchScheduler::Impl {
         ++request.emitted;
         auto event = request.event(BatchEventKind::token, now);
         event.token = token;
+        if (request.input.top_logprobs) {
+            const auto logits =
+                request.seq2seq ? request.seq2seq->logits() : std::span<const float>(request.logits);
+            event.logprobs = token_logprobs(logits, token, *request.input.top_logprobs);
+        }
         if (request.last_token)
             event.inter_token_ms = milliseconds(now - *request.last_token);
         if (request.text)
@@ -325,6 +330,8 @@ void BatchScheduler::submit(BatchRequest request) {
         throw Error(ErrorCode::resource_limit, "batch queued-token budget exceeded");
     if (!request.tokenizer && !request.stop_strings.empty())
         throw Error(ErrorCode::invalid_argument, "stop strings require a tokenizer");
+    if (request.top_logprobs && *request.top_logprobs > max_top_logprobs)
+        throw Error(ErrorCode::invalid_argument, "top logprobs must be between 0 and 20");
     if (std::ranges::any_of(request.stop_ids, [&](Token id) { return id >= s.model.config().vocabulary; }))
         throw Error(ErrorCode::invalid_argument, "stop token ID exceeds model vocabulary");
     detail::validate_tokens(request.tokens, s.model.config(), s.options.context);
