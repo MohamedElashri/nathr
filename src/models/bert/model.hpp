@@ -17,6 +17,8 @@ class Bert {
                                             std::span<const Token> token_types = {}) const;
     [[nodiscard]] std::vector<OutputInfo> outputs() const;
     [[nodiscard]] TensorResult infer(InferenceInput input, const OutputInfo& output) const;
+    [[nodiscard]] std::vector<TensorResult> infer_batch(std::span<const InferenceInput> inputs,
+                                                        const OutputInfo& output) const;
 
   private:
     struct Affine {
@@ -26,6 +28,10 @@ class Bert {
         Affine query, key, value, attention, attention_norm, ff_in, ff_out, ff_norm;
     };
     enum class Pooling { none, mean, cls, maximum };
+
+    [[nodiscard]] std::vector<float> encode(std::span<const InferenceInput> inputs) const;
+    [[nodiscard]] TensorResult project_output(std::span<const float> hidden, std::size_t count,
+                                              const OutputInfo& output) const;
 
     const ModelConfig& config_;
     const CpuBackend& backend_;

@@ -97,6 +97,9 @@ class Model {
     [[nodiscard]] bool supports_generation() const noexcept;
     [[nodiscard]] bool supports_fused_batch() const noexcept;
     [[nodiscard]] TensorResult infer(InferenceInput input, std::string_view output) const;
+    // Returns results in input order. Encoders may share projections across inputs.
+    [[nodiscard]] std::vector<TensorResult> infer_batch(std::span<const InferenceInput> inputs,
+                                                        std::string_view output) const;
     // Uncached, absolute positions starting at zero. At most 128 tokens.
     // Last-token mode writes last_logits and all-token mode streams to sink.
     void forward(std::span<const Token> tokens, LogitsMode mode, std::span<float> last_logits = {},

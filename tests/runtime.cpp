@@ -798,6 +798,19 @@ void checkpoint_outputs() {
            "WordPiece pair IDs and token types");
     const auto model = Model::load(path);
     expect(!model.supports_generation() && model.outputs().size() == 4, "checkpoint output capabilities");
+    const auto short_ids = tokenizer.encode("The sky.");
+    const auto different = tokenizer.encode_pair("The sky.", "A tree.");
+    const std::array inputs{InferenceInput{pair.ids, pair.token_type_ids}, InferenceInput{short_ids},
+                            InferenceInput{different.ids, different.token_type_ids}};
+    for (const auto& output : model.outputs()) {
+        const auto batch = model.infer_batch(inputs, output.name);
+        expect(batch.size() == inputs.size(), "encoder batch result count");
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            const auto standalone = model.infer(inputs[i], output.name);
+            expect(batch[i].shape == standalone.shape, "encoder batch shape and order");
+            compare(batch[i].values, standalone.values, 3e-6);
+        }
+    }
     for (const auto name : {"pooler_output", "sentence_embedding", "logits"}) {
         const auto result = model.infer({pair.ids, pair.token_type_ids}, name);
         const auto reference = ref.at(name).get<std::vector<float>>();

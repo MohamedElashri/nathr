@@ -4,6 +4,7 @@ import base64
 from contextlib import contextmanager
 import http.client
 import json
+import math
 from pathlib import Path
 import runpy
 import select
@@ -210,6 +211,8 @@ def http_checks(binary, checkpoint, encoder):
     with server(binary, encoder, "--max-buffer-bytes", "560", named_model=True) as port:
         request(port, "/v1/embeddings", dict(input="The sky is blue."))
         request(port, "/v1/embeddings", dict(input=["The sky is blue."] * 4), 429)
+        compact = request(port, "/v1/embeddings", dict(input=["The sky is blue."] * 4, encoding_format="base64"))
+        assert len(compact["data"]) == 4 and len(base64.b64decode(compact["data"][0]["embedding"])) == 48
 
     with server(binary, checkpoint, "--max-buffer-bytes", "512", "--model-id", "test") as port:
         request(port, "/v1/chat/completions", dict(messages=[dict(role="user", content="b")], max_tokens=1))
@@ -314,6 +317,65 @@ def multi_model_benchmark(binary, checkpoint, encoder):
         assert result["short"]["requests"] == 3 and result["long"]["requests"] == 1
 
 
+def encoder_batch_checks(binary, encoder):
+    batch = {"output": "sentence_embedding", "inputs": [{"tokens": [1, 2, 3]}, {"tokens": [4, 5, 6]}]}
+    commands = [dict(batch, id=1), {"cancel": 1},
+                dict(batch, id=2, inputs=[{"tokens": [99]}]), dict(batch, id=3)]
+    stdout = subprocess.check_output([binary, "batch", encoder, "--ready"], text=True, timeout=10,
+                                     input="".join(json.dumps(item) + "\n" for item in commands))
+    frames = [json.loads(line) for line in stdout.splitlines()]
+    assert [e["reason"] for e in frames if e.get("id") == 1] == ["cancelled"]
+    assert [e["event"] for e in frames if e.get("id") == 2] == ["error"]
+    results = [e for e in frames if e.get("id") == 3]
+    assert [e["index"] for e in results if e["event"] == "tensor"] == [0, 1]
+    assert results[-1]["reason"] == "result"
+
+
+def rerank_checks(binary, encoder, target):
+    target.mkdir()
+    for path in encoder.iterdir():
+        if path.name not in ("config.json", "model.safetensors"):
+            (target / path.name).symlink_to(path.resolve(), target_is_directory=path.is_dir())
+    config = json.loads((encoder / "config.json").read_text())
+    (target / "config.json").write_text(json.dumps(dict(config, num_labels=1)))
+    original = (encoder / "model.safetensors").read_bytes()
+    size = int.from_bytes(original[:8], "little")
+    header, data = json.loads(original[8:8 + size]), original[8 + size:]
+    tensors = sorted((name for name in header if name != "__metadata__"),
+                     key=lambda name: header[name]["data_offsets"])
+    weights = bytearray()
+    for name in tensors:
+        tensor = header[name]
+        start, end = tensor["data_offsets"]
+        if name in ("classifier.weight", "classifier.bias"):
+            end = start + (end - start) // tensor["shape"][0]
+            tensor["shape"][0] = 1
+        tensor["data_offsets"] = [len(weights), len(weights) + end - start]
+        weights.extend(data[start:end])
+    encoded = json.dumps(header).encode()
+    (target / "model.safetensors").write_bytes(len(encoded).to_bytes(8, "little") + encoded + weights)
+
+    with server(binary, encoder, "--also", target) as port:
+        query = "The sky?"
+        documents = ["The sky is blue.", "Hello world.", "The sky is blue."]
+        scores = [request(port, "/infer", dict(model="reranker", prompt=query, text_pair=text, output="logits"))
+                  for text in documents]
+        order = sorted(range(len(documents)), key=lambda index: scores[index]["values"][0], reverse=True)
+        value = dict(model="reranker", query=query, documents=documents, top_n=2)
+        result = request(port, "/v1/rerank", value)
+        assert result["model"] == "reranker"
+        assert result["usage"]["total_tokens"] == sum(score["prompt_tokens"] for score in scores)
+        assert [item["index"] for item in result["results"]] == order[:2]
+        for item in result["results"]:
+            index = item["index"]
+            assert item["document"] == {"text": documents[index]}
+            assert math.isclose(item["relevance_score"], 1 / (1 + math.exp(-scores[index]["values"][0])),
+                                rel_tol=1e-6)
+        request(port, "/v1/rerank", dict(value, model="bert"), status=400)
+        request(port, "/v1/rerank", dict(value, documents=documents * 6), status=400)
+        request(port, "/v1/rerank", dict(value, top_n=-1), status=400)
+
+
 if __name__ == "__main__":
     executable, fixtures = map(Path, sys.argv[1:])
     help_text = subprocess.check_output([executable, "help", "serve"], text=True, timeout=10)
@@ -326,4 +388,6 @@ if __name__ == "__main__":
         chat_stdin(executable, checkpoint)
         user_commands(executable, checkpoint, fixtures / "bert", checkpoint / "empty cache")
         multi_model_benchmark(executable, checkpoint, fixtures / "bert")
+        encoder_batch_checks(executable, fixtures / "bert")
+        rerank_checks(executable, fixtures / "bert", checkpoint / "reranker")
         checkpoint_defaults(executable, checkpoint)
