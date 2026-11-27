@@ -16,7 +16,8 @@ namespace nathr {
 
 namespace detail {
 class CachePagePool;
-}
+class LoraWeights;
+} // namespace detail
 
 enum class ErrorCode { invalid_argument, unsupported, malformed, io, resource_limit, backend };
 
@@ -84,6 +85,21 @@ struct TensorResult {
     std::vector<float> values;
 };
 
+class LoraAdapter {
+  public:
+    static constexpr std::size_t max_bytes = 128 * 1024 * 1024;
+    [[nodiscard]] std::size_t memory_bytes() const noexcept;
+
+  private:
+    LoraAdapter(std::shared_ptr<const void> model, std::shared_ptr<const detail::LoraWeights> weights)
+        : model_(std::move(model)), weights_(std::move(weights)) {}
+    std::shared_ptr<const void> model_;
+    std::shared_ptr<const detail::LoraWeights> weights_;
+    friend class Model;
+    friend class Session;
+    friend class BatchScheduler;
+};
+
 class Model {
   public:
     static Model load(const std::filesystem::path& path, BackendOptions options = {});
@@ -96,11 +112,15 @@ class Model {
     [[nodiscard]] std::vector<OutputInfo> outputs() const;
     [[nodiscard]] bool supports_generation() const noexcept;
     [[nodiscard]] bool supports_fused_batch() const noexcept;
-    [[nodiscard]] TensorResult infer(InferenceInput input, std::string_view output) const;
+    [[nodiscard]] LoraAdapter load_lora(const std::filesystem::path& directory,
+                                        std::size_t byte_limit = LoraAdapter::max_bytes) const;
+    [[nodiscard]] TensorResult infer(InferenceInput input, std::string_view output,
+                                     const LoraAdapter* lora = nullptr) const;
     // Uncached, absolute positions starting at zero. At most 128 tokens.
     // Last-token mode writes last_logits and all-token mode streams to sink.
     void forward(std::span<const Token> tokens, LogitsMode mode, std::span<float> last_logits = {},
-                 const LogitsSink& sink = {}, const TraceSink& trace = {}) const;
+                 const LogitsSink& sink = {}, const TraceSink& trace = {},
+                 const LoraAdapter* lora = nullptr) const;
     // BERT only. Returns one hidden-size row per input token, in input order.
     [[nodiscard]] std::vector<float> encode(std::span<const Token> tokens) const;
 
@@ -129,7 +149,7 @@ class Sampler;
 class Session {
   public:
     static Session create(const Model& model, std::size_t capacity = 0, std::uint64_t seed = 0,
-                          SessionOptions options = {});
+                          SessionOptions options = {}, const LoraAdapter* lora = nullptr);
     ~Session();
     Session(Session&&) noexcept;
     Session& operator=(Session&&) noexcept;

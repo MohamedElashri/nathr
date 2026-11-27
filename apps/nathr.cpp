@@ -55,13 +55,14 @@ class Arguments {
             const auto name = key.substr(0, equals);
             const auto has_next_value =
                 i + 1 < arguments.size() && !std::string_view(arguments[i + 1]).starts_with("--");
-            if (name == "--stop") {
+            if (name == "--stop" || name == "--lora") {
+                auto& entries = name == "--stop" ? stops_ : adapters_;
                 if (equals != key.npos)
-                    stops_.push_back(key.substr(equals + 1));
+                    entries.push_back(key.substr(equals + 1));
                 else if (has_next_value)
-                    stops_.emplace_back(arguments[++i]);
+                    entries.emplace_back(arguments[++i]);
                 else
-                    invalid("missing value for --stop");
+                    invalid("missing value for " + name);
                 continue;
             }
             auto [entry, added] = values_.try_emplace(name);
@@ -105,17 +106,29 @@ class Arguments {
 
     bool has(const std::string& key) const { return values_.contains(key); }
     std::vector<std::string> stops() { return std::exchange(stops_, {}); }
+    std::vector<std::string> adapters() { return std::exchange(adapters_, {}); }
+    std::optional<std::string> adapter() {
+        if (adapters_.size() > 1)
+            invalid("select one LoRA adapter directory");
+        if (adapters_.empty())
+            return {};
+        auto directory = std::move(adapters_.front());
+        adapters_.clear();
+        return directory;
+    }
 
     void finish() const {
         if (!values_.empty())
             invalid("unknown option: " + values_.begin()->first);
         if (!stops_.empty())
             invalid("unknown option: --stop");
+        if (!adapters_.empty())
+            invalid("unknown option: --lora");
     }
 
   private:
     std::map<std::string, std::optional<std::string>> values_;
-    std::vector<std::string> stops_;
+    std::vector<std::string> stops_, adapters_;
 };
 
 template <class Number> Number parse_number(std::string_view value, std::string_view option) {
@@ -337,6 +350,7 @@ void infer(Arguments& args, const std::filesystem::path& path, BackendOptions op
     const auto types = args.option("--token-type-ids");
     const auto decoder = args.option("--decoder-tokens");
     const auto sidecar = args.option("--tokenizer").value_or("");
+    const auto adapter = args.adapter();
     if (static_cast<int>(prompt.has_value()) + stdin_prompt + tokens.has_value() != 1 || (pair && tokens) ||
         (types && !tokens))
         invalid("infer needs a prompt, --stdin or --tokens IDS");
@@ -344,6 +358,7 @@ void infer(Arguments& args, const std::filesystem::path& path, BackendOptions op
     if (stdin_prompt)
         prompt = read_stdin();
     const auto model = Model::load(path, options);
+    const auto lora = adapter ? std::optional(model.load_lora(*adapter)) : std::nullopt;
     TokenizedInput input;
     if (prompt) {
         const auto tokenizer = cli::load_tokenizer(model, path, sidecar);
@@ -357,7 +372,7 @@ void infer(Arguments& args, const std::filesystem::path& path, BackendOptions op
             input.token_type_ids = parse_tokens(*types);
     }
     const auto prefix = decoder ? parse_tokens(*decoder) : std::vector<Token>{};
-    auto result = model.infer({input.ids, input.token_type_ids, prefix}, output);
+    auto result = model.infer({input.ids, input.token_type_ids, prefix}, output, lora ? &*lora : nullptr);
     std::cout << Json({{"output", output},
                        {"shape", std::move(result.shape)},
                        {"values", std::move(result.values)}})
@@ -434,6 +449,7 @@ void forward(Arguments& args, const std::filesystem::path& path, BackendOptions 
     const auto stream = args.flag("--logits-f32");
     const auto full = args.flag("--json");
     const auto context = number(args, "--context", std::size_t{0});
+    const auto adapter = args.adapter();
     if (!cached && context)
         invalid("--context requires --cached");
     if (stream && (trace_path || full))
@@ -441,6 +457,7 @@ void forward(Arguments& args, const std::filesystem::path& path, BackendOptions 
     args.finish();
 
     const auto model = Model::load(path, options);
+    const auto lora = adapter ? std::optional(model.load_lora(*adapter)) : std::nullopt;
     const auto mode = (stream || trace_path) ? LogitsMode::all_tokens : LogitsMode::last_token;
     std::vector<float> logits(stream ? 0 : model.config().vocabulary);
     TraceFile trace_file;
@@ -462,13 +479,13 @@ void forward(Arguments& args, const std::filesystem::path& path, BackendOptions 
         };
     }
     if (cached) {
-        auto session = Session::create(model, context, 0, settings);
+        auto session = Session::create(model, context, 0, settings, lora ? &*lora : nullptr);
         session.prefill(ids, mode, sink, trace);
         if (mode == LogitsMode::last_token)
             std::ranges::copy(session.logits(), logits.begin());
     } else {
         const auto last = mode == LogitsMode::last_token ? std::span<float>(logits) : std::span<float>{};
-        model.forward(ids, mode, last, sink, trace);
+        model.forward(ids, mode, last, sink, trace, lora ? &*lora : nullptr);
     }
     if (stream) {
         std::cout.flush();
@@ -626,8 +643,11 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         defaults.stop_ids.insert(defaults.stop_ids.end(), additional.begin(), additional.end());
     }
     const auto sidecar = args.option("--tokenizer").value_or("");
+    const auto adapter = args.adapter();
     args.finish();
     const bool seq2seq = model.architecture() == "t5";
+    if (seq2seq && adapter)
+        invalid("LoRA adapters require a Llama or GPT-2 decoder");
     if (seq2seq && (bos || decoder_flags || !sidecar.empty()))
         invalid("T5 does not accept --bos, --kv-cache, --prefill-chunk or --tokenizer");
     if (stdin_prompt)
@@ -660,7 +680,8 @@ void generate_text(Arguments& args, const std::filesystem::path& path, BackendOp
         emit_generation(session, model, sampling, ids, defaults.stop_ids, max_tokens, decoder, as_json);
         return;
     }
-    auto session = Session::create(model, context, seed, settings);
+    const auto lora = adapter ? std::optional(model.load_lora(*adapter)) : std::nullopt;
+    auto session = Session::create(model, context, seed, settings, lora ? &*lora : nullptr);
     if (ids.empty() || ids.size() > session.capacity() ||
         (max_tokens && max_tokens - 1 > session.capacity() - ids.size()))
         invalid("prompt and generation budget exceed context, or prompt is empty");
@@ -682,7 +703,8 @@ void batch(Arguments& args, const std::filesystem::path& path, BackendOptions op
         "batch KV budget");
     batch_options.session = session_options(args);
     const cli::BatchIoOptions io{args.flag("--stats"), args.flag("--ready"),
-                                 number(args, "--max-result-values", std::size_t{0})};
+                                 number(args, "--max-result-values", std::size_t{0}), args.adapters(),
+                                 args.option("--lora-root").value_or("")};
     const auto tokenizer = args.option("--tokenizer").value_or("");
     args.finish();
     cli::run_batch(Model::load(path, options), path, tokenizer, batch_options, io);
@@ -856,6 +878,7 @@ constexpr CommandHelp commands[] = {
      "  --context N                   Limit session context (decoder context for T5).\n"
      "  --kv-cache f32|f16 --prefill-chunk N\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
+     "  --lora DIR                    Apply a PEFT LoRA adapter.\n"
      "  --json                        Include token IDs and the finish reason.\n",
      true},
     {"infer", "Return a named tensor as JSON", "infer MODEL (PROMPT | --stdin | --tokens IDS) --output NAME",
@@ -864,7 +887,8 @@ constexpr CommandHelp commands[] = {
      "  --text-pair TEXT               Add a second segment to BERT text input.\n"
      "  --token-type-ids IDS           Supply BERT segment IDs with --tokens.\n"
      "  --decoder-tokens IDS          Supply a T5 prefix beginning with its decoder start ID.\n"
-     "  --tokenizer FILE               Use a matching GGUF tokenizer sidecar.\n",
+     "  --tokenizer FILE               Use a matching GGUF tokenizer sidecar.\n"
+     "  --lora DIR                     Apply a PEFT LoRA adapter.\n",
      true},
     {"inspect", "Show checkpoint capabilities and outputs", "inspect MODEL",
      "  --summary                     Print a readable list of capabilities and outputs.\n"
@@ -886,6 +910,8 @@ constexpr CommandHelp commands[] = {
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"
      "  --no-prefix-cache             Disable sharing of computed decoder KV pages.\n"
      "  --tokenizer FILE              Use a matching GGUF tokenizer sidecar.\n"
+     "  --lora NAME=DIR               Register a PEFT LoRA adapter. Repeat to register more.\n"
+     "  --lora-root DIR               Enable runtime loading of adapters beneath this directory.\n"
      "  --stats                       Emit timings and KV stats after the batch drains.\n"},
     {"serve", "Start the local OpenAI-compatible API", "serve [MODEL]", ""},
     {"bench", "Measure decoder inference or HTTP serving", "bench MODEL | nathr bench --serve",
@@ -900,6 +926,7 @@ constexpr CommandHelp commands[] = {
     {"encode", "Return BERT hidden-state rows as JSON", "encode MODEL (PROMPT | --tokens IDS)", "", true},
     {"forward", "Inspect decoder-only logits and activations", "forward MODEL --tokens IDS",
      "  --cached                      Run with a KV cache.\n"
+     "  --lora DIR                    Apply a PEFT LoRA adapter.\n"
      "  --context N --kv-cache f32|f16 --prefill-chunk N\n"
      "  --json                        Include the last logit row in JSON.\n"
      "  --trace FILE                  Save intermediate activations.\n"

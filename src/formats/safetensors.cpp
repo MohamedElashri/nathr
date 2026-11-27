@@ -20,13 +20,13 @@ DType read_dtype(const Json& value, std::string_view context) {
 }
 } // namespace
 
-SafeTensors::SafeTensors(const std::filesystem::path& path) : path_(path) {
+SafeTensors::SafeTensors(const std::filesystem::path& path, std::size_t byte_limit) : path_(path) {
     std::ifstream stream(path, std::ios::binary | std::ios::ate);
     const auto size = stream.tellg();
     if (size < 0)
         throw Error(ErrorCode::io, path.string() + ": cannot open file");
-    if (static_cast<std::uint64_t>(size) > max_checkpoint_bytes)
-        throw Error(ErrorCode::resource_limit, path.string() + ": file exceeds 1 GiB");
+    if (static_cast<std::uint64_t>(size) > byte_limit)
+        throw Error(ErrorCode::resource_limit, path.string() + ": file exceeds size limit");
     std::array<std::byte, 8> prefix{};
     stream.seekg(0);
     if (!stream.read(reinterpret_cast<char*>(prefix.data()), prefix.size())) {

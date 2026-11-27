@@ -110,6 +110,7 @@ class Gpt2 final : public Decoder {
         return std::make_unique<Gpt2Workspace>(config, positions, block);
     }
     void execute_batch(Workspace& scratch, const EvaluationBatch& batch) const override;
+    [[nodiscard]] std::vector<LoraTarget> lora_targets() const override;
 
   private:
     const ModelConfig& config;
@@ -161,6 +162,20 @@ Gpt2::Gpt2(SafeTensors& file, const std::filesystem::path& path, const ModelConf
         throw Error(ErrorCode::unsupported, path.string() + ": unexpected tensor " + std::string(name));
 }
 
+std::vector<LoraTarget> Gpt2::lora_targets() const {
+    std::vector<LoraTarget> targets{{"transformer.wte", embedding, true}, {"lm_head", output}};
+    targets.reserve(2 + 4 * layers.size());
+    for (std::size_t i = 0; i < layers.size(); ++i) {
+        const auto prefix = "transformer.h." + std::to_string(i) + ".";
+        const auto& w = layers[i];
+        targets.insert(targets.end(), {{prefix + "attn.c_attn", w.qkv.weight},
+                                       {prefix + "attn.c_proj", w.attention_output.weight},
+                                       {prefix + "mlp.c_fc", w.ff_in.weight},
+                                       {prefix + "mlp.c_proj", w.ff_out.weight}});
+    }
+    return targets;
+}
+
 void Gpt2::execute_batch(Workspace& scratch, const EvaluationBatch& batch) const {
     auto& w = static_cast<Gpt2Workspace&>(scratch);
     const auto h = config.hidden, ff = config.intermediate;
@@ -173,8 +188,9 @@ void Gpt2::execute_batch(Workspace& scratch, const EvaluationBatch& batch) const
     const auto attention = w.attention.first(count * h);
     const auto projection = w.projection.first(count * h);
     const auto ff_values = w.ff.first(count * ff);
+    const auto* adapters = batch.adapters();
     const auto affine = [&](const Affine& weight, std::span<const float> input, std::span<float> result) {
-        backend.project(weight.weight, input, result, count, w.packed);
+        backend.project(weight.weight, input, result, count, w.packed, adapters);
         const auto width = result.size() / count;
         for (std::size_t i = 0; i < count; ++i)
             Scalar::add_bias(row(result, width, i), weight.bias);
@@ -186,6 +202,8 @@ void Gpt2::execute_batch(Workspace& scratch, const EvaluationBatch& batch) const
         auto activation = row(hidden, h, index);
         auto position = row(norm, h, index);
         Scalar::embedding(embedding, e.tokens[i], activation);
+        if (e.lora)
+            e.lora->embed(embedding, e.tokens[i], activation);
         Scalar::embedding(positions, e.start + i, position);
         Scalar::add(activation, position);
         e.record("embedding", TraceEvent::model_level, i, activation);

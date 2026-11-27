@@ -201,6 +201,12 @@ The decoder scheduler indexes full prompt pages by their exact token IDs and the
 
 The terminal and HTTP frontends send JSONL requests to one persistent worker per model. The terminal keeps chat history in the current session. The API routes by model ID and adapts generation and embeddings to the batch request format. It bounds client count, request bodies, and response buffering, and cancels a request between scheduler steps if a buffer fills or a client disconnects. [Frontends](../apps/serve.py) · [HTTP endpoints](../README.md#openai-compatible-api)
 
+### Apply low-rank adapters per request
+
+For a projection `Wx`, a LoRA adapter stores a rank-`r` input projection `A` and an output projection `B`. Compute `Wx` through the usual dense or quantized kernel, then add `(alpha / r) B(Ax)` on the rows that selected that adapter. RSLoRA uses `alpha / sqrt(r)`. For token embeddings, use the token's column of `A` as the input to `B`. Keep the shared base weights and allow the embedding and output head to receive distinct updates even when they share a base tensor.
+
+Nathr reads PEFT Safetensors adapters for the supported Llama and GPT-2 decoder projections, embeddings, and output heads. It validates rank, tensor dimensions, dtype, and byte limits. The loader supports rank and alpha overrides and a bias on `B`. It rejects unsupported tensors and modes such as DoRA or full saved-module replacements. The scheduler keys cached prompt pages by the loaded adapter instance as well as the tokens and parent page, so an unloaded and reloaded name starts with a fresh cache identity. [LoRA loader and evaluation](../src/models/lora.cpp) · [Batch scheduler](../src/runtime/batch.cpp)
+
 ## 7. Execute packed weights and make the CPU path faster
 
 Add packed formats behind the row-dot interface. As a first implementation, unpack one block into a small local buffer, convert its values to FP32, and accumulate their products with the corresponding activation coordinates. Keep the full matrix packed in its backing storage. For a row of `N` weights, its byte stride is `N / elements_per_block * bytes_per_block`. Validate the divisibility when loading the tensor. [Tensor encodings](../src/formats/tensor.hpp) · [Block decoders](../src/quantization/decoders.cpp)

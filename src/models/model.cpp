@@ -29,13 +29,29 @@ TensorView CpuBackend::bind(TensorView view, const std::filesystem::path& path, 
 }
 
 void CpuBackend::project(TensorView weight, std::span<const float> input, std::span<float> output,
-                         std::size_t tokens, std::span<float> packed) const {
-    project({{weight, output}}, input, tokens, packed);
+                         std::size_t tokens, std::span<float> packed, const EvaluationBatch* adapters) const {
+    project({{weight, output}}, input, tokens, packed, adapters);
 }
 
 void CpuBackend::project(std::initializer_list<Projection> projections, std::span<const float> input,
-                         std::size_t tokens, std::span<float> packed) const {
+                         std::size_t tokens, std::span<float> packed, const EvaluationBatch* adapters) const {
     detail::project(pool_, kernels_, {projections.begin(), projections.size()}, input, tokens, packed);
+    if (adapters) {
+        std::size_t offset = 0;
+        const auto in = input.size() / tokens;
+        for (const auto& evaluation : adapters->entries) {
+            const auto rows = evaluation.tokens.size();
+            if (evaluation.lora) {
+                const auto activations = input.subspan(offset * in, rows * in);
+                for (const auto& [weight, output] : projections) {
+                    const auto out = output.size() / tokens;
+                    evaluation.lora->project(weight, activations, output.subspan(offset * out, rows * out),
+                                             rows);
+                }
+            }
+            offset += rows;
+        }
+    }
 }
 
 std::string_view CpuBackend::kernel(std::uint32_t id) const noexcept {
@@ -221,7 +237,18 @@ bool Model::supports_fused_batch() const noexcept {
     return std::holds_alternative<std::unique_ptr<Decoder>>(impl_->execution);
 }
 
-TensorResult Model::infer(InferenceInput input, std::string_view output) const {
+std::size_t LoraAdapter::memory_bytes() const noexcept {
+    return weights_ ? weights_->memory_bytes() : 0;
+}
+
+LoraAdapter Model::load_lora(const std::filesystem::path& directory, std::size_t byte_limit) const {
+    return LoraAdapter(impl_,
+                       std::make_shared<LoraWeights>(directory, impl_->decoder().lora_targets(), byte_limit));
+}
+
+TensorResult Model::infer(InferenceInput input, std::string_view output, const LoraAdapter* lora) const {
+    if (lora && lora->model_ != impl_)
+        throw Error(ErrorCode::invalid_argument, "LoRA adapter belongs to a different base model");
     const auto available = outputs();
     const auto info = std::ranges::find(available, output, &OutputInfo::name);
     if (info == available.end())
@@ -239,11 +266,13 @@ TensorResult Model::infer(InferenceInput input, std::string_view output) const {
         if (!input.decoder_tokens.empty())
             throw Error(ErrorCode::invalid_argument, "decoder-only input uses tokens");
         TensorResult result{{input.tokens.size(), width}, std::vector<float>(input.tokens.size() * width)};
-        forward(input.tokens, LogitsMode::all_tokens, {},
-                [&](std::size_t position, std::span<const float> values) {
-                    std::ranges::copy(values,
-                                      result.values.begin() + static_cast<std::ptrdiff_t>(position * width));
-                });
+        forward(
+            input.tokens, LogitsMode::all_tokens, {},
+            [&](std::size_t position, std::span<const float> values) {
+                std::ranges::copy(values,
+                                  result.values.begin() + static_cast<std::ptrdiff_t>(position * width));
+            },
+            {}, lora);
         return result;
     }
     const auto count = std::max<std::size_t>(1, input.decoder_tokens.size());
@@ -275,7 +304,9 @@ std::string_view Model::kernel(std::uint32_t id) const noexcept {
 }
 
 void Model::forward(std::span<const Token> tokens, LogitsMode mode, std::span<float> last_logits,
-                    const LogitsSink& sink, const TraceSink& trace) const {
+                    const LogitsSink& sink, const TraceSink& trace, const LoraAdapter* lora) const {
+    if (lora && lora->model_ != impl_)
+        throw Error(ErrorCode::invalid_argument, "LoRA adapter belongs to a different base model");
     const auto& decoder = impl_->decoder();
     validate_tokens(tokens, config(), std::min(config().context, max_uncached_tokens));
     validate_mode(mode, sink);
@@ -284,7 +315,8 @@ void Model::forward(std::span<const Token> tokens, LogitsMode mode, std::span<fl
         throw Error(ErrorCode::invalid_argument, "last-token mode requires a vocabulary-sized output span");
     }
     auto scratch = decoder.workspace(tokens.size(), tokens.size());
-    decoder.execute(*scratch, {tokens, 0, nullptr, mode, sink, trace});
+    decoder.execute(
+        *scratch, {tokens, 0, nullptr, mode, sink, trace, {}, false, lora ? lora->weights_.get() : nullptr});
     if (mode == LogitsMode::last_token)
         std::ranges::copy(scratch->logits, last_logits.begin());
 }

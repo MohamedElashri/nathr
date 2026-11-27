@@ -132,6 +132,17 @@ JSONL
 
 Text input also emits decoded fragments. Send `{"cancel":2}` to cancel a pending request. Close stdin to let the batch finish. Use `batch --help` for queue, context, and memory limits.
 
+### Apply a LoRA adapter
+
+Use the checkpoint the adapter was trained on and a local PEFT directory containing `adapter_config.json` and `adapter_model.safetensors`. Nathr supports LoRA on Llama-style models, including SmolLM2 GGUF, and GPT-2.
+
+```sh
+nathr run smollm2 "Explain why the sky looks blue." --lora ./adapter
+nathr serve smollm2 --lora tuned=./adapter
+```
+
+Select `"model":"tuned"` in API requests. The base model and adapter appear in `GET /v1/models`. Repeat `--lora NAME=DIR` to register more adapters for the primary checkpoint. Each request selects one adapter and shares the loaded base weights. Use `--lora DIR` with `generate`, `infer`, or `forward`, or register a name with `batch --lora NAME=DIR` and pass that name in the JSONL `lora` field.
+
 ### Benchmark a decoder
 
 ```sh
@@ -203,6 +214,8 @@ nathr serve smollm2 --also minilm
 ```
 
 Use `smollm2` for generation and `minilm` for embedding up to 16 inputs per request. Repeat `--also` to load more checkpoints. The first model handles requests without a model ID. Each model has its own worker and KV budget. Use `/model?model=minilm` or `/health?model=minilm` to inspect one worker.
+
+Add `--lora-root ./adapters` to enable loading and unloading without restarting. `POST /v1/load_lora_adapter` accepts `{"lora_name":"tuned","lora_path":"my-adapter"}`, where the path resolves beneath that directory. `POST /v1/unload_lora_adapter` accepts `{"lora_name":"tuned"}` once the adapter's active and queued requests finish. The primary worker holds up to 16 adapters and 256 MiB of decoded adapter weights.
 
 ## Build from source
 

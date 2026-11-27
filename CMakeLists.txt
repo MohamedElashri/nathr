@@ -46,6 +46,7 @@ add_library(nathr_lib
     src/backend/cpu/thread_pool.cpp
     src/backend/cpu/x86/avx2.cpp
     src/models/model.cpp
+    src/models/lora.cpp
     src/models/llama/config.cpp
     src/models/llama/model.cpp
     src/models/gpt2/model.cpp
@@ -133,7 +134,9 @@ if(BUILD_TESTING)
     if(Python3_Interpreter_FOUND)
         add_test(NAME nathr-serve COMMAND "${Python3_EXECUTABLE}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/serve.py" "$<TARGET_FILE:nathr>" "${NATHR_TEST_FIXTURES}")
-        set_tests_properties(nathr-serve PROPERTIES LABELS fast TIMEOUT 60)
+        add_test(NAME nathr-lora COMMAND "${Python3_EXECUTABLE}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/lora.py" "$<TARGET_FILE:nathr>" "${NATHR_TEST_FIXTURES}")
+        set_tests_properties(nathr-serve nathr-lora PROPERTIES LABELS fast TIMEOUT 60)
     endif()
     if(NOT NATHR_SANITIZER AND NOT NATHR_BUILD_FUZZERS AND
        NOT IS_ABSOLUTE "${CMAKE_INSTALL_BINDIR}" AND NOT IS_ABSOLUTE "${CMAKE_INSTALL_LIBDIR}" AND

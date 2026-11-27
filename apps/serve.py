@@ -87,8 +87,11 @@ def response_message(value):
     return {"role": "system" if role == "developer" else role, "content": content}
 
 
-def model_card(model_id):
-    return {"id": model_id, "object": "model", "owned_by": "nathr", "created": 0}
+def model_card(model_id, parent=None):
+    card = {"id": model_id, "object": "model", "owned_by": "nathr", "created": 0}
+    if parent is not None:
+        card.update(parent=parent, root=parent)
+    return card
 
 
 def checked_event(event):
@@ -120,6 +123,7 @@ class Worker:
         self.queue_bypasses = 0
         self.kv = {"peak_bytes": 0, "resident_bytes": 0}
         self.metadata = None
+        self.lora_adapters = frozenset()
         self.outputs = set()
         self.error = None
         self.process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
@@ -209,10 +213,13 @@ class Worker:
                 with self.changed:
                     if event["event"] == "ready":
                         del event["event"]
+                        self.lora_adapters = frozenset(event.pop("lora_adapters", ()))
                         self.metadata = event
                         self.outputs = {item["name"] for item in event["outputs"]}
                         self.changed.notify_all()
                         continue
+                    if event["event"] == "result" and "lora_adapters" in event:
+                        self.lora_adapters = frozenset(event["lora_adapters"])
                     request = self.pending.get(event.get("id"))
                     if request is None:
                         continue
@@ -291,13 +298,22 @@ class Server(ThreadingHTTPServer):
         super().__init__(("127.0.0.1", options.port), Handler)
         self.workers = workers
         self.default_model = next(iter(workers))
+        self.primary = workers[self.default_model]
         self.options = options
         self.slots = threading.BoundedSemaphore(options.max_clients)
 
     def worker_for(self, model_id):
-        if not isinstance(model_id, str) or model_id not in self.workers:
-            raise RequestError("model is not loaded", 404)
-        return self.workers[model_id]
+        if isinstance(model_id, str):
+            if model_id in self.workers:
+                return self.workers[model_id]
+            if model_id in self.primary.lora_adapters:
+                return self.primary
+        raise RequestError("model is not loaded", 404)
+
+    def model_cards(self):
+        cards = [model_card(name) for name in self.workers]
+        cards.extend(model_card(name, self.default_model) for name in sorted(self.primary.lora_adapters))
+        return cards
 
     def health(self, model_id):
         if model_id is not None or len(self.workers) == 1:
@@ -408,18 +424,22 @@ class Handler(BaseHTTPRequestHandler):
                 health = self.server.health(model_id)
                 self.reply(health, 503 if health["status"] == "unavailable" else 200)
             elif path == "/v1/models":
-                self.reply({"object": "list", "data": [model_card(name) for name in self.server.workers]})
+                self.reply({"object": "list", "data": self.server.model_cards()})
             elif path.startswith("/v1/models/"):
                 name = unquote(path.removeprefix("/v1/models/"))
                 self.server.worker_for(name)
-                self.reply(model_card(name))
+                parent = None if name in self.server.workers else self.server.default_model
+                self.reply(model_card(name, parent))
             elif path == "/model":
                 name = self.server.default_model if model_id is None else model_id
                 worker = self.server.worker_for(name)
                 options = self.server.options
                 limits = {name: getattr(options, name) for name in
                           ("max_body_bytes", "max_output_tokens", "max_result_values", "max_buffer_bytes")}
-                self.reply(dict(worker.metadata, id=name, limits=limits))
+                metadata = dict(worker.metadata, id=name, limits=limits)
+                if name not in self.server.workers:
+                    metadata["base_model"] = self.server.default_model
+                self.reply(metadata)
             else:
                 raise RequestError("endpoint not found", 404)
         except RequestError as error:
@@ -745,17 +765,49 @@ class Handler(BaseHTTPRequestHandler):
         data.extend(b'],"usage":' + json_bytes({"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens}) + b"}")
         self.inference_body(data)
 
+    def change_lora(self, load):
+        if self.server.options.lora_root is None:
+            raise RequestError("runtime adapter management requires --lora-root", 403)
+        value = self.body()
+        fields = {"lora_name", "lora_path", "base_model_name"} if load else {"lora_name"}
+        check_fields(value, fields)
+        name = value.get("lora_name")
+        if not isinstance(name, str) or not name or name in self.server.workers:
+            raise RequestError("invalid or reserved LoRA adapter name")
+        if load:
+            path = value.get("lora_path")
+            if not isinstance(path, str) or not path or "\0" in path:
+                raise RequestError("lora_path must be a local adapter directory")
+            base = value.get("base_model_name", self.server.default_model)
+            if base != self.server.default_model:
+                raise RequestError("LoRA adapters attach to the primary model")
+            payload = {"load_lora": {"name": name, "path": path}}
+        else:
+            payload = {"unload_lora": name}
+        self.worker = self.server.primary
+        request = self.worker.submit(payload)
+        try:
+            self.waiting(request, time.monotonic() + self.server.options.request_timeout)
+            self.reply({"lora_name": name, "status": "loaded" if load else "unloaded"})
+        finally:
+            self.worker.cancel(request)
+
     def do_POST(self):
         request = None
         try:
             self.check_host()
             if (origin := self.headers.get("Origin")) is not None and origin != f"http://{self.headers['Host']}":
                 raise RequestError("expected a same-origin browser request", 403)
+            if self.path in {"/v1/load_lora_adapter", "/v1/unload_lora_adapter"}:
+                self.change_lora(self.path == "/v1/load_lora_adapter")
+                return
             kind = {"/infer": "infer", "/v1/chat/completions": "chat", "/v1/responses": "responses",
                     "/v1/completions": "completion", "/v1/embeddings": "embeddings"}.get(self.path)
             if kind is None:
                 raise RequestError("endpoint not found", 404)
             value = self.body()
+            if {"lora", "load_lora", "unload_lora"} & value.keys():
+                raise RequestError("select a loaded LoRA adapter with the model field")
             self.model_id = value.pop("model", self.server.default_model)
             self.worker = self.server.worker_for(self.model_id)
             deadline = time.monotonic() + self.server.options.request_timeout
@@ -764,6 +816,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             payload, input_kind = self.response_input(value) if kind == "responses" else (value, kind)
             stream, tensor, include_usage = self.normalize(payload, input_kind)
+            if self.model_id not in self.server.workers:
+                payload["lora"] = self.model_id
             request = self.worker.submit(payload)
             first = self.waiting(request, deadline)
             if tensor:
@@ -856,6 +910,8 @@ def run_terminal(worker, options):
             value = {"messages": messages, "max_new_tokens": count}
         else:
             value = {"prompt": prompt, "max_new_tokens": count}
+        if options.lora:
+            value["lora"] = "nathr-lora"
         reply = terminal_input(worker, value, options.request_timeout)
         if chat:
             history.extend((messages[-1], {"role": "assistant", "content": reply}))
@@ -914,9 +970,15 @@ def main(executable, directory, mode, args):
         parser.add_argument("--no-open", action="store_true", help=argparse.SUPPRESS)
         parser.add_argument("--max-new-tokens", type=bounded(0, 8192), help="limit generated tokens per turn")
         parser.add_argument("--output", help="return a named tensor as JSON")
+        parser.add_argument("--lora", action="append", default=[], metavar="DIR", help="apply a local PEFT LoRA adapter")
     else:
         parser.add_argument("--also", action="append", default=[], metavar="MODEL",
                             help="load an additional checkpoint under its usual ID; repeat to load more")
+        parser.add_argument("--lora", action="append", default=[], metavar="NAME=DIR",
+                            help="register a PEFT LoRA adapter for the primary checkpoint; repeat to add more")
+        parser.add_argument("--lora-root", metavar="DIR",
+                            help="enable runtime loading and unloading of local adapters beneath this directory")
+    parser.set_defaults(lora_root=None)
     parser.add_argument("--model-id", help=argparse.SUPPRESS if run else "API model ID, otherwise the checkpoint name")
     parser.add_argument("--port", type=bounded(0, 65535), default=0 if run else 8000,
                         help=argparse.SUPPRESS if run else "HTTP port, or 0 for an available port")
@@ -951,12 +1013,18 @@ def main(executable, directory, mode, args):
     limits.add_argument("--request-timeout", type=bounded(1, 600), default=120, help="inference timeout in seconds")
     options = parser.parse_args(args)
     if run:
+        if len(options.lora) > 1 or options.lora == [""]:
+            parser.error("--lora requires one adapter directory")
+        options.lora = next(iter(options.lora), None)
         if options.prompt is not None and options.prompt_text is not None:
             parser.error("pass one prompt")
         if options.prompt_text is not None:
             options.prompt = options.prompt_text
-        if options.no_open and options.prompt is None and (options.max_new_tokens is not None or options.output):
+        if options.no_open and options.prompt is None and (
+                options.max_new_tokens is not None or options.output or options.lora):
             parser.error("terminal options cannot be used with --no-open")
+    if options.lora_root == "":
+        parser.error("--lora-root requires a directory")
     if options.max_active > options.step_tokens:
         parser.error("--step-tokens must cover all active slots")
     store = ModelStore(options.models_dir)
@@ -968,6 +1036,13 @@ def main(executable, directory, mode, args):
         if model_id in checkpoints:
             parser.error(f"duplicate model ID: {model_id}")
         checkpoints[model_id] = path
+    adapters = ([f"nathr-lora={options.lora}"] if options.lora else []) if run else options.lora
+    for spec in adapters:
+        name, separator, path = spec.partition("=")
+        if not (name and separator and path):
+            parser.error("--lora requires NAME=DIR")
+        if not run and name in checkpoints:
+            parser.error(f"LoRA adapter name matches a model ID: {name}")
     worker_args = []
     for name in ("backend", "threads", "context", "prefill_chunk", "max_active", "step_tokens", "max_queued",
                  "max_queued_tokens", "max_queue_bypasses", "kv_budget_mib", "kv_cache", "max_result_values"):
@@ -979,8 +1054,13 @@ def main(executable, directory, mode, args):
         workers = {}
         for model_id, path in checkpoints.items():
             command = [executable, "batch", "--model", str(path), "--ready", *worker_args]
-            if options.tokenizer and model_id == options.model_id:
-                command.extend(("--tokenizer", options.tokenizer))
+            if model_id == options.model_id:
+                if options.tokenizer:
+                    command.extend(("--tokenizer", options.tokenizer))
+                for adapter in adapters:
+                    command.extend(("--lora", adapter))
+                if options.lora_root is not None:
+                    command.extend(("--lora-root", options.lora_root))
             worker = Worker(command, options)
             cleanup.callback(worker.close)
             try:
