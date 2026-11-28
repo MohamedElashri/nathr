@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(nathr VERSION 0.11.0 LANGUAGES CXX)
+project(nathr VERSION 0.12.0 LANGUAGES CXX)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
     message(FATAL_ERROR "Nathr requires x86-64 Linux")

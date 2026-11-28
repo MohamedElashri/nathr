@@ -21,7 +21,7 @@ Installed releases check for updates at most once a day when `run` or `serve` st
 
 ## Models and cache
 
-`nathr models` shows one row per model with its default variant and cache status. In the current source build, `nathr run` and `nathr serve` default to `qwen3`, using Qwen's 0.6B Q8_0 GGUF. The variant examples use this catalog. [Build instructions](#build-and-verify)
+`nathr models` shows one row per model with its default variant and cache status. `nathr run` and `nathr serve` default to `qwen3`, using Qwen's 0.6B Q8_0 GGUF.
 
 Use `MODEL:VARIANT` to select a different quantization. Nathr downloads only the selected variant and caches it alongside any others. Use `nathr pull` to download it ahead of time and print its path.
 
