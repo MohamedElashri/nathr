@@ -85,6 +85,7 @@ class RotaryDecoder final : public Decoder {
     const ModelConfig& config;
     const CpuBackend& backend;
     MoeConfig moe;
+    RotaryScales scales;
     TensorView embedding, output, norm;
     std::vector<LayerWeights> layers;
     std::vector<float> frequency;
@@ -95,8 +96,11 @@ RotaryDecoder::RotaryDecoder(File& file, const std::filesystem::path& path, cons
                              CpuBackend& cpu, std::string_view architecture)
     : config(c), backend(cpu) {
     constexpr bool gguf = std::is_same_v<File, Gguf>;
-    if constexpr (gguf)
+    if constexpr (gguf) {
         moe = load_gguf_moe_config(file);
+        if (architecture == "granitemoe")
+            scales = load_gguf_granite_scales(file);
+    }
     const auto h = config.hidden;
     const auto query_width = product({config.query_heads, config.head_dim}, "query width");
     const auto kv = config.kv_heads * config.head_dim;
@@ -260,6 +264,8 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
     const auto kv = config.kv_heads * config.head_dim;
     const auto ff = config.intermediate;
     const auto count = batch.size();
+    const double attention_scale =
+        scales.attention ? scales.attention : 1.0 / std::sqrt(static_cast<double>(config.head_dim));
     const auto hidden = w.hidden.first(count * h);
     const auto queries = w.query.first(count * query_width);
     const auto keys = w.keys.first(count * kv);
@@ -278,6 +284,7 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
         Scalar::embedding(embedding, e.tokens[i], activation);
         if (e.lora)
             e.lora->embed(embedding, e.tokens[i], activation);
+        scale_values(activation, scales.embedding);
         e.record("embedding", TraceEvent::model_level, i, activation);
     });
 
@@ -322,10 +329,10 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
         });
         batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t offset) {
             auto result = row(attention, query_width, index);
-            Scalar::attention(config, layer, e.start + i, e.cache,
-                              keys.subspan(offset * kv, e.tokens.size() * kv),
-                              values.subspan(offset * kv, e.tokens.size() * kv),
-                              row(queries, query_width, index), result, w.scores);
+            Scalar::attention_range(config, layer, e.cache, keys.subspan(offset * kv, e.tokens.size() * kv),
+                                    values.subspan(offset * kv, e.tokens.size() * kv),
+                                    row(queries, query_width, index), result, w.scores.first(e.start + i + 1),
+                                    attention_scale);
             e.record("attention", layer, i, result);
         });
         linear(weights.o, attention, projection);
@@ -334,6 +341,7 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
             auto result = row(projection, h, index);
             auto norm_row = row(norms, h, index);
             e.record("attention_projection", layer, i, result);
+            scale_values(result, scales.residual);
             Scalar::add(activation, result);
             e.record("attention_residual", layer, i, activation);
             Scalar::rms_norm(weights.post_attention_norm, activation, norm_row, config.rms_epsilon);
@@ -357,13 +365,15 @@ void RotaryDecoder::execute_batch(Workspace& scratch, const EvaluationBatch& bat
             auto result = row(projection, h, index);
             auto activation = row(hidden, h, index);
             e.record("down", layer, i, result);
+            scale_values(result, scales.residual);
             Scalar::add(activation, result);
             e.record("layer_output", layer, i, activation);
         });
     }
-    project_logits(w, batch, backend, output, hidden, norms.first(h), [&](auto input, auto result) {
-        Scalar::rms_norm(norm, input, result, config.rms_epsilon);
-    });
+    project_logits(
+        w, batch, backend, output, hidden, norms.first(h),
+        [&](auto input, auto result) { Scalar::rms_norm(norm, input, result, config.rms_epsilon); },
+        scales.logits);
 }
 
 } // namespace

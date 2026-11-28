@@ -67,12 +67,33 @@ class ModelStore:
         self.default = data["default_checkpoint"]
         self.profiles = data["checkpoints"]
         self.sources = {source["repository"]: source for source in data["sources"]}
-        self.names = {name: profile for profile in self.profiles
-                      for name in [profile["name"], *profile.get("aliases", [])]}
+        self.names = {profile["name"]: (profile, None) for profile in self.profiles}
+        for profile in self.profiles:
+            profile.setdefault("default_variant", "original")
+            profile.setdefault("variants", {"original": {}})
+            self.names.update({name: (profile, variant) for name, variant in profile.get("aliases", {}).items()})
 
-    def files(self, profile):
-        source = self.sources[profile["repository"]]
-        if filename := profile.get("file"):
+    def select(self, selection):
+        name, separator, requested = selection.partition(":")
+        if name not in self.names:
+            raise RuntimeError(f"unknown checkpoint {name!r}. Run nathr models to see available names")
+        profile, alias_variant = self.names[name]
+        variant = requested.lower() if separator else alias_variant or profile["default_variant"]
+        variants = profile["variants"]
+        if variant not in variants:
+            available = ", ".join(variants)
+            raise RuntimeError(f"unknown variant {requested!r} for {profile['name']!r}. Available: {available}")
+        model_id = profile["name"]
+        if separator:
+            model_id = f"{model_id}:{variant}"
+        elif alias_variant is not None:
+            model_id = name
+        return profile, variant, model_id
+
+    def files(self, profile, variant):
+        artifact = profile["variants"][variant]
+        source = self.sources[artifact.get("repository", profile["repository"])]
+        if filename := artifact.get("file"):
             directory = self.directory
             model = self.directory / filename
             hashes = [item for item in source["files"] if item["filename"] == filename]
@@ -84,10 +105,9 @@ class ModelStore:
             raise RuntimeError(f"no files in the manifest for {profile['name']}")
         return model, directory, source, hashes
 
-    def pull(self, name):
-        if name not in self.names:
-            raise RuntimeError(f"unknown checkpoint {name!r}. Run nathr models to see available names")
-        model, directory, source, hashes = self.files(self.names[name])
+    def pull(self, selection):
+        profile, variant, _ = self.select(selection)
+        model, directory, source, hashes = self.files(profile, variant)
         self.directory.mkdir(parents=True, exist_ok=True)
         with (self.directory / ".download.lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -105,28 +125,39 @@ class ModelStore:
         path = Path(selection).expanduser()
         if explicit and path.exists():
             return path.absolute(), path.resolve().name, None
-        if selection in self.names:
-            profile = self.names[selection]
-            model, _, _, _ = self.files(profile)
-            return model, profile["name"], selection
-        if "/" in selection or path.suffix:
+        if selection.partition(":")[0] not in self.names and ("/" in selection or path.suffix):
             raise RuntimeError(f"checkpoint path does not exist: {path}")
-        raise RuntimeError(f"unknown checkpoint {selection!r}. Run nathr models to see available names")
+        profile, variant, model_id = self.select(selection)
+        model, _, _, _ = self.files(profile, variant)
+        return model, model_id, selection
 
     def resolve(self, selection):
         path, name, source = self.locate(selection)
         return self.pull(source) if source else path, name
 
-    def list(self):
-        print(f"{'MODEL':<14} {'CACHE':<11} CHECKPOINT")
+    def status(self, profile, variant):
+        model, directory, _, hashes = self.files(profile, variant)
+        cached = all((directory / item["filename"]).is_file() for item in hashes)
+        return model, "cached" if cached else "available"
+
+    def list(self, selection=None):
+        if selection is not None:
+            profile, _, _ = self.select(selection)
+            print(f"{'VARIANT':<14} {'CACHE':<11} FILE")
+            for variant in profile["variants"]:
+                model, status = self.status(profile, variant)
+                marker = " (default)" if variant == profile["default_variant"] else ""
+                print(f"{variant:<14} {status:<11} {model.name}{marker}")
+            return
+        print(f"{'MODEL':<14} {'CACHE':<11} {'VARIANT':<10} CHECKPOINT")
         for profile in self.profiles:
-            _, directory, _, hashes = self.files(profile)
-            cached = all((directory / item["filename"]).is_file() for item in hashes)
+            variant = profile["default_variant"]
+            _, status = self.status(profile, variant)
             name = profile["name"]
             label = profile["description"]
             if name == self.default:
                 label += " (default)"
-            print(f"{name:<14} {'cached' if cached else 'available':<11} {label}")
+            print(f"{name:<14} {status:<11} {variant:<10} {label}")
 
 
 def command(kind, args):
@@ -134,14 +165,16 @@ def command(kind, args):
                                      description="Download a pinned checkpoint." if kind == "pull"
                                      else "List named checkpoints and their cache status.")
     if kind == "pull":
-        parser.add_argument("model", help="checkpoint name from nathr models")
+        parser.add_argument("model", metavar="MODEL[:VARIANT]", help="checkpoint and optional quantization")
+    else:
+        parser.add_argument("model", nargs="?", metavar="MODEL", help="list available variants of one model")
     parser.add_argument("--models-dir", help="cache directory (overrides NATHR_MODELS)")
     options = parser.parse_args(args)
     store = ModelStore(options.models_dir)
     if kind == "pull":
         print(store.pull(options.model))
     else:
-        store.list()
+        store.list(options.model)
 
 
 if __name__ == "__main__":

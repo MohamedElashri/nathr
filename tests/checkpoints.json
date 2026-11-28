@@ -1,4 +1,234 @@
 {
+  "qwen3:q4_k_m": {
+    "path": "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
+    "prompt": "The sky is blue.",
+    "ids": [
+      785,
+      12884,
+      374,
+      6303,
+      13
+    ],
+    "output": "logits",
+    "shape": [
+      5,
+      151936
+    ],
+    "probes": {
+      "607744": 4.92932272,
+      "607761": 6.95141649,
+      "608320": 17.30823135,
+      "614945": 2.4047215,
+      "618300": 1.0892508,
+      "759677": 0.65097868
+    },
+    "tolerance": 0.91,
+    "last_token_argmax": 576,
+    "chat": {
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer in one word."
+        },
+        {
+          "role": "user",
+          "content": "What is the capital of Italy?"
+        },
+        {
+          "role": "assistant",
+          "content": "Rome"
+        },
+        {
+          "role": "user",
+          "content": "What is the capital of France?"
+        }
+      ],
+      "prompt_ids": [
+        151644,
+        8948,
+        198,
+        16141,
+        304,
+        825,
+        3409,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        15344,
+        30,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        49,
+        635,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        3838,
+        374,
+        279,
+        6722,
+        315,
+        9625,
+        30,
+        151645,
+        198,
+        151644,
+        77091,
+        198,
+        151667,
+        271,
+        151668,
+        271
+      ],
+      "generated_ids": [
+        59604,
+        151645
+      ],
+      "text": "Paris"
+    }
+  },
+  "granite:q4_k_m": {
+    "path": "granite-3.1-1b-a400m-instruct-Q4_K_M.gguf",
+    "prompt": "The sky is blue.",
+    "ids": [
+      1318,
+      26718,
+      438,
+      10087,
+      32
+    ],
+    "output": "logits",
+    "shape": [
+      5,
+      49155
+    ],
+    "probes": {
+      "196620": 19.59080887,
+      "196637": 0.4609178,
+      "196823": 23.82456017,
+      "203821": 8.35376167,
+      "207176": 12.72539902,
+      "245772": 4.84268188
+    },
+    "tolerance": 1.9,
+    "last_token_argmax": 203
+  },
+  "qwen2.5:q8_0": {
+    "path": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "prompt": "The sky is blue.",
+    "ids": [
+      785,
+      12884,
+      374,
+      6303,
+      13
+    ],
+    "output": "logits",
+    "shape": [
+      5,
+      151936
+    ],
+    "probes": {
+      "607744": -1.72908008,
+      "607761": 5.58047009,
+      "608320": 15.55930424,
+      "614945": -1.10542274,
+      "618300": 1.9994303,
+      "759677": -4.28151226
+    },
+    "tolerance": 0.6,
+    "last_token_argmax": 576
+  },
+  "qwen2.5-1.5b:q3_k_m": {
+    "path": "qwen2.5-1.5b-instruct-q3_k_m.gguf",
+    "prompt": "The sky is blue.",
+    "ids": [
+      785,
+      12884,
+      374,
+      6303,
+      13
+    ],
+    "output": "logits",
+    "shape": [
+      5,
+      151936
+    ],
+    "probes": {
+      "607744": 3.05093241,
+      "607761": 8.91174698,
+      "608320": 17.32273102,
+      "614945": 1.56556559,
+      "618300": 3.17865133,
+      "759677": -4.44783878
+    },
+    "tolerance": 0.78,
+    "last_token_argmax": 576
+  },
+  "granite": {
+    "path": "granite-3.1-1b-a400m-instruct-Q5_K_M.gguf",
+    "prompt": "The sky is blue. 123 café",
+    "ids": [1318, 26718, 438, 10087, 32, 225, 35, 36, 37, 281, 1549, 1309],
+    "output": "logits",
+    "shape": [12, 49155],
+    "probes": {
+      "540705": 21.85831451,
+      "540722": 4.71564770,
+      "541143": 26.57946396,
+      "547906": 8.87796974,
+      "551261": 12.81824398,
+      "589857": 6.77249813
+    },
+    "tolerance": 1.1,
+    "last_token_argmax": 438,
+    "chat": {
+      "messages": [
+        {"role": "system", "content": "Answer in one word."},
+        {"role": "user", "content": "What is the capital of Italy?"},
+        {"role": "assistant", "content": "Rome"},
+        {"role": "user", "content": "What is the capital of France?"}
+      ],
+      "prompt_ids": [
+        49152, 2946, 49153, 10963, 328, 1591, 3594, 32, 0, 225,
+        49152, 496, 49153, 8197, 438, 322, 18926, 432, 2030, 3241, 49, 0, 225,
+        49152, 17594, 49153, 68, 842, 0, 225,
+        49152, 496, 49153, 8197, 438, 322, 18926, 432, 45600, 49, 0, 225,
+        49152, 17594, 49153
+      ],
+      "generated_ids": [926, 297, 0],
+      "text": "Paris"
+    }
+  },
+  "qwen2.5-1.5b": {
+    "path": "qwen2.5-1.5b-instruct-q4_0.gguf",
+    "prompt": "The sky is blue.",
+    "ids": [785, 12884, 374, 6303, 13],
+    "output": "logits",
+    "shape": [5, 151936],
+    "probes": {
+      "607744": 3.25441837,
+      "607761": 9.94201946,
+      "608320": 17.72948837,
+      "614945": 2.10787868,
+      "618300": 4.12663412,
+      "759677": -4.29884577
+    },
+    "tolerance": 0.55,
+    "last_token_argmax": 576
+  },
   "qwen3-moe": {
     "path": "Qwen3-0.6B-MoE-A0.5B-Q4_K_M.gguf",
     "prompt": "The sky is blue.",

@@ -1,16 +1,18 @@
 """Check pinned, locally downloaded model files and optionally measure mixed CPU generation."""
 
 import argparse
-import hashlib
 import json
 import math
 from pathlib import Path
 import statistics
 import subprocess
+import sys
 import tempfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "apps"))
+from model_store import ModelStore, checksum_matches
 
 
 def require(condition, message):
@@ -18,24 +20,14 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def verify_files(path, profile):
-    manifest = json.loads((ROOT / "models/manifest.json").read_text())
-    checkpoint = next(item for item in manifest["checkpoints"]
-                      if profile in [item["name"], *item.get("aliases", [])])
-    source = next(item for item in manifest["sources"] if item["repository"] == checkpoint["repository"])
-    files = source["files"]
-    checkpoint_file = checkpoint.get("file")
-    if checkpoint_file:
-        require(path.name == checkpoint_file, f"{path}: expected checkpoint file {checkpoint_file}")
-        files = [item for item in files if item["filename"] == checkpoint_file]
-    require(files, f"{profile}: no files in manifest")
+def verify_files(store, selection, expected):
+    profile, variant, _ = store.select(selection)
+    path, directory, _, files = store.files(profile, variant)
+    require(path == store.directory / expected, f"{selection}: expected {expected}, found {path}")
     for item in files:
-        filename = path if checkpoint_file else path / item["filename"]
-        sha = hashlib.sha256()
-        with filename.open("rb") as stream:
-            for block in iter(lambda: stream.read(1024 * 1024), b""):
-                sha.update(block)
-        require(sha.hexdigest() == item["sha256"], f"{filename}: SHA-256 mismatch")
+        filename = directory / item["filename"]
+        require(checksum_matches(filename, item["sha256"]), f"{filename}: missing or SHA-256 mismatch")
+    return path
 
 
 def run(binary, *args, requests=None):
@@ -163,23 +155,23 @@ def main():
     if not 1 <= options.threads <= 64 or options.repetitions < 1:
         parser.error("expected 1–64 threads and at least one repetition")
 
+    store = ModelStore(options.models)
     for name in selected:
         case = cases[name]
-        path = options.models / case["path"]
         try:
-            verify_files(path, name)
+            path = verify_files(store, name, case["path"])
             check(options.binary.resolve(), path, case, options.backend)
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             parser.exit(1, f"{name}: {getattr(error, 'stderr', None) or error}\n")
         print(f"{name}: passed", flush=True)
     if options.measure:
-        gguf = options.models / cases["gguf"]["path"]
         try:
+            gguf = options.models / cases["gguf"]["path"]
             if "gguf" not in selected:
-                verify_files(gguf, "gguf")
+                gguf = verify_files(store, "gguf", cases["gguf"]["path"])
             measure(options.binary.resolve(), gguf, options.backend, options.threads, options.repetitions,
                     cases["gguf"]["ids"])
-        except (OSError, ValueError, subprocess.SubprocessError) as error:
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
             parser.exit(1, f"measurement: {getattr(error, 'stderr', None) or error}\n")
 
 

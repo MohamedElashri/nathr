@@ -108,7 +108,8 @@ std::optional<ChatFormat> chat_format(const std::filesystem::path& path, const M
     // These Qwen3 templates render the same plain-text prompt with thinking disabled.
     if ((model.architecture() == "qwen3" &&
          (digest == "57f1fd00f0013a2be96aa79b857391f27e23df5b5f847072b524c897e24d0361" ||
-          digest == "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5")) ||
+          digest == "87a2728cb8dc9fe424d624542f6060ec05a1d285ebbec578bb078900e33396b5" ||
+          digest == "5595e8741bb5500f9d395e05a0aefe6ca1e8d54c5dd8b98bcf7760d895fdc6e6")) ||
         (model.architecture() == "qwen3moe" &&
          digest == "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"))
         return ChatFormat{ChatStyle::qwen3};
@@ -120,6 +121,11 @@ std::optional<ChatFormat> chat_format(const std::filesystem::path& path, const M
                           "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."};
     if (digest == "66291cf0045c2425a3a667cf3cbb7af2b11f09e025c02f97245323ab79119362")
         return ChatFormat{ChatStyle::zephyr};
+    if (model.architecture() == "granitemoe" &&
+        digest == "22da301945ac6b617a8835d435cbbdc780c0ac08d69c07e1e17e6c6799eed800")
+        return ChatFormat{ChatStyle::granite,
+                          "Knowledge Cutoff Date: April 2024. You are Granite, developed by IBM. "
+                          "You are a helpful AI assistant."};
 
     // Recognize the SmolLM2 ChatML template and read its default system message.
     // The checkpoint's Jinja source is data and is never executed.
@@ -149,8 +155,14 @@ std::string render_chat(const Json& messages, const std::optional<ChatFormat>& f
     const bool qwen3 = format->style == ChatStyle::qwen3;
     const bool qwen = qwen3 || format->style == ChatStyle::qwen2;
     const bool zephyr = format->style == ChatStyle::zephyr;
+    const bool granite = format->style == ChatStyle::granite;
     constexpr std::string_view zephyr_delimiters[] = {"<s>", "</s>", "<|system|>", "<|user|>",
                                                       "<|assistant|>"};
+    constexpr std::string_view granite_delimiters[] = {"<|start_of_role|>", "<|end_of_role|>",
+                                                       "<|end_of_text|>", "<|tool_call|>"};
+    const std::string_view role_begin = granite ? "<|start_of_role|>" : zephyr ? "<|" : "<|im_start|>";
+    const std::string_view role_end = granite ? "<|end_of_role|>" : zephyr ? "|>\n" : "\n";
+    const std::string_view message_end = granite ? "<|end_of_text|> " : zephyr ? "</s>\n" : "<|im_end|>\n";
     std::string prompt;
     const auto append = [&](std::string_view role, std::string_view text) {
         constexpr std::string_view qwen_delimiters[] = {"<|endoftext|>",   "<think>",      "</think>",
@@ -158,28 +170,29 @@ std::string render_chat(const Json& messages, const std::optional<ChatFormat>& f
                                                         "</tool_response>"};
         const auto contains = [&](std::string_view tag) { return text.find(tag) != text.npos; };
         if ((zephyr && std::ranges::any_of(zephyr_delimiters, contains)) ||
-            (!zephyr && (contains("<|im_start|>") || contains("<|im_end|>"))) ||
+            (granite && std::ranges::any_of(granite_delimiters, contains)) ||
+            (!zephyr && !granite && (contains("<|im_start|>") || contains("<|im_end|>"))) ||
             (qwen && std::ranges::any_of(qwen_delimiters, contains)))
             throw Error(ErrorCode::invalid_argument, "message text contains a reserved chat delimiter");
-        const auto size = detail::sum(text.size(), role.size() + 24, "chat prompt");
+        const auto size =
+            detail::sum(text.size(), role_begin.size() + role.size() + role_end.size() + message_end.size(),
+                        "chat prompt");
         if (size > detail::mib - prompt.size())
             throw Error(ErrorCode::resource_limit, "rendered chat prompt exceeds 1 MiB");
-        prompt += zephyr ? "<|" : "<|im_start|>";
+        prompt += role_begin;
         prompt += role;
-        if (zephyr)
-            prompt += "|>";
-        prompt += '\n';
+        prompt += role_end;
         prompt += text;
-        prompt += zephyr ? "</s>\n" : "<|im_end|>\n";
+        prompt += message_end;
     };
     bool user_turn = true;
     for (std::size_t i = 0; i < messages.size(); ++i) {
         const auto& message = messages[i];
         const auto role = message.at("role").get<std::string>();
         const auto text = message.at("content").get<std::string>();
-        if (qwen && (!message.value("tool_calls", Json{}).is_null() ||
-                     !message.value("reasoning_content", Json{}).is_null()))
-            throw Error(ErrorCode::unsupported, "Qwen chat supports plain-text messages");
+        if ((qwen || granite) && (!message.value("tool_calls", Json{}).is_null() ||
+                                  !message.value("reasoning_content", Json{}).is_null()))
+            throw Error(ErrorCode::unsupported, "the chat template supports plain-text messages");
         if (!i && role == "system") {
             append(role, text);
             continue;
@@ -193,12 +206,15 @@ std::string render_chat(const Json& messages, const std::optional<ChatFormat>& f
     }
     if (user_turn)
         throw Error(ErrorCode::invalid_argument, "the last message must have the user role");
-    const std::string_view assistant = zephyr  ? "<|assistant|>\n"
-                                       : qwen3 ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
-                                               : "<|im_start|>assistant\n";
-    if (assistant.size() > detail::mib - prompt.size())
+    constexpr std::string_view assistant = "assistant";
+    const std::string_view suffix = qwen3 ? "<think>\n\n</think>\n\n" : "";
+    if (role_begin.size() + assistant.size() + role_end.size() + suffix.size() > detail::mib - prompt.size())
         throw Error(ErrorCode::resource_limit, "rendered chat prompt exceeds 1 MiB");
-    return prompt + std::string(assistant);
+    prompt += role_begin;
+    prompt += assistant;
+    prompt += role_end;
+    prompt += suffix;
+    return prompt;
 }
 
 std::vector<Token> encode_prompt(const Tokenizer& tokenizer, const Model& model, std::string_view prompt,

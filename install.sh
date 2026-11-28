@@ -163,7 +163,9 @@ main() (
     fi
 
     if "$prefetch" && "$destination/bin/nathr" help pull >/dev/null 2>&1; then
-        "$destination/bin/nathr" pull smollm2 >/dev/null
+        model=$(python3 -I -c 'import json, sys; print(json.load(sys.stdin)["default_checkpoint"])' \
+            < "$destination/share/nathr/models/manifest.json")
+        "$destination/bin/nathr" pull "$model" >/dev/null
     fi
 
     link_stage=$(mktemp -d "$bin_dir/.nathr.XXXXXXXX")
@@ -172,9 +174,9 @@ main() (
 
     printf 'Installed Nathr %s at %s\n' "$actual_version" "$launcher"
     if [[ :$PATH: == *":$bin_dir:"* ]]; then
-        printf 'Try nathr run smollm2 "Say hello."\n'
+        printf 'Try nathr run\n'
     else
-        printf 'Add the command directory to PATH, or try %q run smollm2 "Say hello."\n' "$launcher"
+        printf 'Add the command directory to PATH, or run %q run\n' "$launcher"
         printf "  export PATH=%q:\"\$PATH\"\n" "$bin_dir"
     fi
 )

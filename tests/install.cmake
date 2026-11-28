@@ -35,7 +35,7 @@ execute_process(COMMAND "${CMAKE_COMMAND}" -E compare_files "${prefix}/${NATHR_D
 if(NATHR_PYTHON AND NATHR_BINDIR STREQUAL "bin")
     execute_process(COMMAND "${prefix}/bin/nathr" models --models-dir "${stage}/empty-cache"
         OUTPUT_VARIABLE models COMMAND_ERROR_IS_FATAL ANY)
-    foreach(profile IN ITEMS qwen3-moe tiny-mixtral)
+    foreach(profile IN ITEMS granite qwen2.5-1.5b qwen3-moe tiny-mixtral)
         if(NOT models MATCHES "(^|\n)${profile}[ \t]")
             message(FATAL_ERROR "Installed CLI is missing model alias ${profile}")
         endif()

@@ -21,15 +21,28 @@ Installed releases check for updates at most once a day when `run` or `serve` st
 
 ## Models and cache
 
-`nathr models` lists the built-in names and shows which models are cached. `nathr run` and `nathr serve` default to `smollm2`. Other chat models include `qwen3`, `qwen3-1.7b`, `qwen2.5`, and `tinyllama`. To download a model ahead of time and print its local path, use `nathr pull MODEL`.
+`nathr models` shows one row per model with its default variant and cache status. In the current source build, `nathr run` and `nathr serve` default to `qwen3`, using Qwen's 0.6B Q8_0 GGUF. The variant examples use this catalog. [Build instructions](#build-and-verify)
+
+Use `MODEL:VARIANT` to select a different quantization. Nathr downloads only the selected variant and caches it alongside any others. Use `nathr pull` to download it ahead of time and print its path.
+
+```sh
+nathr models qwen3
+nathr pull qwen3:q4_k_m
+nathr run qwen3:q4_k_m "Why does the sky look blue?"
+nathr serve qwen3 --also qwen3:q4_k_m
+```
+
+The server example exposes `qwen3` and `qwen3:q4_k_m` as model IDs in the OpenAI-compatible API. `smollm2-base` groups the GGUF and original Safetensors weights. The `gguf` and `safetensors` names still select their respective files.
+
+`qwen3:q4_k_m` uses a community quantization of the original Qwen3-0.6B weights. [Qwen3 Q4_K_M weights](https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF)
 
 The cache lives at `${XDG_CACHE_HOME:-$HOME/.cache}/nathr`. Set `NATHR_MODELS` or pass `--models-dir DIR` to use a different directory with `models`, `pull`, `run`, or `serve`.
 
-Use `qwen3-moe` for chat or `tiny-mixtral` for text continuation with mixture-of-experts (MoE) models. Nathr downloads the weights on first use.
+For a larger Qwen model, use `qwen2.5-1.5b`. For mixture-of-experts (MoE) chat, use `granite`, a GGUF quantization of IBM's Granite 3.1 1B-A400M Instruct. The `qwen3-moe` and `tiny-mixtral` aliases are experimental checkpoints for compatibility testing. [Qwen GGUF](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct-GGUF) · [IBM Granite model card](https://huggingface.co/ibm-granite/granite-3.1-1b-a400m-instruct) · [Granite GGUF](https://huggingface.co/bartowski/granite-3.1-1b-a400m-instruct-GGUF)
 
 ```sh
-nathr run qwen3-moe "What makes the sky blue?" --max-new-tokens 64
-nathr run tiny-mixtral "Once upon a time" --max-new-tokens 64
+nathr run qwen2.5-1.5b "Explain why the sky looks blue in two sentences."
+nathr run granite "What makes a sunset look red?"
 ```
 
 For your own model, pass a GGUF file or a Safetensors directory containing `config.json` and `model.safetensors`. To use text with a Safetensors checkpoint, keep `tokenizer.json` in the same directory. Check the format and architecture in the [checkpoint compatibility guide](inference-engine.md#checkpoint-support-and-limits).
@@ -46,7 +59,7 @@ Run `nathr --help` for the command list or `nathr COMMAND --help` for options.
 | Command | Use |
 | --- | --- |
 | `run [MODEL] [PROMPT]` | Chat, complete text, or return a named tensor in the terminal. |
-| `models`, `pull MODEL` | List pinned checkpoints or download one. |
+| `models [MODEL]`, `pull MODEL[:VARIANT]` | List models, show one model's variants, or download a checkpoint. |
 | `update [--check]` | Install the latest release or check availability. |
 | `inspect MODEL --summary` | See checkpoint capabilities and output names. |
 | `generate MODEL PROMPT` | Generate text with explicit sampling and stopping options. |
@@ -232,7 +245,7 @@ Use x86-64 Linux with Git, Bash, Python 3.10+, CMake 3.25+, Ninja, GCC 12+ or Cl
 ```sh
 git clone https://github.com/MohamedElashri/nathr.git
 cd nathr
-./setup.sh smollm2
+./setup.sh qwen3
 ./build/release/nathr run --models-dir models/cache
 ```
 

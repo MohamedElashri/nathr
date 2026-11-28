@@ -106,9 +106,15 @@ inline std::span<float> row(std::span<float> values, std::size_t width, std::siz
     return values.subspan(width * index, width);
 }
 
+inline void scale_values(std::span<float> values, float factor) {
+    if (factor != 1.f)
+        for (auto& value : values)
+            value *= factor;
+}
+
 void project_logits(Workspace& workspace, const EvaluationBatch& batch, const CpuBackend& backend,
                     TensorView weights, std::span<float> hidden, std::span<float> normalized,
-                    const auto& normalize) {
+                    const auto& normalize, float scale = 1.f) {
     batch.for_each([&](const Evaluation& e, std::size_t i, std::size_t index, std::size_t) {
         if (!e.wants_logits(i))
             return;
@@ -117,6 +123,7 @@ void project_logits(Workspace& workspace, const EvaluationBatch& batch, const Cp
         backend.project(weights, normalized, workspace.logits, 1, workspace.packed);
         if (e.lora)
             e.lora->project(weights, normalized, workspace.logits, 1);
+        scale_values(workspace.logits, scale);
         e.publish_logits(i, workspace.logits);
     });
 }

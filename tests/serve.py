@@ -419,7 +419,18 @@ def chat_stdin(binary, checkpoint):
 
 def user_commands(binary, checkpoint, encoder, directory):
     output = subprocess.check_output([binary, "models", "--models-dir", directory], text=True, timeout=10)
-    assert "smollm2" in output and "available" in output and "(default)" in output
+    default = next(line for line in output.splitlines() if "(default)" in line)
+    assert default.split()[:3] == ["qwen3", "available", "q8_0"], default
+    names = [line.split()[0] for line in output.splitlines()[1:]]
+    assert names.count("qwen3") == 1 and names.count("smollm2-base") == 1
+    assert "gguf" not in names and "safetensors" not in names
+    variants = subprocess.check_output([binary, "models", "qwen3", "--models-dir", directory],
+                                       text=True, timeout=10).splitlines()[1:]
+    assert [line.split()[0] for line in variants] == ["q8_0", "q4_k_m"], variants
+    assert variants[0].endswith("(default)") and all(line.split()[1] == "available" for line in variants)
+    result = subprocess.run([binary, "pull", "qwen3:missing", "--models-dir", directory],
+                            text=True, capture_output=True, timeout=10)
+    assert result.returncode != 0 and "Available: q8_0, q4_k_m" in result.stderr, result
     result = subprocess.run([binary, "pull", "unknown", "--models-dir", directory],
                             text=True, capture_output=True, timeout=10)
     assert result.returncode != 0 and "nathr models" in result.stderr

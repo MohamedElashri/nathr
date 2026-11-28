@@ -1529,8 +1529,8 @@ def main(executable, directory, mode, invoked, version, args):
                                                   "Serve the OpenAI-compatible API on 127.0.0.1."),
                                      formatter_class=argparse.ArgumentDefaultsHelpFormatter, allow_abbrev=False)
     model = parser.add_mutually_exclusive_group()
-    model.add_argument("model", nargs="?", metavar="MODEL",
-                       help="checkpoint name or local path. Uses smollm2 when omitted")
+    model.add_argument("model", nargs="?", metavar="MODEL[:VARIANT]",
+                       help="checkpoint name with optional quantization, or a local path")
     model.add_argument("--model", dest="model_path", metavar="PATH", help="path to the checkpoint")
     parser.add_argument("--models-dir", help="cache directory for named checkpoints (overrides NATHR_MODELS)")
     if run:
@@ -1542,8 +1542,8 @@ def main(executable, directory, mode, invoked, version, args):
         parser.add_argument("--output", help="return a named tensor as JSON")
         parser.add_argument("--lora", action="append", default=[], metavar="DIR", help="apply a local PEFT LoRA adapter")
     else:
-        parser.add_argument("--also", action="append", default=[], metavar="MODEL",
-                            help="load an additional checkpoint under its usual ID; repeat to load more")
+        parser.add_argument("--also", action="append", default=[], metavar="MODEL[:VARIANT]",
+                            help="load an additional checkpoint; repeat to load more")
         parser.add_argument("--lora", action="append", default=[], metavar="NAME=DIR",
                             help="register a PEFT LoRA adapter for the primary checkpoint; repeat to add more")
         parser.add_argument("--lora-root", metavar="DIR",

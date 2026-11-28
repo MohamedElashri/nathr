@@ -948,8 +948,8 @@ struct CommandHelp {
 
 constexpr CommandHelp commands[] = {
     {"run", "Start a terminal session or run one prompt", "run [MODEL] [PROMPT]", ""},
-    {"models", "List pinned checkpoint names and cache status", "models", ""},
-    {"pull", "Download and verify a named checkpoint", "pull MODEL", ""},
+    {"models", "List models or available quantizations for one model", "models [MODEL]", ""},
+    {"pull", "Download and verify a named checkpoint", "pull MODEL[:VARIANT]", ""},
     {"update", "Check for or install the latest release", "update [--check]", ""},
     {"generate", "Continue a prompt or run chat messages",
      "generate MODEL (PROMPT | --stdin | --tokens IDS | --messages FILE)",

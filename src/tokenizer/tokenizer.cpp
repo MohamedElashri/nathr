@@ -637,7 +637,7 @@ Tokenizer Tokenizer::load_model(const std::filesystem::path& model, const std::f
 
         const auto name = metadata.value("tokenizer.ggml.pre", std::string{});
         auto pre = Pretokenizer::unsupported;
-        if (name == "smollm")
+        if (name == "smollm" || name == "refact")
             pre = Pretokenizer::digits_byte_level;
         else if (name == "gpt-2")
             pre = Pretokenizer::byte_level;

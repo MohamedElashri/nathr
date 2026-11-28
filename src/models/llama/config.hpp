@@ -12,8 +12,16 @@ struct MoeConfig {
     float weight_scale = 1.f;
 };
 
+struct RotaryScales {
+    float embedding = 1.f;
+    float residual = 1.f;
+    float attention = 0.f;
+    float logits = 1.f;
+};
+
 ModelConfig load_llama_config(const Json& json, const std::filesystem::path& path);
 ModelConfig load_gguf_decoder_config(const Gguf& file);
 MoeConfig load_gguf_moe_config(const Gguf& file);
+RotaryScales load_gguf_granite_scales(const Gguf& file);
 
 } // namespace nathr::detail

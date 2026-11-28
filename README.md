@@ -10,7 +10,7 @@ Chat in the terminal, run a one-off prompt, or connect an OpenAI-compatible clie
 
 The prebuilt release targets Ubuntu 24.04 on x86-64. It requires Bash, Python 3.10+, `ca-certificates`, `libicu74`, `libstdc++6`, `coreutils`, `tar`, `flock` from `util-linux`, and `curl` or `wget`.
 
-Run these commands as your regular user. The installer verifies the release and downloads SmolLM2-135M-Instruct (about 270 MB).
+Run these commands as your regular user. The installer verifies the release and downloads its default chat model.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/MohamedElashri/nathr/main/install.sh | bash
@@ -30,7 +30,7 @@ nathr run qwen3 "Explain what a checksum is in one sentence." --stats
 nathr run minilm "The sky is blue."
 ```
 
-Nathr downloads named models on first use. Run `nathr pull MODEL` to download one ahead of time, or pass a local checkpoint path to `nathr run`. See the [model and cache guide](docs/usage.md#models-and-cache).
+Nathr downloads named models on first use. Run `nathr pull MODEL` to download one ahead of time, or pass a local checkpoint path to `nathr run`. See the [model and cache guide](docs/usage.md#models-and-cache) for available quantizations.
 
 `--stats` shows latency and tokens per second. The MiniLM example returns a sentence embedding.
 
@@ -39,7 +39,7 @@ Nathr downloads named models on first use. Run `nathr pull MODEL` to download on
 Start the server in one terminal.
 
 ```sh
-nathr serve smollm2
+nathr serve qwen3
 ```
 
 Send a prompt from another terminal.
@@ -47,10 +47,10 @@ Send a prompt from another terminal.
 ```sh
 curl -fsS http://127.0.0.1:8000/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"smollm2","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":16}'
+  -d '{"model":"qwen3","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":16}'
 ```
 
-Read the reply in `choices[0].message.content`. In an OpenAI-compatible client, set the base URL to `http://127.0.0.1:8000/v1` and the model to `smollm2`. If the client requires an API key, enter `local`. See the [Python SDK example](docs/usage.md#use-the-openai-python-sdk).
+Read the reply in `choices[0].message.content`. In an OpenAI-compatible client, set the base URL to `http://127.0.0.1:8000/v1` and the model to `qwen3`. If the client requires an API key, enter `local`. See the [Python SDK example](docs/usage.md#use-the-openai-python-sdk).
 
 Press Ctrl+C in the server terminal to stop it.
 
